@@ -196,6 +196,28 @@ impl Dispatcher {
             .await
     }
 
+    /// Submit a secretsdump task using NTLM hash (pass-the-hash).
+    pub async fn request_secretsdump_hash(
+        &self,
+        target_ip: &str,
+        username: &str,
+        domain: &str,
+        hash_value: &str,
+        priority: i32,
+    ) -> Result<Option<String>> {
+        let payload = json!({
+            "technique": "secretsdump",
+            "target_ip": target_ip,
+            "credential": {
+                "username": username,
+                "domain": domain,
+            },
+            "hash_value": hash_value,
+        });
+        self.throttled_submit("credential_access", "credential_access", payload, priority)
+            .await
+    }
+
     /// Submit a lateral movement task.
     pub async fn request_lateral(
         &self,
@@ -349,27 +371,6 @@ impl Dispatcher {
             },
         });
         self.throttled_submit("recon", "recon", payload, 7).await
-    }
-
-    /// Submit a delegation enumeration task.
-    pub async fn request_delegation_enum(
-        &self,
-        domain: &str,
-        dc_ip: &str,
-        credential: &ares_core::models::Credential,
-    ) -> Result<Option<String>> {
-        let payload = json!({
-            "technique": "find_delegation",
-            "domain": domain,
-            "target_ip": dc_ip,
-            "credential": {
-                "username": credential.username,
-                "password": credential.password,
-                "domain": credential.domain,
-            },
-        });
-        self.throttled_submit("privesc_enumeration", "recon", payload, 5)
-            .await
     }
 
     /// Submit a share enumeration task against a host using credentials.

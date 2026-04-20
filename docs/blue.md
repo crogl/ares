@@ -811,7 +811,7 @@ Set `BLUE_ENABLED=1` to start blue team investigations automatically when
 a red team operation runs:
 
 ```bash
-task red:ec2:multi TARGET=dreadgoad DOMAIN=sevenkingdoms.local BLUE_ENABLED=1
+task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_ENABLED=1
 ```
 
 ### Taskfile Variables
@@ -822,7 +822,7 @@ task red:ec2:multi TARGET=dreadgoad DOMAIN=sevenkingdoms.local BLUE_ENABLED=1
 | `POLL_INTERVAL` | `30` | Seconds between poll cycles |
 | `MAX_STEPS_BLUE` | `50` | Max agent steps (watch/poll mode) |
 | `MAX_STEPS_BLUE_ONCE` | `15` | Max agent steps (once/investigate mode) |
-| `GRAFANA_URL` | `https://grafana.dev.plundr.ai` | Grafana instance |
+| `GRAFANA_URL` | _(none — must be set)_ | Grafana instance |
 | `K8S_NAMESPACE` | `attack-simulation` | K8s namespace for remote commands |
 | `REPORT_DIR` | `./reports` | Report output directory |
 | `LOG_DIR` | `./logs` | Log output directory |

@@ -90,6 +90,8 @@ tasks:
       CARGO_BUILD_JOBS: '{{.CARGO_BUILD_JOBS | default "1"}}'
       S3_DEPLOY_PREFIX: 'ares-deploy'
     preconditions:
+      - sh: aws sts get-caller-identity --profile "{{.EC2_PROFILE}}" --region "{{.EC2_REGION}}" >/dev/null 2>&1
+        msg: "Not logged into AWS (profile: {{.EC2_PROFILE}}). Run: aws sso login --profile {{.EC2_PROFILE}}"
       - sh: test -n "{{.BCP_BUCKET}}"
         msg: "BCP_BUCKET not set. Either create ~/.bcp/config.yaml with 'bucket: your-bucket' or pass BCP_BUCKET=your-bucket"
     cmds:
@@ -224,6 +226,8 @@ tasks:
           cross)
             # Override linker: container has x86_64-linux-gnu-gcc, not x86_64-unknown-linux-gnu-gcc.
             export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc
+            # Use CMake builder for aws-lc-sys (CC builder fails due to GCC memcmp bug #95189)
+            export AWS_LC_SYS_CMAKE_BUILDER=1
             cross build --release --target {{.RUST_TARGET}} -j "{{.CARGO_BUILD_JOBS}}"
             ;;
           zigbuild)
@@ -584,7 +588,7 @@ tasks:
 
         PARAMS_FILE=$(mktemp)
         trap "rm -f $PARAMS_FILE" EXIT
-        jq -n --arg units "$WORKER_UNITS" '{"commands": ["systemctl stop " + $units + " 2>/dev/null || true; pkill -f '\\''ares orchestrator'\\'' 2>/dev/null || true; echo Stopped all ares workers and orchestrator"]}' > "$PARAMS_FILE"
+        jq -n --arg units "$WORKER_UNITS" '{"commands": ["systemctl stop " + $units + " 2>/dev/null || true; pkill -f \"ares orchestrator\" 2>/dev/null || true; echo Stopped all ares workers and orchestrator"]}' > "$PARAMS_FILE"
 
         CMD_ID=$(aws ssm send-command \
           --profile "{{.EC2_PROFILE}}" \
@@ -977,7 +981,7 @@ tasks:
         GRAFANA_URL_VAL=$(echo "$SECRETS" | jq -r '.GRAFANA_URL // empty')
         GRAFANA_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.GRAFANA_SERVICE_ACCOUNT_TOKEN // empty')
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
-        OTEL_TRACES_ENDPOINT="https://otlp.dev.plundr.ai/v1/traces"
+        OTEL_TRACES_ENDPOINT="{{.OTEL_TRACES_ENDPOINT}}"
 
         FLUSH_CMD=""
         if [ "{{.FLUSH_REDIS}}" = "true" ]; then
@@ -994,9 +998,10 @@ tasks:
           fi
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
-        # OTEL: send traces to Alloy ingress which fans out to Tempo + Dreadnode Platform
+        # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_TRACES_ENDPOINT}' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_RESOURCE_ATTRIBUTES=deployment.environment=staging,attack.team=red' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; chmod 600 /etc/ares/env; echo Wrote /etc/ares/env"
         # Restart workers so they pick up the new env file
         ENV_FILE_CMD="$ENV_FILE_CMD; for role in recon credential_access cracker acl privesc lateral coercion; do systemctl restart ares-worker@\${role} 2>/dev/null || true; done; echo Workers restarted"

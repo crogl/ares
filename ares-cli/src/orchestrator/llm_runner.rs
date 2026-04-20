@@ -13,8 +13,8 @@ use ares_llm::prompt::templates;
 use ares_llm::prompt::StateSnapshot;
 use ares_llm::tool_registry::{self, AgentRole};
 use ares_llm::{
-    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, LlmProvider, LoopEndReason,
-    ToolDispatcher,
+    run_agent_loop, AgentLoopConfig, AgentLoopOutcome, CallbackHandler, HostnameMap, LlmProvider,
+    LoopEndReason, ToolDispatcher,
 };
 
 use crate::orchestrator::state::SharedState;
@@ -69,6 +69,11 @@ impl LlmTaskRunner {
         let _ = self.callback_handler.set(handler);
     }
 
+    /// Get a reference to the tool dispatcher for direct tool calls.
+    pub fn tool_dispatcher(&self) -> &Arc<dyn ToolDispatcher> {
+        &self.dispatcher
+    }
+
     /// Execute a task through the LLM agent loop.
     ///
     /// This is the main entry point called by the orchestrator when
@@ -103,7 +108,36 @@ impl LlmTaskRunner {
             "Starting LLM agent loop"
         );
 
-        // 5. Run the agent loop
+        // 5. Build IP→FQDN map from discovered hosts so spans show hostnames
+        //    instead of bare IPs in destination.address.
+        let hostname_map: Option<HostnameMap> = {
+            let hosts = &snapshot.hosts;
+            if hosts.is_empty() {
+                None
+            } else {
+                let map: std::collections::HashMap<String, String> = hosts
+                    .iter()
+                    .filter(|h| !h.hostname.is_empty())
+                    .map(|h| {
+                        let fqdn = if h.hostname.contains('.') {
+                            h.hostname.to_lowercase()
+                        } else if let Some(domain) = snapshot.domains.first() {
+                            format!("{}.{}", h.hostname.to_lowercase(), domain)
+                        } else {
+                            h.hostname.to_lowercase()
+                        };
+                        (h.ip.clone(), fqdn)
+                    })
+                    .collect();
+                if map.is_empty() {
+                    None
+                } else {
+                    Some(Arc::new(map))
+                }
+            }
+        };
+
+        // 6. Run the agent loop
         let outcome = run_agent_loop(
             self.provider.as_ref(),
             Arc::clone(&self.dispatcher),
@@ -114,6 +148,7 @@ impl LlmTaskRunner {
             task_id,
             &tools,
             self.callback_handler.get().cloned(),
+            hostname_map,
         )
         .await;
 
@@ -155,7 +190,7 @@ fn build_system_prompt(role: AgentRole, snapshot: &StateSnapshot) -> Result<Stri
     let agent_instructions = templates::render_agent_instructions(
         template_name,
         &capabilities,
-        false,
+        !snapshot.undominated_forests.is_empty(),
         &snapshot.undominated_forests,
     )?;
 

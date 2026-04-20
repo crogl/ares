@@ -76,7 +76,7 @@ IMPORTANT: After code changes, ALWAYS deploy before testing. Use `task remote:ch
 
 ```bash
 # via Taskfile (convenience wrappers)
-task red:multi TARGET=dreadgoad DOMAIN=sevenkingdoms.local
+task red:multi TARGET=dreadgoad DOMAIN=contoso.local
 
 # via ares (direct)
 ares ops submit dreadgoad contoso.local \
@@ -84,7 +84,7 @@ ares ops submit dreadgoad contoso.local \
   --model gpt-5.2 --max-steps 200 --follow
 
 # EC2
-task ec2:launch DOMAIN=sevenkingdoms.local TARGETS=192.168.58.10
+task ec2:launch DOMAIN=contoso.local TARGETS=192.168.58.10
 ```
 
 ### Monitor
@@ -207,13 +207,13 @@ task remote:logs ROLE=orchestrator         # Read logs
 
 ### Debugging Stuck Operations
 
-1. **Check Grafana** (`grafana.dev.plundr.ai`) for token usage and Loki errors.
+1. **Check Grafana** (URL from `GRAFANA_URL` env var) for token usage and Loki errors.
 2. **Check failed tasks**: `ares --k8s ares-red ops tasks --latest --status failed`.
 3. **Verify binary sync**: `task remote:check`.
 4. **Inject state**: If the LLM is stuck on a specific discovery step, manually inject the result.
 5. **Restart**: `ares --k8s ares-red ops kill --all` then re-submit.
 
-## GOAD Lab Reference
+## Lab Reference
 
 - Primary: `contoso.local` (DC: dc01, 192.168.58.10)
 - Foreign: `fabrikam.local` (DC: dc02, 192.168.58.20)
