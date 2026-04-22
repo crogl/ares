@@ -45,6 +45,12 @@ pub const DEDUP_NTLM_RELAY: &str = "ntlm_relay";
 pub const DEDUP_NOPAC: &str = "nopac";
 pub const DEDUP_ZEROLOGON: &str = "zerologon";
 pub const DEDUP_PRINTNIGHTMARE: &str = "printnightmare";
+pub const DEDUP_MSSQL_COERCION: &str = "mssql_coercion";
+pub const DEDUP_PASSWORD_POLICY: &str = "password_policy";
+pub const DEDUP_GPP_SYSVOL: &str = "gpp_sysvol";
+pub const DEDUP_NTLMV1_DOWNGRADE: &str = "ntlmv1_downgrade";
+pub const DEDUP_LDAP_SIGNING: &str = "ldap_signing";
+pub const DEDUP_WEBDAV_DETECTION: &str = "webdav_detection";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -82,4 +88,10 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_NOPAC,
     DEDUP_ZEROLOGON,
     DEDUP_PRINTNIGHTMARE,
+    DEDUP_MSSQL_COERCION,
+    DEDUP_PASSWORD_POLICY,
+    DEDUP_GPP_SYSVOL,
+    DEDUP_NTLMV1_DOWNGRADE,
+    DEDUP_LDAP_SIGNING,
+    DEDUP_WEBDAV_DETECTION,
 ];

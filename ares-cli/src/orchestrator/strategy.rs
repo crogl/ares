@@ -297,6 +297,12 @@ fn fast_weights() -> HashMap<String, i32> {
         ("zerologon", 3),
         ("printnightmare", 6),
         ("share_coercion", 5),
+        ("mssql_coercion", 4),
+        ("password_policy", 3),
+        ("gpp_sysvol", 3),
+        ("ntlmv1_downgrade", 3),
+        ("ldap_signing", 3),
+        ("webdav_detection", 4),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -341,6 +347,12 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("zerologon", 3),
         ("printnightmare", 3),
         ("share_coercion", 3),
+        ("mssql_coercion", 3),
+        ("password_policy", 3),
+        ("gpp_sysvol", 3),
+        ("ntlmv1_downgrade", 3),
+        ("ldap_signing", 3),
+        ("webdav_detection", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -385,6 +397,12 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("zerologon", 4),
         ("printnightmare", 8),
         ("share_coercion", 6),
+        ("mssql_coercion", 5),
+        ("password_policy", 2),
+        ("gpp_sysvol", 2),
+        ("ntlmv1_downgrade", 2),
+        ("ldap_signing", 2),
+        ("webdav_detection", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -649,6 +667,12 @@ mod tests {
             "zerologon",
             "printnightmare",
             "share_coercion",
+            "mssql_coercion",
+            "password_policy",
+            "gpp_sysvol",
+            "ntlmv1_downgrade",
+            "ldap_signing",
+            "webdav_detection",
         ];
         for preset in [
             StrategyPreset::Fast,

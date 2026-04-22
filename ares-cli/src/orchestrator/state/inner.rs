@@ -335,6 +335,12 @@ mod tests {
             DEDUP_NOPAC,
             DEDUP_ZEROLOGON,
             DEDUP_PRINTNIGHTMARE,
+            DEDUP_MSSQL_COERCION,
+            DEDUP_PASSWORD_POLICY,
+            DEDUP_GPP_SYSVOL,
+            DEDUP_NTLMV1_DOWNGRADE,
+            DEDUP_LDAP_SIGNING,
+            DEDUP_WEBDAV_DETECTION,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

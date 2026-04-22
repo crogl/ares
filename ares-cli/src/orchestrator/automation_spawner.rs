@@ -54,6 +54,12 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_print_nightmare);
     spawn_auto!(auto_smb_signing_detection);
     spawn_auto!(auto_share_coercion);
+    spawn_auto!(auto_mssql_coercion);
+    spawn_auto!(auto_password_policy);
+    spawn_auto!(auto_gpp_sysvol);
+    spawn_auto!(auto_ntlmv1_downgrade);
+    spawn_auto!(auto_ldap_signing);
+    spawn_auto!(auto_webdav_detection);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles
