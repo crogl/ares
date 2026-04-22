@@ -52,6 +52,8 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_nopac);
     spawn_auto!(auto_zerologon);
     spawn_auto!(auto_print_nightmare);
+    spawn_auto!(auto_smb_signing_detection);
+    spawn_auto!(auto_share_coercion);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles

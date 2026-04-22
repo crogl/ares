@@ -296,6 +296,7 @@ fn fast_weights() -> HashMap<String, i32> {
         ("nopac", 4),
         ("zerologon", 3),
         ("printnightmare", 6),
+        ("share_coercion", 5),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -339,6 +340,7 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("nopac", 3),
         ("zerologon", 3),
         ("printnightmare", 3),
+        ("share_coercion", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -382,6 +384,7 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("nopac", 5),
         ("zerologon", 4),
         ("printnightmare", 8),
+        ("share_coercion", 6),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -645,6 +648,7 @@ mod tests {
             "nopac",
             "zerologon",
             "printnightmare",
+            "share_coercion",
         ];
         for preset in [
             StrategyPreset::Fast,
