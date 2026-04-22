@@ -65,6 +65,19 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_dfs_coercion);
     spawn_auto!(auto_petitpotam_unauth);
     spawn_auto!(auto_winrm_lateral);
+    spawn_auto!(auto_group_enumeration);
+    spawn_auto!(auto_localuser_spray);
+    spawn_auto!(auto_krbrelayup);
+    spawn_auto!(auto_searchconnector_coercion);
+    spawn_auto!(auto_lsassy_dump);
+    spawn_auto!(auto_rdp_lateral);
+    spawn_auto!(auto_foreign_group_enum);
+    spawn_auto!(auto_certipy_auth);
+    spawn_auto!(auto_sid_enumeration);
+    spawn_auto!(auto_dns_enum);
+    spawn_auto!(auto_domain_user_enum);
+    spawn_auto!(auto_pth_spray);
+    spawn_auto!(auto_certifried);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles

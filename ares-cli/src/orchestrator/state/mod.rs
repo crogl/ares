@@ -56,6 +56,19 @@ pub const DEDUP_MACHINE_ACCOUNT_QUOTA: &str = "machine_account_quota";
 pub const DEDUP_DFS_COERCION: &str = "dfs_coercion";
 pub const DEDUP_PETITPOTAM_UNAUTH: &str = "petitpotam_unauth";
 pub const DEDUP_WINRM_LATERAL: &str = "winrm_lateral";
+pub const DEDUP_GROUP_ENUMERATION: &str = "group_enumeration";
+pub const DEDUP_LOCALUSER_SPRAY: &str = "localuser_spray";
+pub const DEDUP_KRBRELAYUP: &str = "krbrelayup";
+pub const DEDUP_SEARCHCONNECTOR: &str = "searchconnector";
+pub const DEDUP_LSASSY_DUMP: &str = "lsassy_dump";
+pub const DEDUP_RDP_LATERAL: &str = "rdp_lateral";
+pub const DEDUP_FOREIGN_GROUP_ENUM: &str = "foreign_group_enum";
+pub const DEDUP_CERTIPY_AUTH: &str = "certipy_auth";
+pub const DEDUP_SID_ENUMERATION: &str = "sid_enumeration";
+pub const DEDUP_DNS_ENUM: &str = "dns_enum";
+pub const DEDUP_DOMAIN_USER_ENUM: &str = "domain_user_enum";
+pub const DEDUP_PTH_SPRAY: &str = "pth_spray";
+pub const DEDUP_CERTIFRIED: &str = "certifried";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -104,4 +117,17 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_DFS_COERCION,
     DEDUP_PETITPOTAM_UNAUTH,
     DEDUP_WINRM_LATERAL,
+    DEDUP_GROUP_ENUMERATION,
+    DEDUP_LOCALUSER_SPRAY,
+    DEDUP_KRBRELAYUP,
+    DEDUP_SEARCHCONNECTOR,
+    DEDUP_LSASSY_DUMP,
+    DEDUP_RDP_LATERAL,
+    DEDUP_FOREIGN_GROUP_ENUM,
+    DEDUP_CERTIPY_AUTH,
+    DEDUP_SID_ENUMERATION,
+    DEDUP_DNS_ENUM,
+    DEDUP_DOMAIN_USER_ENUM,
+    DEDUP_PTH_SPRAY,
+    DEDUP_CERTIFRIED,
 ];

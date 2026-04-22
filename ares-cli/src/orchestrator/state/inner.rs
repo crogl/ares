@@ -346,6 +346,19 @@ mod tests {
             DEDUP_DFS_COERCION,
             DEDUP_PETITPOTAM_UNAUTH,
             DEDUP_WINRM_LATERAL,
+            DEDUP_GROUP_ENUMERATION,
+            DEDUP_LOCALUSER_SPRAY,
+            DEDUP_KRBRELAYUP,
+            DEDUP_SEARCHCONNECTOR,
+            DEDUP_LSASSY_DUMP,
+            DEDUP_RDP_LATERAL,
+            DEDUP_FOREIGN_GROUP_ENUM,
+            DEDUP_CERTIPY_AUTH,
+            DEDUP_SID_ENUMERATION,
+            DEDUP_DNS_ENUM,
+            DEDUP_DOMAIN_USER_ENUM,
+            DEDUP_PTH_SPRAY,
+            DEDUP_CERTIFRIED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {
