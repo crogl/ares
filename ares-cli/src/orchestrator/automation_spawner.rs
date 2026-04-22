@@ -60,6 +60,11 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_ntlmv1_downgrade);
     spawn_auto!(auto_ldap_signing);
     spawn_auto!(auto_webdav_detection);
+    spawn_auto!(auto_spooler_check);
+    spawn_auto!(auto_machine_account_quota);
+    spawn_auto!(auto_dfs_coercion);
+    spawn_auto!(auto_petitpotam_unauth);
+    spawn_auto!(auto_winrm_lateral);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles

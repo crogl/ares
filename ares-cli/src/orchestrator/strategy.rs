@@ -303,6 +303,11 @@ fn fast_weights() -> HashMap<String, i32> {
         ("ntlmv1_downgrade", 3),
         ("ldap_signing", 3),
         ("webdav_detection", 4),
+        ("spooler_check", 3),
+        ("machine_account_quota", 3),
+        ("dfs_coercion", 5),
+        ("petitpotam_unauth", 4),
+        ("winrm_lateral", 5),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -353,6 +358,11 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("ntlmv1_downgrade", 3),
         ("ldap_signing", 3),
         ("webdav_detection", 3),
+        ("spooler_check", 3),
+        ("machine_account_quota", 3),
+        ("dfs_coercion", 3),
+        ("petitpotam_unauth", 3),
+        ("winrm_lateral", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -403,6 +413,11 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("ntlmv1_downgrade", 2),
         ("ldap_signing", 2),
         ("webdav_detection", 3),
+        ("spooler_check", 2),
+        ("machine_account_quota", 2),
+        ("dfs_coercion", 6),
+        ("petitpotam_unauth", 5),
+        ("winrm_lateral", 4),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -673,6 +688,11 @@ mod tests {
             "ntlmv1_downgrade",
             "ldap_signing",
             "webdav_detection",
+            "spooler_check",
+            "machine_account_quota",
+            "dfs_coercion",
+            "petitpotam_unauth",
+            "winrm_lateral",
         ];
         for preset in [
             StrategyPreset::Fast,

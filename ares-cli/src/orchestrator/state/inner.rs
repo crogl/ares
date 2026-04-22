@@ -341,6 +341,11 @@ mod tests {
             DEDUP_NTLMV1_DOWNGRADE,
             DEDUP_LDAP_SIGNING,
             DEDUP_WEBDAV_DETECTION,
+            DEDUP_SPOOLER_CHECK,
+            DEDUP_MACHINE_ACCOUNT_QUOTA,
+            DEDUP_DFS_COERCION,
+            DEDUP_PETITPOTAM_UNAUTH,
+            DEDUP_WINRM_LATERAL,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

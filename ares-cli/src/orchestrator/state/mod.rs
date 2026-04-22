@@ -51,6 +51,11 @@ pub const DEDUP_GPP_SYSVOL: &str = "gpp_sysvol";
 pub const DEDUP_NTLMV1_DOWNGRADE: &str = "ntlmv1_downgrade";
 pub const DEDUP_LDAP_SIGNING: &str = "ldap_signing";
 pub const DEDUP_WEBDAV_DETECTION: &str = "webdav_detection";
+pub const DEDUP_SPOOLER_CHECK: &str = "spooler_check";
+pub const DEDUP_MACHINE_ACCOUNT_QUOTA: &str = "machine_account_quota";
+pub const DEDUP_DFS_COERCION: &str = "dfs_coercion";
+pub const DEDUP_PETITPOTAM_UNAUTH: &str = "petitpotam_unauth";
+pub const DEDUP_WINRM_LATERAL: &str = "winrm_lateral";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -94,4 +99,9 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_NTLMV1_DOWNGRADE,
     DEDUP_LDAP_SIGNING,
     DEDUP_WEBDAV_DETECTION,
+    DEDUP_SPOOLER_CHECK,
+    DEDUP_MACHINE_ACCOUNT_QUOTA,
+    DEDUP_DFS_COERCION,
+    DEDUP_PETITPOTAM_UNAUTH,
+    DEDUP_WINRM_LATERAL,
 ];
