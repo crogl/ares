@@ -292,6 +292,10 @@ fn fast_weights() -> HashMap<String, i32> {
         ("adcs_esc8", 5),
         ("gpo_abuse", 6),
         ("laps", 4),
+        ("ntlm_relay", 5),
+        ("nopac", 4),
+        ("zerologon", 3),
+        ("printnightmare", 6),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -331,6 +335,10 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("adcs_esc8", 3),
         ("gpo_abuse", 3),
         ("laps", 3),
+        ("ntlm_relay", 3),
+        ("nopac", 3),
+        ("zerologon", 3),
+        ("printnightmare", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -370,6 +378,10 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("adcs_esc8", 2),
         ("gpo_abuse", 3),
         ("laps", 3),
+        ("ntlm_relay", 7),
+        ("nopac", 5),
+        ("zerologon", 4),
+        ("printnightmare", 8),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -625,7 +637,15 @@ mod tests {
     #[test]
     fn new_technique_weights_in_presets() {
         // Verify that new techniques added in this branch are in all presets
-        let new_techniques = ["rbcd", "shadow_credentials", "mssql_deep_exploitation"];
+        let new_techniques = [
+            "rbcd",
+            "shadow_credentials",
+            "mssql_deep_exploitation",
+            "ntlm_relay",
+            "nopac",
+            "zerologon",
+            "printnightmare",
+        ];
         for preset in [
             StrategyPreset::Fast,
             StrategyPreset::Comprehensive,
@@ -654,9 +674,12 @@ mod tests {
     #[test]
     fn stealth_penalizes_noisy_techniques() {
         let s = Strategy::from_preset(StrategyPreset::Stealth);
-        // Password spray and SMB signing should be most penalized (8)
+        // Password spray, SMB signing, and PrintNightmare should be most penalized (8)
         assert_eq!(s.effective_priority("password_spray"), 8);
         assert_eq!(s.effective_priority("smb_signing_disabled"), 8);
+        assert_eq!(s.effective_priority("printnightmare"), 8);
+        // NTLM relay is noisy too (7)
+        assert_eq!(s.effective_priority("ntlm_relay"), 7);
         // ADCS/ACL should be most prioritized (1)
         assert_eq!(s.effective_priority("esc1"), 1);
         assert_eq!(s.effective_priority("acl_abuse"), 1);

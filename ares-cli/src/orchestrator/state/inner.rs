@@ -331,6 +331,10 @@ mod tests {
             DEDUP_ADCS_EXPLOIT,
             DEDUP_GPO_ABUSE,
             DEDUP_LAPS,
+            DEDUP_NTLM_RELAY,
+            DEDUP_NOPAC,
+            DEDUP_ZEROLOGON,
+            DEDUP_PRINTNIGHTMARE,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

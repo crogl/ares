@@ -48,6 +48,10 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_mssql_exploitation);
     spawn_auto!(auto_gpo_abuse);
     spawn_auto!(auto_laps_extraction);
+    spawn_auto!(auto_ntlm_relay);
+    spawn_auto!(auto_nopac);
+    spawn_auto!(auto_zerologon);
+    spawn_auto!(auto_print_nightmare);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles

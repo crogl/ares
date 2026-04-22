@@ -28,6 +28,9 @@ mod gpo;
 mod laps;
 mod mssql;
 mod mssql_exploitation;
+mod nopac;
+mod ntlm_relay;
+mod print_nightmare;
 mod rbcd;
 mod refresh;
 mod s4u;
@@ -38,6 +41,7 @@ mod shares;
 mod stall_detection;
 mod trust;
 mod unconstrained;
+mod zerologon;
 
 // Re-export all public task functions at the same paths they had before the split.
 pub use acl::auto_acl_chain_follow;
@@ -56,6 +60,9 @@ pub use gpo::auto_gpo_abuse;
 pub use laps::auto_laps_extraction;
 pub use mssql::auto_mssql_detection;
 pub use mssql_exploitation::auto_mssql_exploitation;
+pub use nopac::auto_nopac;
+pub use ntlm_relay::auto_ntlm_relay;
+pub use print_nightmare::auto_print_nightmare;
 pub use rbcd::auto_rbcd_exploitation;
 pub use refresh::state_refresh;
 pub use s4u::auto_s4u_exploitation;
@@ -66,6 +73,7 @@ pub use shares::auto_share_spider;
 pub use stall_detection::auto_stall_detection;
 pub use trust::auto_trust_follow;
 pub use unconstrained::auto_unconstrained_exploitation;
+pub use zerologon::auto_zerologon;
 
 pub(crate) fn crack_dedup_key(hash: &ares_core::models::Hash) -> String {
     let prefix = &hash.hash_value[..32.min(hash.hash_value.len())];
