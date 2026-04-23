@@ -17,6 +17,11 @@ pub struct ToolTargetInfo {
 /// - IP: `target_ip`, `target`, `host`, `ip` (if it looks like an IP)
 /// - FQDN: `target_fqdn`, `target`, `host`, `hostname` (if it looks like an FQDN)
 /// - User: `username`, `user`, `target_user`
+///
+/// Values are sanitized before validation: multi-token strings (e.g.,
+/// `"10.1.2.150 10.1.2.220"` or nmap arguments) are split and only the
+/// first token is considered. CIDR ranges (`10.0.0.0/24`) are rejected
+/// because they represent networks, not individual hosts.
 pub fn extract_target_info(arguments: &serde_json::Value) -> ToolTargetInfo {
     let mut info = ToolTargetInfo::default();
 
@@ -25,21 +30,23 @@ pub fn extract_target_info(arguments: &serde_json::Value) -> ToolTargetInfo {
         None => return info,
     };
 
-    // Extract IP
+    // Extract IP — sanitize multi-token values first
     for key in &["target_ip", "target", "host", "ip"] {
         if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-            if is_ip_address(val) {
-                info.target_ip = Some(val.to_string());
+            let sanitized = first_token(val);
+            if !is_cidr(sanitized) && is_ip_address(sanitized) {
+                info.target_ip = Some(sanitized.to_string());
                 break;
             }
         }
     }
 
-    // Extract FQDN
+    // Extract FQDN — sanitize multi-token values first
     for key in &["target_fqdn", "target", "host", "hostname"] {
         if let Some(val) = obj.get(*key).and_then(|v| v.as_str()) {
-            if is_likely_fqdn(val) {
-                info.target_fqdn = Some(val.to_string());
+            let sanitized = first_token(val);
+            if is_likely_fqdn(sanitized) {
+                info.target_fqdn = Some(sanitized.to_string());
                 break;
             }
         }
@@ -108,6 +115,29 @@ pub fn infer_target_type_from_info(info: &ToolTargetInfo) -> Option<&'static str
         return Some("user");
     }
     None
+}
+
+/// Extract the first whitespace/comma-delimited token from a string.
+///
+/// Handles cases where LLM agents pass multi-IP scan results or
+/// nmap arguments in a single field, e.g.:
+/// - `"10.1.2.150 10.1.2.220 10.1.2.51"` → `"10.1.2.150"`
+/// - `"10.1.2.121 -p 53,88 --open"` → `"10.1.2.121"`
+fn first_token(s: &str) -> &str {
+    s.split_whitespace().next().unwrap_or(s)
+}
+
+/// Returns true for CIDR notation like `10.0.0.0/24`.
+///
+/// CIDR ranges represent networks, not individual hosts, so they
+/// must not be used as `destination.address` span values.
+fn is_cidr(s: &str) -> bool {
+    if let Some((ip_part, mask)) = s.rsplit_once('/') {
+        if let Ok(bits) = mask.parse::<u8>() {
+            return bits <= 128 && ip_part.parse::<std::net::IpAddr>().is_ok();
+        }
+    }
+    false
 }
 
 fn is_ip_address(s: &str) -> bool {
@@ -180,6 +210,66 @@ mod tests {
         let info = extract_target_info(&args);
         assert_eq!(info.target_ip.as_deref(), Some("192.168.58.10"));
         assert!(info.target_fqdn.is_none());
+    }
+
+    #[test]
+    fn extract_target_info_rejects_cidr() {
+        let args = serde_json::json!({"target": "10.1.2.0/24"});
+        let info = extract_target_info(&args);
+        assert!(
+            info.target_ip.is_none(),
+            "CIDR should not be used as target_ip"
+        );
+        assert!(info.target_fqdn.is_none());
+    }
+
+    #[test]
+    fn extract_target_info_rejects_cidr_in_target_ip() {
+        let args = serde_json::json!({"target_ip": "10.1.2.0/25"});
+        let info = extract_target_info(&args);
+        assert!(
+            info.target_ip.is_none(),
+            "CIDR should not be used as target_ip"
+        );
+    }
+
+    #[test]
+    fn extract_target_info_multi_ip_takes_first() {
+        let args = serde_json::json!({"target": "10.1.2.150 10.1.2.220 10.1.2.51"});
+        let info = extract_target_info(&args);
+        assert_eq!(info.target_ip.as_deref(), Some("10.1.2.150"));
+    }
+
+    #[test]
+    fn extract_target_info_nmap_args_takes_first_ip() {
+        let args = serde_json::json!({"target": "10.1.2.121 -p 53,88,135 --open -sv -o"});
+        let info = extract_target_info(&args);
+        assert_eq!(info.target_ip.as_deref(), Some("10.1.2.121"));
+    }
+
+    #[test]
+    fn extract_target_info_multi_fqdn_takes_first() {
+        let args = serde_json::json!({"target": "dc01.contoso.local dc02.contoso.local"});
+        let info = extract_target_info(&args);
+        assert_eq!(info.target_fqdn.as_deref(), Some("dc01.contoso.local"));
+    }
+
+    #[test]
+    fn first_token_extracts_correctly() {
+        assert_eq!(first_token("10.1.2.150 10.1.2.220"), "10.1.2.150");
+        assert_eq!(first_token("10.1.2.121 -p 53,88"), "10.1.2.121");
+        assert_eq!(first_token("single"), "single");
+        assert_eq!(first_token(""), "");
+    }
+
+    #[test]
+    fn is_cidr_detects_ranges() {
+        assert!(is_cidr("10.1.2.0/24"));
+        assert!(is_cidr("192.168.0.0/16"));
+        assert!(is_cidr("10.0.0.0/8"));
+        assert!(!is_cidr("10.1.2.150"));
+        assert!(!is_cidr("dc01.contoso.local"));
+        assert!(!is_cidr("10.1.2.0/abc"));
     }
 
     #[test]

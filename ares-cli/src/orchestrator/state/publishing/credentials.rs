@@ -164,14 +164,33 @@ impl SharedState {
 
                 // Auto-set domain admin when first krbtgt NTLM hash arrives (matches Python)
                 if !state.has_domain_admin {
+                    let da_domain = krbtgt_domain.clone();
                     drop(state);
                     let path = Some("secretsdump → krbtgt NTLM hash".to_string());
-                    if let Err(e) = self.set_domain_admin(queue, path).await {
+                    if let Err(e) = self.set_domain_admin(queue, path.clone()).await {
                         tracing::warn!(err = %e, "Failed to auto-set domain admin from krbtgt hash");
                     } else {
                         tracing::info!(
                             "🎯 Domain Admin auto-set from krbtgt NTLM hash in publish_hash"
                         );
+                        // Emit DA timeline event
+                        let techniques = vec!["T1003.006".to_string(), "T1078.002".to_string()];
+                        let event_id =
+                            format!("evt-da-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+                        let event = serde_json::json!({
+                            "id": event_id,
+                            "timestamp": chrono::Utc::now().to_rfc3339(),
+                            "source": "domain_admin",
+                            "description": format!(
+                                "CRITICAL: Domain Admin achieved for {} via {}",
+                                da_domain,
+                                path.as_deref().unwrap_or("krbtgt hash")
+                            ),
+                            "mitre_techniques": techniques,
+                        });
+                        let _ = self
+                            .persist_timeline_event(queue, &event, &techniques)
+                            .await;
                     }
                 } else {
                     drop(state);

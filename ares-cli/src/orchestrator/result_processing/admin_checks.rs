@@ -7,6 +7,7 @@ use serde_json::Value;
 use tracing::{info, warn};
 
 use super::parsing::has_domain_admin_indicator;
+use super::timeline::{create_admin_upgrade_timeline_event, create_domain_admin_timeline_event};
 use crate::orchestrator::dispatcher::Dispatcher;
 
 /// Determine the domain admin path from a payload.
@@ -80,6 +81,12 @@ pub(crate) async fn check_domain_admin_indicators(payload: &Value, dispatcher: &
         info!("Domain Admin achieved!");
     }
     if !already_da {
+        // Emit Domain Admin timeline event
+        let da_domain = {
+            let state = dispatcher.state.read().await;
+            state.domains.first().cloned().unwrap_or_default()
+        };
+        create_domain_admin_timeline_event(dispatcher, &da_domain, path.as_deref()).await;
         let (domain, dc_target) = {
             let state = dispatcher.state.read().await;
             let domain = state.domains.first().cloned().unwrap_or_default();
@@ -229,6 +236,7 @@ pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher:
                 pwned_host = ?pwned_ip,
                 "Credential upgraded to admin -- dispatching priority secretsdump"
             );
+            create_admin_upgrade_timeline_event(dispatcher, &username, &domain).await;
             let work: Vec<(String, ares_core::models::Credential)> = {
                 let state = dispatcher.state.read().await;
                 let dc_ips: Vec<String> = state.domain_controllers.values().cloned().collect();

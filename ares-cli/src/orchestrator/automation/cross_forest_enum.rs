@@ -176,7 +176,13 @@ pub async fn auto_cross_forest_enum(
                     "authenticate via the forest trust. Report every user found with their ",
                     "group memberships, SPNs, delegation settings, and description fields. ",
                     "Pay special attention to accounts with adminCount=1, ",
-                    "DoesNotRequirePreAuth, or interesting SPNs."
+                    "DoesNotRequirePreAuth, or interesting SPNs.\n\n",
+                    "IMPORTANT: For each user found, include them in the discovered_users ",
+                    "array with EXACTLY this JSON format:\n",
+                    "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
+                    "\"source\": \"ldap_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}\n",
+                    "Also report users with DoesNotRequirePreAuth as vulnerabilities with ",
+                    "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'."
                 ),
             });
 
@@ -228,7 +234,11 @@ pub async fn auto_cross_forest_enum(
                     "Enumerate ALL security groups in this domain and their members. ",
                     "Resolve Foreign Security Principals to their source domain. ",
                     "Report group name, type (Global/DomainLocal/Universal), members, ",
-                    "and managed-by. This is critical for mapping cross-domain attack paths."
+                    "and managed-by. This is critical for mapping cross-domain attack paths.\n\n",
+                    "IMPORTANT: For each user found in any group, include them in the ",
+                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
+                    "\"source\": \"ldap_group_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}"
                 ),
             });
 

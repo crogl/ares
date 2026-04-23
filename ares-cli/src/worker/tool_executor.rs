@@ -287,23 +287,53 @@ async fn execute_and_respond(
                 Some(discoveries)
             };
 
-            // Emit discovery spans for observability
+            // Emit discovery spans for observability.
+            // For "hosts" discoveries, emit one span per discovered host so each
+            // gets a clean destination.address (instead of the raw CIDR/multi-IP
+            // input target). Other discovery types use the extracted target info.
             if let Some(ref disc) = discoveries {
                 if let Some(obj) = disc.as_object() {
                     for (disc_type, items) in obj {
-                        let count = items.as_array().map(|a| a.len()).unwrap_or(0);
-                        if count > 0 {
-                            let span = trace_discovery(
-                                disc_type,
-                                &request.tool_name,
-                                di.target_user.as_deref(),
-                                None,
-                                di.target_ip.as_deref(),
-                                di.target_fqdn.as_deref(),
-                                dt,
-                                request.operation_id.as_deref(),
-                            );
-                            let _guard = span.enter();
+                        if disc_type == "hosts" {
+                            // Per-host spans with individual IPs/hostnames
+                            if let Some(hosts) = items.as_array() {
+                                for host in hosts {
+                                    let host_ip = host.get("ip").and_then(|v| v.as_str());
+                                    let host_fqdn = host
+                                        .get("hostname")
+                                        .and_then(|v| v.as_str())
+                                        .filter(|h| !h.is_empty());
+                                    let host_target_type = host_fqdn
+                                        .map(ares_core::telemetry::target::infer_target_type)
+                                        .or(dt);
+                                    let span = trace_discovery(
+                                        disc_type,
+                                        &request.tool_name,
+                                        di.target_user.as_deref(),
+                                        None,
+                                        host_ip,
+                                        host_fqdn,
+                                        host_target_type,
+                                        request.operation_id.as_deref(),
+                                    );
+                                    let _guard = span.enter();
+                                }
+                            }
+                        } else {
+                            let count = items.as_array().map(|a| a.len()).unwrap_or(0);
+                            if count > 0 {
+                                let span = trace_discovery(
+                                    disc_type,
+                                    &request.tool_name,
+                                    di.target_user.as_deref(),
+                                    None,
+                                    di.target_ip.as_deref(),
+                                    di.target_fqdn.as_deref(),
+                                    dt,
+                                    request.operation_id.as_deref(),
+                                );
+                                let _guard = span.enter();
+                            }
                         }
                     }
                 }

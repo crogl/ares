@@ -444,6 +444,24 @@ impl Dispatcher {
                 "password": credential.password,
                 "domain": credential.domain,
             },
+            "instructions": concat!(
+                "Run certipy find to enumerate ALL certificate templates and CA configurations. ",
+                "Use: certipy find -u 'user@domain' -p 'pass' -dc-ip <target_ip> -vulnerable\n\n",
+                "For each vulnerable template found, register a vulnerability with:\n",
+                "  vuln_type: the ESC type (e.g. 'esc1', 'esc2', 'esc3', 'esc4', 'esc6', 'esc8')\n",
+                "  target: the certificate template name\n",
+                "  target_ip: the CA server IP\n",
+                "  domain: the domain\n",
+                "  details: include template_name, ca_name, enrollee_supplies_subject, ",
+                "client_authentication, any_purpose, enrollment_rights, and which users/groups can enroll\n\n",
+                "Also check:\n",
+                "- ESC1: Enrollee Supplies Subject + Client Authentication + low-priv enrollment\n",
+                "- ESC4: Vulnerable template ACL (GenericAll/WriteDacl/WriteOwner on template)\n",
+                "- ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 flag on CA\n",
+                "- ESC8: Web Enrollment enabled (HTTP endpoint for NTLM relay)\n",
+                "- ESC7: ManageCA or ManageCertificates permissions\n",
+                "If certipy find fails, try: certipy find -u 'user@domain' -p 'pass' -dc-ip <target_ip> -stdout"
+            ),
         });
         self.throttled_submit("recon", "recon", payload, 4).await
     }

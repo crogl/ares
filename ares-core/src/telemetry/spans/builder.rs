@@ -58,13 +58,24 @@ impl AgentSpanBuilder {
         self
     }
 
+    /// Set the target IP. Rejects CIDR ranges and multi-value strings.
     pub fn target_ip(mut self, ip: impl Into<String>) -> Self {
-        self.target.ip = Some(ip.into());
+        let ip = ip.into();
+        // Defense-in-depth: reject values that aren't single IP addresses.
+        // extract_target_info should already sanitize, but guard here too.
+        if !ip.contains('/') && !ip.contains(' ') && ip.parse::<std::net::IpAddr>().is_ok() {
+            self.target.ip = Some(ip);
+        }
         self
     }
 
+    /// Set the target FQDN. Rejects multi-value strings.
     pub fn target_fqdn(mut self, fqdn: impl Into<String>) -> Self {
-        self.target.fqdn = Some(fqdn.into());
+        let fqdn = fqdn.into();
+        // Defense-in-depth: reject values containing spaces or slashes
+        if !fqdn.contains(' ') && !fqdn.contains('/') {
+            self.target.fqdn = Some(fqdn);
+        }
         self
     }
 

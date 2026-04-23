@@ -34,7 +34,10 @@ use self::admin_checks::{
 };
 use self::discovery_polling::has_lockout_in_result;
 use self::parsing::{parse_discoveries, resolve_parent_id};
-use self::timeline::{create_credential_timeline_event, create_hash_timeline_event};
+use self::timeline::{
+    create_credential_timeline_event, create_exploitation_timeline_event,
+    create_hash_timeline_event, create_lateral_movement_timeline_event,
+};
 
 /// Kerberos/SMB errors that indicate a credential is locked out.
 pub(crate) const LOCKOUT_PATTERNS: &[&str] =
@@ -162,6 +165,7 @@ pub async fn process_completed_task(
             {
                 warn!(err = %e, vuln_id = %vuln_id, "Failed to mark vulnerability exploited");
             }
+            create_exploitation_timeline_event(dispatcher, &vuln_id, task_id).await;
         }
     }
 
@@ -326,6 +330,7 @@ async fn auto_chain_s4u_secretsdump(payload: &Value, dispatcher: &Arc<Dispatcher
                 ticket = %ticket_path,
                 "S4U auto-chain: secretsdump dispatched with ticket"
             );
+            create_lateral_movement_timeline_event(dispatcher, &resolved_ip, &ticket_path).await;
         }
         Ok(None) => {}
         Err(e) => warn!(err = %e, "S4U auto-chain: failed to dispatch secretsdump"),
@@ -389,9 +394,11 @@ async fn extract_from_raw_text(
 
     for cred in extracted.credentials {
         let is_cracked = cred.source.starts_with("cracked:");
-        let cracked_username = cred.username.clone();
-        let cracked_domain = cred.domain.clone();
-        let cracked_password = cred.password.clone();
+        let source = cred.source.clone();
+        let username = cred.username.clone();
+        let domain = cred.domain.clone();
+        let password = cred.password.clone();
+        let is_admin = cred.is_admin;
         match dispatcher
             .state
             .publish_credential(&dispatcher.queue, cred)
@@ -399,6 +406,8 @@ async fn extract_from_raw_text(
         {
             Ok(true) => {
                 new_count += 1;
+                create_credential_timeline_event(dispatcher, &source, &username, &domain, is_admin)
+                    .await;
                 // When a cracked credential is published, update the corresponding
                 // hash's cracked_password field in state and Redis.
                 if is_cracked {
@@ -406,9 +415,9 @@ async fn extract_from_raw_text(
                         .state
                         .update_hash_cracked_password(
                             &dispatcher.queue,
-                            &cracked_username,
-                            &cracked_domain,
-                            &cracked_password,
+                            &username,
+                            &domain,
+                            &password,
                         )
                         .await;
                 }
@@ -419,8 +428,24 @@ async fn extract_from_raw_text(
     }
 
     for hash in extracted.hashes {
+        let username = hash.username.clone();
+        let domain = hash.domain.clone();
+        let hash_type = hash.hash_type.clone();
+        let hash_value = hash.hash_value.clone();
+        let source = hash.source.clone();
         match dispatcher.state.publish_hash(&dispatcher.queue, hash).await {
-            Ok(true) => new_count += 1,
+            Ok(true) => {
+                new_count += 1;
+                create_hash_timeline_event(
+                    dispatcher,
+                    &username,
+                    &domain,
+                    &hash_type,
+                    &hash_value,
+                    &source,
+                )
+                .await;
+            }
             Ok(false) => {}
             Err(e) => warn!(err = %e, "Failed to publish text-extracted hash"),
         }

@@ -115,6 +115,134 @@ pub(crate) async fn create_hash_timeline_event(
         .await;
 }
 
+/// Emit a timeline event when a credential is upgraded to admin (Pwn3d! detected).
+pub(crate) async fn create_admin_upgrade_timeline_event(
+    dispatcher: &Arc<Dispatcher>,
+    username: &str,
+    domain: &str,
+) {
+    let techniques = vec!["T1078".to_string()]; // Valid Accounts
+    let event_id = format!(
+        "evt-admin-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let event = serde_json::json!({
+        "id": event_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "admin_upgrade",
+        "description": format!("Admin access confirmed: {domain}\\{username} (Pwn3d!)"),
+        "mitre_techniques": techniques,
+    });
+    let _ = dispatcher
+        .state
+        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
+        .await;
+}
+
+/// Emit a timeline event when a vulnerability is exploited.
+pub(crate) async fn create_exploitation_timeline_event(
+    dispatcher: &Arc<Dispatcher>,
+    vuln_id: &str,
+    task_id: &str,
+) {
+    let techniques = exploitation_techniques(vuln_id);
+    let event_id = format!(
+        "evt-exploit-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let event = serde_json::json!({
+        "id": event_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "exploitation",
+        "description": format!("Vulnerability exploited: {vuln_id} (task {task_id})"),
+        "mitre_techniques": techniques,
+    });
+    let _ = dispatcher
+        .state
+        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
+        .await;
+}
+
+/// Emit a timeline event for lateral movement via S4U/delegation.
+pub(crate) async fn create_lateral_movement_timeline_event(
+    dispatcher: &Arc<Dispatcher>,
+    target: &str,
+    _ticket_path: &str,
+) {
+    let techniques = vec![
+        "T1550.003".to_string(), // Use Alternate Authentication Material: Pass the Ticket
+        "T1021".to_string(),     // Remote Services
+    ];
+    let event_id = format!(
+        "evt-lateral-{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..8]
+    );
+    let event = serde_json::json!({
+        "id": event_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "s4u_lateral_movement",
+        "description": format!("Lateral movement via S4U delegation to {target}"),
+        "mitre_techniques": techniques,
+    });
+    let _ = dispatcher
+        .state
+        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
+        .await;
+}
+
+/// Emit a timeline event when Domain Admin is achieved.
+pub(crate) async fn create_domain_admin_timeline_event(
+    dispatcher: &Arc<Dispatcher>,
+    domain: &str,
+    path: Option<&str>,
+) {
+    let techniques = vec![
+        "T1003.006".to_string(), // OS Credential Dumping: DCSync
+        "T1078.002".to_string(), // Valid Accounts: Domain Accounts
+    ];
+    let event_id = format!("evt-da-{}", &uuid::Uuid::new_v4().simple().to_string()[..8]);
+    let description = match path {
+        Some(p) => format!("CRITICAL: Domain Admin achieved for {domain} via {p}"),
+        None => format!("CRITICAL: Domain Admin achieved for {domain}"),
+    };
+    let event = serde_json::json!({
+        "id": event_id,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+        "source": "domain_admin",
+        "description": description,
+        "mitre_techniques": techniques,
+    });
+    let _ = dispatcher
+        .state
+        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
+        .await;
+}
+
+/// Map vulnerability IDs to MITRE ATT&CK technique IDs.
+fn exploitation_techniques(vuln_id: &str) -> Vec<String> {
+    let vuln_lower = vuln_id.to_lowercase();
+    let mut techniques = vec!["T1210".to_string()]; // Exploitation of Remote Services (base)
+    if vuln_lower.contains("constrained_delegation") {
+        techniques.push("T1558.003".to_string()); // Kerberoasting (S4U)
+    }
+    if vuln_lower.contains("unconstrained_delegation") {
+        techniques.push("T1558".to_string()); // Steal or Forge Kerberos Tickets
+    }
+    if vuln_lower.contains("mssql") {
+        techniques.push("T1505".to_string()); // Server Software Component
+    }
+    if vuln_lower.contains("esc1") || vuln_lower.contains("esc4") || vuln_lower.contains("esc8") {
+        techniques.push("T1649".to_string()); // Steal or Forge Authentication Certificates
+    }
+    if vuln_lower.contains("rbcd") {
+        techniques.push("T1134.001".to_string()); // Access Token Manipulation: Token Impersonation
+    }
+    if vuln_lower.contains("smb_signing") {
+        techniques.push("T1557.001".to_string()); // LLMNR/NBT-NS Poisoning (relay)
+    }
+    techniques
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -255,5 +383,55 @@ mod tests {
     #[test]
     fn critical_hash_regular_user() {
         assert!(!is_critical_hash("jsmith"));
+    }
+
+    // --- exploitation_techniques ---
+
+    #[test]
+    fn exploitation_techniques_base() {
+        let t = exploitation_techniques("some_vuln");
+        assert!(t.contains(&"T1210".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_constrained_delegation() {
+        let t = exploitation_techniques("constrained_delegation_dc01");
+        assert!(t.contains(&"T1558.003".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_mssql() {
+        let t = exploitation_techniques("mssql_impersonation_braavos");
+        assert!(t.contains(&"T1505".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_esc1() {
+        let t = exploitation_techniques("esc1_template");
+        assert!(t.contains(&"T1649".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_esc4() {
+        let t = exploitation_techniques("esc4_template");
+        assert!(t.contains(&"T1649".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_rbcd() {
+        let t = exploitation_techniques("rbcd_dc01");
+        assert!(t.contains(&"T1134.001".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_smb_signing() {
+        let t = exploitation_techniques("smb_signing_disabled_192.168.58.10");
+        assert!(t.contains(&"T1557.001".to_string()));
+    }
+
+    #[test]
+    fn exploitation_techniques_unconstrained() {
+        let t = exploitation_techniques("unconstrained_delegation_ws01");
+        assert!(t.contains(&"T1558".to_string()));
     }
 }
