@@ -182,4 +182,101 @@ mod tests {
         let empty = Some("".to_string()).filter(|h| !h.is_empty());
         assert!(empty.is_none());
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = serde_json::json!({
+            "technique": "certifried",
+            "cve": "CVE-2022-26923",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "dc_hostname": "dc01.contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "certifried");
+        assert_eq!(payload["cve"], "CVE-2022-26923");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["dc_hostname"], "dc01.contoso.local");
+    }
+
+    #[test]
+    fn payload_without_dc_hostname() {
+        let payload = serde_json::json!({
+            "technique": "certifried",
+            "cve": "CVE-2022-26923",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "dc_hostname": null,
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert!(payload["dc_hostname"].is_null());
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = CertifriedWork {
+            dedup_key: "certifried:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            dc_hostname: Some("dc01.contoso.local".into()),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.dc_hostname, Some("dc01.contoso.local".into()));
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn work_struct_without_hostname() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = CertifriedWork {
+            dedup_key: "certifried:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            dc_hostname: None,
+            credential: cred,
+        };
+        assert!(work.dc_hostname.is_none());
+    }
 }

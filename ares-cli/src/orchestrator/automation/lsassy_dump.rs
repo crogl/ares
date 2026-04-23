@@ -187,4 +187,121 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "lsassy_dump",
+            "target_ip": "192.168.58.22",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "lsassy_dump");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["hostname"], "srv01.contoso.local");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = LsassyWork {
+            dedup_key: "lsassy:192.168.58.22".into(),
+            host_ip: "192.168.58.22".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.dedup_key, "lsassy:192.168.58.22");
+        assert_eq!(work.host_ip, "192.168.58.22");
+        assert_eq!(work.hostname, "srv01.contoso.local");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn domain_extraction_from_fabrikam() {
+        let hostname = "sql01.fabrikam.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn dedup_key_with_various_ips() {
+        let ips = ["192.168.58.10", "192.168.58.240", "192.168.58.1"];
+        for ip in &ips {
+            let key = format!("lsassy:{ip}");
+            assert!(key.starts_with("lsassy:"));
+            assert!(key.ends_with(ip));
+        }
+    }
+
+    #[test]
+    fn credential_preference_admin_flag() {
+        let admin_cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "domainadmin".into(),
+            password: "AdminPass!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let regular_cred = ares_core::models::Credential {
+            id: "c2".into(),
+            username: "user1".into(),
+            password: "UserPass!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let creds = [regular_cred, admin_cred];
+        // Fallback logic: find admin credential
+        let admin = creds.iter().find(|c| c.is_admin && !c.password.is_empty());
+        assert!(admin.is_some());
+        assert_eq!(admin.unwrap().username, "domainadmin");
+    }
 }

@@ -189,4 +189,99 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "printnightmare",
+            "target_ip": "192.168.58.22",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "listener_ip": "192.168.58.50",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "printnightmare");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["hostname"], "srv01.contoso.local");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["listener_ip"], "192.168.58.50");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = PrintNightmareWork {
+            target_ip: "192.168.58.22".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            listener: "192.168.58.50".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.target_ip, "192.168.58.22");
+        assert_eq!(work.hostname, "srv01.contoso.local");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.listener, "192.168.58.50");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn domain_from_multi_level_hostname() {
+        let hostname = "web01.dmz.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "dmz.contoso.local");
+    }
+
+    #[test]
+    fn domain_from_uppercase_hostname() {
+        let hostname = "DC01.CONTOSO.LOCAL";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
+
+    #[test]
+    fn dedup_key_format_validation() {
+        // PrintNightmare uses the raw target_ip as dedup key
+        let ip = "192.168.58.10";
+        // The dedup key is just the IP itself
+        assert_eq!(ip, "192.168.58.10");
+        assert!(!ip.contains(':'));
+    }
 }

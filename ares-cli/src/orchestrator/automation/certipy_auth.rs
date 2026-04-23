@@ -254,4 +254,100 @@ mod tests {
             .unwrap_or("administrator");
         assert_eq!(user2, "administrator");
     }
+
+    #[test]
+    fn cert_auth_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "certipy_auth",
+            "vuln_id": "cert-001",
+            "pfx_path": "/tmp/cert.pfx",
+            "domain": "contoso.local",
+            "target_user": "administrator",
+        });
+        assert_eq!(payload["technique"], "certipy_auth");
+        assert_eq!(payload["pfx_path"], "/tmp/cert.pfx");
+        assert_eq!(payload["target_user"], "administrator");
+    }
+
+    #[test]
+    fn cert_auth_payload_with_dc() {
+        let mut payload = serde_json::json!({
+            "technique": "certipy_auth",
+            "vuln_id": "cert-001",
+            "pfx_path": "/tmp/cert.pfx",
+            "domain": "contoso.local",
+            "target_user": "administrator",
+        });
+        let dc_ip = Some("192.168.58.10".to_string());
+        if let Some(ref dc) = dc_ip {
+            payload["target_ip"] = serde_json::json!(dc);
+            payload["dc_ip"] = serde_json::json!(dc);
+        }
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["dc_ip"], "192.168.58.10");
+    }
+
+    #[test]
+    fn cert_auth_payload_without_dc() {
+        let payload = serde_json::json!({
+            "technique": "certipy_auth",
+            "vuln_id": "cert-001",
+            "pfx_path": "/tmp/cert.pfx",
+            "domain": "contoso.local",
+            "target_user": "administrator",
+        });
+        assert!(payload.get("target_ip").is_none());
+        assert!(payload.get("dc_ip").is_none());
+    }
+
+    #[test]
+    fn target_user_upn_fallback() {
+        let details = serde_json::json!({"upn": "admin@contoso.local"});
+        let user = details
+            .get("target_user")
+            .or_else(|| details.get("upn"))
+            .or_else(|| details.get("account_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("administrator");
+        assert_eq!(user, "admin@contoso.local");
+    }
+
+    #[test]
+    fn target_user_account_name_fallback() {
+        let details = serde_json::json!({"account_name": "svc_sql"});
+        let user = details
+            .get("target_user")
+            .or_else(|| details.get("upn"))
+            .or_else(|| details.get("account_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("administrator");
+        assert_eq!(user, "svc_sql");
+    }
+
+    #[test]
+    fn cert_auth_work_construction() {
+        let work = CertAuthWork {
+            vuln_id: "cert-001".into(),
+            dedup_key: "cert_auth:cert-001".into(),
+            pfx_path: "/tmp/cert.pfx".into(),
+            domain: "contoso.local".into(),
+            target_user: "administrator".into(),
+            dc_ip: Some("192.168.58.10".into()),
+        };
+        assert_eq!(work.vuln_id, "cert-001");
+        assert_eq!(work.dc_ip, Some("192.168.58.10".into()));
+    }
+
+    #[test]
+    fn cert_auth_work_no_dc() {
+        let work = CertAuthWork {
+            vuln_id: "cert-002".into(),
+            dedup_key: "cert_auth:cert-002".into(),
+            pfx_path: "/tmp/cert2.pfx".into(),
+            domain: "fabrikam.local".into(),
+            target_user: "admin".into(),
+            dc_ip: None,
+        };
+        assert!(work.dc_ip.is_none());
+    }
 }

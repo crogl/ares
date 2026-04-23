@@ -140,4 +140,77 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_GPP_SYSVOL, "gpp_sysvol");
     }
+
+    #[test]
+    fn payload_contains_both_techniques() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "techniques": ["gpp_password_finder", "sysvol_script_search"],
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        let techniques = payload["techniques"].as_array().unwrap();
+        assert_eq!(techniques.len(), 2);
+        assert_eq!(techniques[0], "gpp_password_finder");
+        assert_eq!(techniques[1], "sysvol_script_search");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = GppSysvolWork {
+            dedup_key: "gpp:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.dedup_key, "gpp:contoso.local");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("gpp:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "gpp:contoso.local");
+    }
+
+    #[test]
+    fn two_tasks_per_domain() {
+        // The payload dispatches two techniques in a single submission per domain
+        let techniques = ["gpp_password_finder", "sysvol_script_search"];
+        assert_eq!(techniques.len(), 2);
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_domain() {
+        let key1 = format!("gpp:{}", "contoso.local");
+        let key2 = format!("gpp:{}", "fabrikam.local");
+        assert_ne!(key1, key2);
+    }
 }

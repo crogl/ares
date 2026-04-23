@@ -290,4 +290,146 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "contoso.local");
     }
+
+    #[test]
+    fn webdav_service_detection_webclient() {
+        let services = ["WebClient service running".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(has_webdav);
+    }
+
+    #[test]
+    fn webdav_service_detection_case_insensitive() {
+        let services = ["80/TCP WEBDAV".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(has_webdav);
+    }
+
+    #[test]
+    fn webdav_service_not_port_80_without_http() {
+        // Port 80 alone without "http" keyword should not match
+        let services = ["80/tcp other_service".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(!has_webdav);
+    }
+
+    #[test]
+    fn domain_from_hostname_bare() {
+        let hostname = "web01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
+
+    #[test]
+    fn domain_from_hostname_subdomain() {
+        let hostname = "web01.child.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "child.contoso.local");
+    }
+
+    #[test]
+    fn vuln_id_format_various_ips() {
+        let ips = ["192.168.58.10", "192.168.58.22", "192.168.58.240"];
+        for ip in ips {
+            let vuln_id = format!("webdav_enabled_{}", ip.replace('.', "_"));
+            assert!(vuln_id.starts_with("webdav_enabled_"));
+            assert!(!vuln_id.contains('.'));
+        }
+    }
+
+    #[test]
+    fn credential_domain_matching() {
+        let domain = "contoso.local".to_string();
+        let cred_domain = "CONTOSO.LOCAL";
+        assert_eq!(cred_domain.to_lowercase(), domain);
+    }
+
+    #[test]
+    fn credential_domain_matching_empty_domain() {
+        let domain = "".to_string();
+        let cred_domain = "contoso.local";
+        // When domain is empty, the first branch should fail and fall through
+        let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain;
+        assert!(!matches);
+    }
+
+    #[test]
+    fn webdav_vuln_details_construction() {
+        let hostname = "web01.contoso.local".to_string();
+        let domain = "contoso.local".to_string();
+        let target_ip = "192.168.58.22".to_string();
+        let mut d = std::collections::HashMap::new();
+        d.insert(
+            "hostname".to_string(),
+            serde_json::Value::String(hostname.clone()),
+        );
+        d.insert(
+            "domain".to_string(),
+            serde_json::Value::String(domain.clone()),
+        );
+        d.insert(
+            "target_ip".to_string(),
+            serde_json::Value::String(target_ip.clone()),
+        );
+        assert_eq!(d.len(), 3);
+        assert_eq!(d["hostname"], serde_json::json!("web01.contoso.local"));
+        assert_eq!(d["domain"], serde_json::json!("contoso.local"));
+        assert_eq!(d["target_ip"], serde_json::json!("192.168.58.22"));
+    }
+
+    #[test]
+    fn webdav_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "webdav_check",
+            "target_ip": "192.168.58.22",
+            "hostname": "web01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "webdav_check");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["hostname"], "web01.contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+    }
+
+    #[test]
+    fn empty_services_no_webdav() {
+        let services: Vec<String> = vec![];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(!has_webdav);
+    }
 }

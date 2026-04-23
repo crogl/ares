@@ -222,4 +222,112 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "winrm_exec",
+            "target_ip": "192.168.58.30",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "winrm_exec");
+        assert_eq!(payload["target_ip"], "192.168.58.30");
+        assert_eq!(payload["hostname"], "srv01.contoso.local");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = WinRmWork {
+            dedup_key: "winrm:192.168.58.30".into(),
+            target_ip: "192.168.58.30".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.dedup_key, "winrm:192.168.58.30");
+        assert_eq!(work.target_ip, "192.168.58.30");
+        assert_eq!(work.hostname, "srv01.contoso.local");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn winrm_service_detection_variations() {
+        let test_cases = vec![
+            (vec!["5985/tcp http".to_string()], true),
+            (vec!["5986/tcp ssl/http".to_string()], true),
+            (vec!["winrm-service".to_string()], true),
+            (vec!["WinRM".to_string()], true),
+            (vec!["445/tcp smb".to_string()], false),
+            (vec!["3389/tcp rdp".to_string()], false),
+        ];
+
+        for (services, expected) in test_cases {
+            let has_winrm = services.iter().any(|s| {
+                let sl = s.to_lowercase();
+                sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+            });
+            assert_eq!(
+                has_winrm, expected,
+                "Services {:?} should have winrm={expected}",
+                services
+            );
+        }
+    }
+
+    #[test]
+    fn domain_from_fabrikam_host() {
+        let hostname = "web01.fabrikam.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn empty_services() {
+        let services: Vec<String> = vec![];
+        let has_winrm = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+        });
+        assert!(!has_winrm, "Empty services should not detect WinRM");
+    }
 }

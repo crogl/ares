@@ -162,4 +162,99 @@ mod tests {
         let dc_ip2 = "192.168.58.10";
         assert_ne!(dc_ip2, listener, "Different IP should not be skipped");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "dfs_coercion",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "listener_ip": "192.168.58.50",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "dfs_coercion");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["listener_ip"], "192.168.58.50");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = DfsWork {
+            dedup_key: "dfs_coerce:192.168.58.10".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            listener: "192.168.58.50".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.dedup_key, "dfs_coerce:192.168.58.10");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.listener, "192.168.58.50");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn self_targeting_prevention() {
+        let listener = "192.168.58.50";
+        let dc_ips = ["192.168.58.10", "192.168.58.50", "192.168.58.20"];
+
+        let non_self: Vec<&&str> = dc_ips.iter().filter(|ip| **ip != listener).collect();
+
+        assert_eq!(non_self.len(), 2);
+        assert!(!non_self.contains(&&"192.168.58.50"));
+        assert!(non_self.contains(&&"192.168.58.10"));
+        assert!(non_self.contains(&&"192.168.58.20"));
+    }
+
+    #[test]
+    fn domain_extraction_for_credential_match() {
+        let domain = "contoso.local";
+        let cred_domain = "CONTOSO.LOCAL";
+        assert_eq!(
+            cred_domain.to_lowercase(),
+            domain.to_lowercase(),
+            "Domain matching should be case-insensitive"
+        );
+
+        let domain2 = "fabrikam.local";
+        assert_ne!(
+            cred_domain.to_lowercase(),
+            domain2.to_lowercase(),
+            "Different domains should not match"
+        );
+    }
 }

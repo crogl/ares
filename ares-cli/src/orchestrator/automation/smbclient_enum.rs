@@ -210,4 +210,91 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "CONTOSO.LOCAL");
     }
+
+    #[test]
+    fn smb_service_detection_cifs() {
+        let services = ["cifs share".to_string()];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(has_smb);
+    }
+
+    #[test]
+    fn domain_from_bare_hostname() {
+        let hostname = "srv01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_string())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
+
+    #[test]
+    fn smb_enum_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "authenticated_share_enumeration",
+            "target_ip": "192.168.58.22",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "authenticated_share_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["credential"]["username"], "admin");
+    }
+
+    #[test]
+    fn credential_domain_matching_case_insensitive() {
+        let domain = "contoso.local";
+        let cred_domain = "CONTOSO.LOCAL";
+        assert_eq!(cred_domain.to_lowercase(), domain.to_lowercase());
+    }
+
+    #[test]
+    fn credential_domain_matching_empty_skips() {
+        let domain = "".to_string();
+        let cred_domain = "contoso.local";
+        let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain.to_lowercase();
+        assert!(!matches);
+    }
+
+    #[test]
+    fn smb_enum_work_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = SmbEnumWork {
+            dedup_key: "smb_auth_enum:192.168.58.22".into(),
+            target_ip: "192.168.58.22".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            credential: cred,
+        };
+        assert_eq!(work.target_ip, "192.168.58.22");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn empty_services_no_smb() {
+        let services: Vec<String> = vec![];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(!has_smb);
+    }
 }

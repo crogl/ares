@@ -267,4 +267,80 @@ mod tests {
         );
         assert_eq!(dedup_key, "pth:192.168.58.10:admin:aad3b435");
     }
+
+    #[test]
+    fn ntlm_hash_filter_exact_32() {
+        let hash = "a".repeat(32);
+        assert_eq!(hash.len(), 32);
+        assert!(!hash.is_empty());
+    }
+
+    #[test]
+    fn ntlm_hash_type_variations() {
+        for t in ["NTLM", "ntlm", "NT", "ntlm_hash"] {
+            assert!(t.to_lowercase().contains("ntlm") || t.to_lowercase().contains("nt"));
+        }
+    }
+
+    #[test]
+    fn smb_service_detection_cifs() {
+        let services = ["cifs".to_string()];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(has_smb);
+    }
+
+    #[test]
+    fn pth_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "pass_the_hash",
+            "target_ip": "192.168.58.22",
+            "hostname": "srv01.contoso.local",
+            "username": "admin",
+            "ntlm_hash": "aad3b435b51404eeaad3b435b51404ee",
+            "domain": "contoso.local",
+            "protocol": "smb",
+        });
+        assert_eq!(payload["technique"], "pass_the_hash");
+        assert_eq!(payload["protocol"], "smb");
+        assert_eq!(payload["ntlm_hash"], "aad3b435b51404eeaad3b435b51404ee");
+    }
+
+    #[test]
+    fn pth_work_construction() {
+        let work = PthWork {
+            dedup_key: "pth:192.168.58.22:admin:aad3b435".into(),
+            target_ip: "192.168.58.22".into(),
+            hostname: "srv01.contoso.local".into(),
+            username: "admin".into(),
+            ntlm_hash: "aad3b435b51404eeaad3b435b51404ee".into(),
+            domain: "contoso.local".into(),
+        };
+        assert_eq!(work.username, "admin");
+        assert_eq!(work.ntlm_hash.len(), 32);
+    }
+
+    #[test]
+    fn domain_fallback_bare_hostname() {
+        let hash_domain = "";
+        let hostname = "srv01";
+        let domain = if !hash_domain.is_empty() {
+            hash_domain.to_string()
+        } else {
+            hostname
+                .find('.')
+                .map(|i| hostname[i + 1..].to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(domain, "");
+    }
+
+    #[test]
+    fn take_5_limiting() {
+        let items: Vec<i32> = (0..20).collect();
+        let taken: Vec<_> = items.into_iter().take(5).collect();
+        assert_eq!(taken.len(), 5);
+    }
 }

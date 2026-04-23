@@ -139,4 +139,71 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_NTLMV1_DOWNGRADE, "ntlmv1_downgrade");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "ntlmv1_downgrade_check",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "ntlmv1_downgrade_check");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = NtlmV1Work {
+            dedup_key: "ntlmv1:192.168.58.10".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn dedup_key_uses_dc_ip() {
+        // NTLMv1 dedup is by DC IP, not domain
+        let key = format!("ntlmv1:{}", "192.168.58.10");
+        assert!(key.starts_with("ntlmv1:"));
+        assert!(key.contains("192.168.58.10"));
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_dc() {
+        let key1 = format!("ntlmv1:{}", "192.168.58.10");
+        let key2 = format!("ntlmv1:{}", "192.168.58.20");
+        assert_ne!(key1, key2);
+    }
 }

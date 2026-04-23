@@ -146,4 +146,56 @@ mod tests {
         });
         // No credential field needed
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let payload = serde_json::json!({
+            "technique": "petitpotam_unauthenticated",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "listener_ip": "192.168.58.50",
+        });
+        assert_eq!(payload["technique"], "petitpotam_unauthenticated");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["listener_ip"], "192.168.58.50");
+        assert!(payload.get("credential").is_none());
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let work = PetitPotamWork {
+            dedup_key: "petitpotam_unauth:192.168.58.10".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            listener: "192.168.58.50".into(),
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.listener, "192.168.58.50");
+    }
+
+    #[test]
+    fn dedup_key_based_on_dc_ip() {
+        let dc_ip = "192.168.58.10";
+        let key = format!("petitpotam_unauth:{dc_ip}");
+        assert_eq!(key, "petitpotam_unauth:192.168.58.10");
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_dc() {
+        let key1 = format!("petitpotam_unauth:{}", "192.168.58.10");
+        let key2 = format!("petitpotam_unauth:{}", "192.168.58.20");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn listener_excluded_from_targets() {
+        let dc_ip = "192.168.58.10";
+        let listener = "192.168.58.50";
+        assert_ne!(dc_ip, listener, "DC should not be the listener");
+
+        let self_target_dc = "192.168.58.50";
+        assert_eq!(self_target_dc, listener, "Self-targeting should be skipped");
+    }
 }

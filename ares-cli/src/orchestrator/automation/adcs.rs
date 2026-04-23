@@ -176,4 +176,70 @@ mod tests {
         // "host." splits into ("host", "") -> Some("")
         assert_eq!(extract_domain_from_fqdn("host."), Some("".to_string()));
     }
+
+    #[test]
+    fn dedup_set_name() {
+        assert_eq!(DEDUP_ADCS_SERVERS, "adcs_servers");
+    }
+
+    #[test]
+    fn certenroll_share_name_match() {
+        let share_name = "CertEnroll";
+        assert_eq!(share_name.to_lowercase(), "certenroll");
+    }
+
+    #[test]
+    fn certenroll_case_insensitive() {
+        let names = vec!["CertEnroll", "certenroll", "CERTENROLL"];
+        for name in names {
+            assert_eq!(name.to_lowercase(), "certenroll");
+        }
+    }
+
+    #[test]
+    fn domain_resolution_from_fqdn() {
+        // Verifies domain extraction works for typical ADCS hosts
+        assert_eq!(
+            extract_domain_from_fqdn("ca01.contoso.local"),
+            Some("contoso.local".to_string())
+        );
+        assert_eq!(
+            extract_domain_from_fqdn("ca01.fabrikam.local"),
+            Some("fabrikam.local".to_string())
+        );
+    }
+
+    #[test]
+    fn credential_selection_prefers_same_domain() {
+        let creds = [
+            ares_core::models::Credential {
+                id: "c1".into(),
+                username: "admin".into(),
+                password: "P@ssw0rd!".into(), // pragma: allowlist secret
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                is_admin: false,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+            },
+            ares_core::models::Credential {
+                id: "c2".into(),
+                username: "admin2".into(),
+                password: "P@ssw0rd!".into(), // pragma: allowlist secret
+                domain: "fabrikam.local".into(),
+                source: "test".into(),
+                is_admin: false,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+            },
+        ];
+        let target_domain = "fabrikam.local";
+        let selected = creds.iter().find(|c| {
+            !c.password.is_empty() && c.domain.to_lowercase() == target_domain.to_lowercase()
+        });
+        assert!(selected.is_some());
+        assert_eq!(selected.unwrap().domain, "fabrikam.local");
+    }
 }

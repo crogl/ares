@@ -161,4 +161,96 @@ mod tests {
         });
         assert!(payload.get("credential").is_none());
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let payload = serde_json::json!({
+            "technique": "dns_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+        });
+        assert_eq!(payload["technique"], "dns_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn payload_with_credential() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let mut payload = serde_json::json!({
+            "technique": "dns_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+        });
+        payload["credential"] = serde_json::json!({
+            "username": cred.username,
+            "password": cred.password,
+            "domain": cred.domain,
+        });
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let work = DnsEnumWork {
+            dedup_key: "dns_enum:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: None,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert!(work.credential.is_none());
+    }
+
+    #[test]
+    fn work_struct_with_credential() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = DnsEnumWork {
+            dedup_key: "dns_enum:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: Some(cred),
+        };
+        assert!(work.credential.is_some());
+        assert_eq!(work.credential.unwrap().username, "admin");
+    }
+
+    #[test]
+    fn dedup_key_domain_based() {
+        let domain1 = "contoso.local";
+        let domain2 = "fabrikam.local";
+        let key1 = format!("dns_enum:{}", domain1.to_lowercase());
+        let key2 = format!("dns_enum:{}", domain2.to_lowercase());
+        assert_ne!(key1, key2);
+        assert_eq!(key1, "dns_enum:contoso.local");
+        assert_eq!(key2, "dns_enum:fabrikam.local");
+    }
+
+    #[test]
+    fn case_normalization_mixed() {
+        let key = format!("dns_enum:{}", "Contoso.Local".to_lowercase());
+        assert_eq!(key, "dns_enum:contoso.local");
+    }
 }

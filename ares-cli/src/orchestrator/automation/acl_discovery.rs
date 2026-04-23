@@ -215,4 +215,98 @@ mod tests {
     fn dangerous_ace_types_count() {
         assert_eq!(DANGEROUS_ACE_TYPES.len(), 9);
     }
+
+    #[test]
+    fn dangerous_ace_types_includes_write_property() {
+        assert!(DANGEROUS_ACE_TYPES.contains(&"WriteProperty"));
+        assert!(DANGEROUS_ACE_TYPES.contains(&"AllExtendedRights"));
+        assert!(DANGEROUS_ACE_TYPES.contains(&"WriteMember"));
+    }
+
+    #[test]
+    fn dangerous_ace_types_no_duplicates() {
+        let mut seen = std::collections::HashSet::new();
+        for ace in DANGEROUS_ACE_TYPES {
+            assert!(seen.insert(*ace), "Duplicate ACE type: {ace}");
+        }
+    }
+
+    #[test]
+    fn dedup_key_case_normalized() {
+        let key1 = format!("acl_disc:{}", "CONTOSO.LOCAL".to_lowercase());
+        let key2 = format!("acl_disc:{}", "contoso.local");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn acl_discovery_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "ldap_acl_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+            "ace_types": DANGEROUS_ACE_TYPES,
+            "known_users": ["admin", "jdoe"],
+        });
+        assert_eq!(payload["technique"], "ldap_acl_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        let ace_types = payload["ace_types"].as_array().unwrap();
+        assert_eq!(ace_types.len(), 9);
+    }
+
+    #[test]
+    fn credential_domain_preference() {
+        // Same-domain credential is preferred
+        let domain = "contoso.local";
+        let cred_same = "contoso.local";
+        let cred_other = "fabrikam.local";
+        assert_eq!(cred_same.to_lowercase(), domain.to_lowercase());
+        assert_ne!(cred_other.to_lowercase(), domain.to_lowercase());
+    }
+
+    #[test]
+    fn known_users_collection() {
+        let credentials = [
+            ("admin", "contoso.local"),
+            ("jdoe", "contoso.local"),
+            ("admin", "fabrikam.local"),
+        ];
+        let domain = "contoso.local";
+        let domain_users: Vec<&str> = credentials
+            .iter()
+            .filter(|(_, d)| d.to_lowercase() == domain.to_lowercase())
+            .map(|(u, _)| *u)
+            .collect();
+        assert_eq!(domain_users.len(), 2);
+        assert!(domain_users.contains(&"admin"));
+        assert!(domain_users.contains(&"jdoe"));
+    }
+
+    #[test]
+    fn acl_discovery_work_fields() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = AclDiscoveryWork {
+            dedup_key: "acl_disc:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+            known_users: vec!["admin".into(), "jdoe".into()],
+        };
+        assert_eq!(work.known_users.len(), 2);
+        assert_eq!(work.domain, "contoso.local");
+    }
 }

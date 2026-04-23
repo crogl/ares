@@ -155,4 +155,112 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_NOPAC, "nopac");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "nopac",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "nopac");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = NopacWork {
+            dedup_key: "nopac:contoso.local:192.168.58.10".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.dedup_key, "nopac:contoso.local:192.168.58.10");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn dedup_key_case_normalization() {
+        let domain = "CONTOSO.LOCAL";
+        let dc_ip = "192.168.58.10";
+        let key = format!("nopac:{}:{}", domain.to_lowercase(), dc_ip);
+        assert_eq!(key, "nopac:contoso.local:192.168.58.10");
+
+        let domain2 = "Fabrikam.Local";
+        let key2 = format!("nopac:{}:{}", domain2.to_lowercase(), "192.168.58.20");
+        assert_eq!(key2, "nopac:fabrikam.local:192.168.58.20");
+    }
+
+    #[test]
+    fn domain_matching_for_credential_selection() {
+        let cred_contoso = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let cred_fabrikam = ares_core::models::Credential {
+            id: "c2".into(),
+            username: "fabadmin".into(),
+            password: "FabPass!".into(), // pragma: allowlist secret
+            domain: "fabrikam.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let creds = [cred_contoso, cred_fabrikam];
+        let target_domain = "fabrikam.local";
+
+        let matched = creds
+            .iter()
+            .find(|c| c.domain.to_lowercase() == target_domain.to_lowercase());
+        assert!(matched.is_some());
+        assert_eq!(matched.unwrap().username, "fabadmin");
+    }
 }

@@ -206,4 +206,116 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "contoso.local");
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "krbrelayup",
+            "target_ip": "192.168.58.30",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "krbrelayup");
+        assert_eq!(payload["target_ip"], "192.168.58.30");
+        assert_eq!(payload["hostname"], "srv01.contoso.local");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = KrbRelayUpWork {
+            dedup_key: "krbrelayup:192.168.58.30".into(),
+            target_ip: "192.168.58.30".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.dedup_key, "krbrelayup:192.168.58.30");
+        assert_eq!(work.target_ip, "192.168.58.30");
+        assert_eq!(work.hostname, "srv01.contoso.local");
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.credential.username, "testuser");
+    }
+
+    #[test]
+    fn ldap_signing_not_enforced_matches() {
+        let vtype = "ldap_signing_not_enforced".to_lowercase();
+        // The code checks for "ldap_signing_disabled" or "ldap_signing_not_required"
+        let matches = vtype == "ldap_signing_disabled" || vtype == "ldap_signing_not_required";
+        assert!(
+            !matches,
+            "ldap_signing_not_enforced should NOT match the specific vuln types"
+        );
+    }
+
+    #[test]
+    fn non_matching_vuln_types() {
+        let types = [
+            "esc1",
+            "smb_signing_disabled",
+            "unconstrained_delegation",
+            "mssql_access",
+        ];
+        for t in &types {
+            let vtype = t.to_lowercase();
+            assert!(
+                vtype != "ldap_signing_disabled" && vtype != "ldap_signing_not_required",
+                "{t} should NOT match LDAP weak signing"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_from_bare_hostname() {
+        let hostname = "ws01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
+
+    #[test]
+    fn domain_from_fabrikam_host() {
+        let hostname = "srv01.fabrikam.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "fabrikam.local");
+    }
 }

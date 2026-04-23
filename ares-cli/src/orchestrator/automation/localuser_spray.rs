@@ -125,4 +125,76 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_LOCALUSER_SPRAY, "localuser_spray");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let payload = json!({
+            "technique": "smb_login_check",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "localuser",
+                "password": "localuser",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "smb_login_check");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["credential"]["username"], "localuser");
+        assert_eq!(payload["credential"]["password"], "localuser");
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let work = LocaluserWork {
+            dedup_key: "localuser:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.dedup_key, "localuser:contoso.local");
+    }
+
+    #[test]
+    fn no_credentials_needed_in_work_struct() {
+        // LocaluserWork does not carry a credential -- it uses hardcoded localuser:localuser
+        let work = LocaluserWork {
+            dedup_key: "localuser:fabrikam.local".into(),
+            domain: "fabrikam.local".into(),
+            dc_ip: "192.168.58.20".into(),
+        };
+        assert_eq!(work.domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("localuser:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "localuser:contoso.local");
+    }
+
+    #[test]
+    fn credential_uses_domain_from_target() {
+        let domain = "contoso.local";
+        let payload = json!({
+            "credential": {
+                "username": "localuser",
+                "password": "localuser",
+                "domain": domain,
+            },
+        });
+        assert_eq!(payload["credential"]["domain"], domain);
+    }
+
+    #[test]
+    fn per_domain_dedup() {
+        let domains = ["contoso.local", "fabrikam.local"];
+        let keys: Vec<String> = domains
+            .iter()
+            .map(|d| format!("localuser:{}", d.to_lowercase()))
+            .collect();
+        assert_eq!(keys.len(), 2);
+        assert_ne!(keys[0], keys[1]);
+    }
 }

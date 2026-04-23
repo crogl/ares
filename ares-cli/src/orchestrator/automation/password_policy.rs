@@ -141,4 +141,69 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_PASSWORD_POLICY, "password_policy");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "password_policy",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "password_policy");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = PasswordPolicyWork {
+            dedup_key: "policy:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.dedup_key, "policy:contoso.local");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("policy:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "policy:contoso.local");
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_domain() {
+        let key1 = format!("policy:{}", "contoso.local");
+        let key2 = format!("policy:{}", "fabrikam.local");
+        assert_ne!(key1, key2);
+    }
 }

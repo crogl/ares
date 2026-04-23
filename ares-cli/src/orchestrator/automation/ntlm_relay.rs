@@ -350,4 +350,194 @@ mod tests {
         let not_smb = "mssql_access".to_lowercase();
         assert_ne!(not_smb, "smb_signing_disabled");
     }
+
+    #[test]
+    fn relay_work_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = RelayWork {
+            dedup_key: "smb_relay:192.168.58.22".into(),
+            relay_type: RelayType::SmbToLdap,
+            relay_target: "192.168.58.22".into(),
+            coercion_source: Some("192.168.58.10".into()),
+            listener: "192.168.58.100".into(),
+            credential: cred.clone(),
+        };
+        assert_eq!(work.relay_target, "192.168.58.22");
+        assert_eq!(work.listener, "192.168.58.100");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn smb_to_ldap_payload_structure() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "ntlm_relay_ldap",
+            "relay_target": "192.168.58.22",
+            "listener_ip": "192.168.58.100",
+            "coercion_source": "192.168.58.10",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "ntlm_relay_ldap");
+        assert_eq!(payload["relay_target"], "192.168.58.22");
+        assert_eq!(payload["listener_ip"], "192.168.58.100");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn esc8_payload_structure() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let relay_type = RelayType::Esc8 {
+            ca_name: "contoso-CA".into(),
+            domain: "contoso.local".into(),
+        };
+        let payload = json!({
+            "technique": "ntlm_relay_adcs",
+            "relay_target": "192.168.58.10",
+            "listener_ip": "192.168.58.100",
+            "ca_name": "contoso-CA",
+            "domain": "contoso.local",
+            "coercion_source": "192.168.58.20",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "ntlm_relay_adcs");
+        assert_eq!(payload["ca_name"], "contoso-CA");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(relay_type.to_string(), "esc8_adcs");
+    }
+
+    #[test]
+    fn target_ip_extraction_from_vuln_details() {
+        let details = serde_json::json!({"target_ip": "192.168.58.22", "ip": "192.168.58.23"});
+        let fallback = "192.168.58.99";
+        let target = details
+            .get("target_ip")
+            .or_else(|| details.get("ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(target, "192.168.58.22");
+    }
+
+    #[test]
+    fn target_ip_fallback_to_ip_field() {
+        let details = serde_json::json!({"ip": "192.168.58.23"});
+        let fallback = "192.168.58.99";
+        let target = details
+            .get("target_ip")
+            .or_else(|| details.get("ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(target, "192.168.58.23");
+    }
+
+    #[test]
+    fn target_ip_fallback_to_vuln_target() {
+        let details = serde_json::json!({});
+        let fallback = "192.168.58.99";
+        let target = details
+            .get("target_ip")
+            .or_else(|| details.get("ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(target, "192.168.58.99");
+    }
+
+    #[test]
+    fn ca_host_extraction_fallback() {
+        let details = serde_json::json!({"ca_host": "192.168.58.10"});
+        let fallback = "192.168.58.99";
+        let ca_host = details
+            .get("ca_host")
+            .or_else(|| details.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(ca_host, "192.168.58.10");
+
+        let details2 = serde_json::json!({"target_ip": "192.168.58.20"});
+        let ca_host2 = details2
+            .get("ca_host")
+            .or_else(|| details2.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(ca_host2, "192.168.58.20");
+    }
+
+    #[test]
+    fn ca_name_extraction() {
+        let details = serde_json::json!({"ca_name": "contoso-CA"});
+        let ca_name = details
+            .get("ca_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(ca_name, "contoso-CA");
+
+        let details2 = serde_json::json!({});
+        let ca_name2 = details2
+            .get("ca_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(ca_name2, "");
+    }
+
+    #[test]
+    fn find_coercion_source_all_unprocessed() {
+        let mut dcs = HashMap::new();
+        dcs.insert("contoso.local".into(), "192.168.58.10".into());
+        dcs.insert("fabrikam.local".into(), "192.168.58.20".into());
+
+        let result = find_coercion_source(&dcs, |_| false);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn relay_type_display_exhaustive() {
+        let smb = RelayType::SmbToLdap;
+        assert_eq!(format!("{smb}"), "smb_to_ldap");
+
+        let esc8 = RelayType::Esc8 {
+            ca_name: String::new(),
+            domain: String::new(),
+        };
+        assert_eq!(format!("{esc8}"), "esc8_adcs");
+    }
 }

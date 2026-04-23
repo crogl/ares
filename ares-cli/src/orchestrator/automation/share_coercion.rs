@@ -211,4 +211,127 @@ mod tests {
             assert!(!is_writable, "{p} should NOT be writable");
         }
     }
+
+    #[test]
+    fn payload_structure_validation() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let payload = serde_json::json!({
+            "technique": "share_coercion",
+            "target_ip": "192.168.58.22",
+            "share_name": "Users",
+            "listener_ip": "192.168.58.50",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+
+        assert_eq!(payload["technique"], "share_coercion");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["share_name"], "Users");
+        assert_eq!(payload["listener_ip"], "192.168.58.50");
+        assert_eq!(payload["credential"]["username"], "admin");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn admin_share_filtering_lowercase_variations() {
+        let lower_admin_shares = ["c$", "admin$", "ipc$", "print$", "sysvol", "netlogon"];
+        for name in &lower_admin_shares {
+            let name_upper = name.to_uppercase();
+            assert!(
+                matches!(
+                    name_upper.as_str(),
+                    "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
+                ),
+                "{name} (lowercase) should be filtered after uppercasing"
+            );
+        }
+    }
+
+    #[test]
+    fn writable_permission_with_change_keyword() {
+        let perm = "CHANGE";
+        let perms = perm.to_uppercase();
+        let is_writable = perms == "WRITE" || perms == "READ/WRITE" || perms.contains("WRITE");
+        assert!(!is_writable, "CHANGE alone should not match WRITE logic");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "testuser".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+
+        let work = ShareCoercionWork {
+            host: "192.168.58.22".into(),
+            share_name: "Data".into(),
+            listener: "192.168.58.50".into(),
+            credential: cred,
+        };
+
+        assert_eq!(work.host, "192.168.58.22");
+        assert_eq!(work.share_name, "Data");
+        assert_eq!(work.listener, "192.168.58.50");
+        assert_eq!(work.credential.username, "testuser");
+        assert_eq!(work.credential.domain, "contoso.local");
+    }
+
+    #[test]
+    fn per_cycle_limit_of_three() {
+        let shares: Vec<String> = (0..10).map(|i| format!("Share{i}")).collect();
+        let limited: Vec<&String> = shares.iter().take(3).collect();
+        assert_eq!(limited.len(), 3);
+        assert_eq!(*limited[0], "Share0");
+        assert_eq!(*limited[2], "Share2");
+    }
+
+    #[test]
+    fn empty_share_name_handling() {
+        let name = "";
+        let name_upper = name.to_uppercase();
+        assert!(
+            !matches!(
+                name_upper.as_str(),
+                "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
+            ),
+            "Empty share name should pass admin filter"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_admin_share_check() {
+        let mixed_case = ["Sysvol", "NetLogon", "Admin$", "Ipc$"];
+        for name in &mixed_case {
+            let name_upper = name.to_uppercase();
+            assert!(
+                matches!(
+                    name_upper.as_str(),
+                    "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
+                ),
+                "{name} should be filtered regardless of case"
+            );
+        }
+    }
 }

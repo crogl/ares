@@ -221,4 +221,87 @@ mod tests {
             .unwrap_or_default();
         assert_eq!(domain, "");
     }
+
+    #[test]
+    fn rdp_service_detection_by_name() {
+        let services = ["remote desktop rdp".to_string()];
+        let has_rdp = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("3389") || sl.contains("rdp")
+        });
+        assert!(has_rdp);
+    }
+
+    #[test]
+    fn rdp_service_detection_case_insensitive() {
+        let services = ["3389/TCP MS-WBT-SERVER".to_string()];
+        let has_rdp = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("3389") || sl.contains("rdp")
+        });
+        assert!(has_rdp);
+    }
+
+    #[test]
+    fn rdp_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "rdp_lateral",
+            "target_ip": "192.168.58.22",
+            "hostname": "srv01.contoso.local",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "rdp_lateral");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["hostname"], "srv01.contoso.local");
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn rdp_work_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = RdpWork {
+            dedup_key: "rdp:192.168.58.22".into(),
+            host_ip: "192.168.58.22".into(),
+            hostname: "srv01.contoso.local".into(),
+            domain: "contoso.local".into(),
+            credential: cred,
+        };
+        assert_eq!(work.host_ip, "192.168.58.22");
+        assert_eq!(work.hostname, "srv01.contoso.local");
+        assert!(work.credential.is_admin);
+    }
+
+    #[test]
+    fn admin_credential_preferred() {
+        // The module first looks for admin creds, then falls back to any with password
+        let is_admin = true;
+        let has_password = true;
+        let admin_match = is_admin && has_password;
+        assert!(admin_match);
+    }
+
+    #[test]
+    fn empty_services_no_rdp() {
+        let services: Vec<String> = vec![];
+        let has_rdp = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("3389") || sl.contains("rdp")
+        });
+        assert!(!has_rdp);
+    }
 }

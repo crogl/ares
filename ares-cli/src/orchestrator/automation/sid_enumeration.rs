@@ -155,4 +155,69 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_SID_ENUMERATION, "sid_enumeration");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "sid_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "sid_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = SidEnumWork {
+            dedup_key: "sid_enum:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("sid_enum:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "sid_enum:contoso.local");
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_domain() {
+        let key1 = format!("sid_enum:{}", "contoso.local");
+        let key2 = format!("sid_enum:{}", "fabrikam.local");
+        assert_ne!(key1, key2);
+    }
 }

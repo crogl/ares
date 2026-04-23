@@ -147,4 +147,69 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_MACHINE_ACCOUNT_QUOTA, "machine_account_quota");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "machine_account_quota_check",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "machine_account_quota_check");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = MaqWork {
+            dedup_key: "maq:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.dedup_key, "maq:contoso.local");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("maq:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "maq:contoso.local");
+    }
+
+    #[test]
+    fn dedup_keys_differ_per_domain() {
+        let key1 = format!("maq:{}", "contoso.local");
+        let key2 = format!("maq:{}", "fabrikam.local");
+        assert_ne!(key1, key2);
+    }
 }

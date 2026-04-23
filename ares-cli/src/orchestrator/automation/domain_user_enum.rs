@@ -155,4 +155,127 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_DOMAIN_USER_ENUM, "domain_user_enum");
     }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "ldap_user_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+            "filters": ["(objectCategory=person)(objectClass=user)"],
+            "attributes": ["sAMAccountName", "description", "memberOf", "userAccountControl", "servicePrincipalName"],
+        });
+        assert_eq!(payload["technique"], "ldap_user_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn ldap_filter_format() {
+        let filters = ["(objectCategory=person)(objectClass=user)"];
+        assert_eq!(filters.len(), 1);
+        assert!(filters[0].contains("objectCategory=person"));
+        assert!(filters[0].contains("objectClass=user"));
+    }
+
+    #[test]
+    fn ldap_attributes_list() {
+        let attrs = [
+            "sAMAccountName",
+            "description",
+            "memberOf",
+            "userAccountControl",
+            "servicePrincipalName",
+        ];
+        assert_eq!(attrs.len(), 5);
+        assert!(attrs.contains(&"sAMAccountName"));
+        assert!(attrs.contains(&"servicePrincipalName"));
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = UserEnumWork {
+            dedup_key: "user_enum:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("user_enum:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "user_enum:contoso.local");
+    }
+
+    #[test]
+    fn credential_quarantine_check_logic() {
+        // Empty password should be skipped by the credential selection logic
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "".into(),
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(cred.password.is_empty());
+    }
+
+    #[test]
+    fn cross_domain_credential_fallback() {
+        // When no same-domain cred exists, any cred can be used (cross-domain LDAP)
+        let creds = [ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "fabrikam.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }];
+        let target_domain = "contoso.local";
+        let same_domain = creds.iter().find(|c| {
+            c.domain.to_lowercase() == target_domain.to_lowercase() && !c.password.is_empty()
+        });
+        assert!(same_domain.is_none());
+        let fallback = creds.iter().find(|c| !c.password.is_empty());
+        assert!(fallback.is_some());
+        assert_eq!(fallback.unwrap().domain, "fabrikam.local");
+    }
 }

@@ -197,4 +197,80 @@ mod tests {
             .unwrap_or(fallback);
         assert_eq!(target, "192.168.58.10");
     }
+
+    #[test]
+    fn credential_domain_matching() {
+        let domain = "contoso.local".to_string();
+        let cred_domain = "CONTOSO.LOCAL";
+        let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain.to_lowercase();
+        assert!(matches);
+    }
+
+    #[test]
+    fn credential_domain_empty_no_match() {
+        let domain = "".to_string();
+        let cred_domain = "contoso.local";
+        let matches = !domain.is_empty() && cred_domain.to_lowercase() == domain.to_lowercase();
+        assert!(!matches);
+    }
+
+    #[test]
+    fn mssql_coercion_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "mssql_ntlm_coercion",
+            "target_ip": "192.168.58.22",
+            "listener_ip": "192.168.58.100",
+            "credential": {
+                "username": "sa",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "mssql_ntlm_coercion");
+        assert_eq!(payload["target_ip"], "192.168.58.22");
+        assert_eq!(payload["listener_ip"], "192.168.58.100");
+        assert_eq!(payload["credential"]["username"], "sa");
+    }
+
+    #[test]
+    fn domain_extraction_from_vuln() {
+        let details = serde_json::json!({"domain": "contoso.local"});
+        let domain = details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(domain, "contoso.local");
+
+        let details2 = serde_json::json!({});
+        let domain2 = details2
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(domain2, "");
+    }
+
+    #[test]
+    fn mssql_coercion_work_fields() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "sa".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = MssqlCoercionWork {
+            dedup_key: "mssql_coerce:192.168.58.22".into(),
+            target_ip: "192.168.58.22".into(),
+            listener: "192.168.58.100".into(),
+            credential: cred,
+        };
+        assert_eq!(work.target_ip, "192.168.58.22");
+        assert_eq!(work.listener, "192.168.58.100");
+    }
 }

@@ -297,4 +297,160 @@ mod tests {
             .unwrap_or("");
         assert_eq!(source3, "");
     }
+
+    #[test]
+    fn source_domain_extraction_keys() {
+        let details = serde_json::json!({"source_domain": "contoso.local"});
+        let source_domain = details
+            .get("source_domain")
+            .or_else(|| details.get("domain"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source_domain, "contoso.local");
+
+        let details2 = serde_json::json!({"domain": "fabrikam.local"});
+        let source_domain2 = details2
+            .get("source_domain")
+            .or_else(|| details2.get("domain"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source_domain2, "fabrikam.local");
+
+        let details3 = serde_json::json!({});
+        let source_domain3 = details3
+            .get("source_domain")
+            .or_else(|| details3.get("domain"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source_domain3, "");
+    }
+
+    #[test]
+    fn target_user_extraction_keys() {
+        let details = serde_json::json!({"target": "victim", "target_user": "v2", "to": "v3"});
+        let target = details
+            .get("target")
+            .or_else(|| details.get("target_user"))
+            .or_else(|| details.get("to"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(target, "victim");
+
+        let details2 = serde_json::json!({"target_user": "v2"});
+        let target2 = details2
+            .get("target")
+            .or_else(|| details2.get("target_user"))
+            .or_else(|| details2.get("to"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(target2, "v2");
+
+        let details3 = serde_json::json!({"to": "v3"});
+        let target3 = details3
+            .get("target")
+            .or_else(|| details3.get("target_user"))
+            .or_else(|| details3.get("to"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(target3, "v3");
+    }
+
+    #[test]
+    fn credential_matching_with_domain() {
+        let source_user = "admin";
+        let source_domain = "contoso.local";
+        let cred_username = "Admin";
+        let cred_domain = "CONTOSO.LOCAL";
+
+        let matches = cred_username.to_lowercase() == source_user.to_lowercase()
+            && (source_domain.is_empty()
+                || cred_domain.to_lowercase() == source_domain.to_lowercase());
+        assert!(matches);
+    }
+
+    #[test]
+    fn credential_matching_without_domain() {
+        let source_user = "admin";
+        let source_domain = "";
+        let cred_username = "admin";
+        let cred_domain = "contoso.local";
+
+        let matches = cred_username.to_lowercase() == source_user.to_lowercase()
+            && (source_domain.is_empty()
+                || cred_domain.to_lowercase() == source_domain.to_lowercase());
+        assert!(matches);
+    }
+
+    #[test]
+    fn credential_matching_wrong_user() {
+        let source_user = "admin";
+        let source_domain = "contoso.local";
+        let cred_username = "jdoe";
+        let cred_domain = "contoso.local";
+
+        let matches = cred_username.to_lowercase() == source_user.to_lowercase()
+            && (source_domain.is_empty()
+                || cred_domain.to_lowercase() == source_domain.to_lowercase());
+        assert!(!matches);
+    }
+
+    #[test]
+    fn credential_matching_wrong_domain() {
+        let source_user = "admin";
+        let source_domain = "contoso.local";
+        let cred_username = "admin";
+        let cred_domain = "fabrikam.local";
+
+        let matches = cred_username.to_lowercase() == source_user.to_lowercase()
+            && (source_domain.is_empty()
+                || cred_domain.to_lowercase() == source_domain.to_lowercase());
+        assert!(!matches);
+    }
+
+    #[test]
+    fn dacl_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "dacl_abuse",
+            "acl_type": "forcechangepassword",
+            "vuln_id": "vuln-acl-001",
+            "source_user": "admin",
+            "target_user": "victim",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        assert_eq!(payload["technique"], "dacl_abuse");
+        assert_eq!(payload["acl_type"], "forcechangepassword");
+        assert_eq!(payload["source_user"], "admin");
+        assert_eq!(payload["target_user"], "victim");
+        assert_eq!(payload["credential"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn acl_vuln_type_case_insensitive() {
+        for t in [
+            "ForceChangePassword",
+            "FORCECHANGEPASSWORD",
+            "forcechangepassword",
+        ] {
+            let vtype = t.to_lowercase();
+            assert!(vtype.contains("forcechangepassword"), "{t} should match");
+        }
+    }
+
+    #[test]
+    fn source_user_from_key() {
+        let details = serde_json::json!({"from": "svc_account"});
+        let source = details
+            .get("source")
+            .or_else(|| details.get("source_user"))
+            .or_else(|| details.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source, "svc_account");
+    }
 }

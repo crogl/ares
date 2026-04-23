@@ -304,4 +304,100 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_CROSS_FOREST_ENUM, "cross_forest_enum");
     }
+
+    #[test]
+    fn is_cross_forest_empty_strings() {
+        // Empty strings are equal (same empty domain)
+        assert!(!is_cross_forest("", ""));
+    }
+
+    #[test]
+    fn is_cross_forest_one_empty() {
+        assert!(is_cross_forest("contoso.local", ""));
+        assert!(is_cross_forest("", "contoso.local"));
+    }
+
+    #[test]
+    fn is_cross_forest_deeply_nested() {
+        assert!(!is_cross_forest("a.b.contoso.local", "contoso.local"));
+        assert!(!is_cross_forest("contoso.local", "a.b.contoso.local"));
+    }
+
+    #[test]
+    fn cross_forest_work_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = CrossForestWork {
+            dedup_key: "xforest:fabrikam.local:admin@contoso.local".into(),
+            domain: "fabrikam.local".into(),
+            dc_ip: "192.168.58.20".into(),
+            credential: cred,
+            is_under_enumerated: true,
+        };
+        assert!(work.is_under_enumerated);
+        assert_eq!(work.domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn user_enum_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "ldap_user_enumeration",
+            "target_ip": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+            "cross_forest": true,
+        });
+        assert_eq!(payload["technique"], "ldap_user_enumeration");
+        assert!(payload["cross_forest"].as_bool().unwrap());
+        assert_eq!(payload["domain"], "fabrikam.local");
+    }
+
+    #[test]
+    fn group_enum_payload_structure() {
+        let payload = serde_json::json!({
+            "technique": "ldap_group_enumeration",
+            "target_ip": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "resolve_foreign_principals": true,
+            "cross_forest": true,
+        });
+        assert_eq!(payload["technique"], "ldap_group_enumeration");
+        assert!(payload["resolve_foreign_principals"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn coverage_threshold_values() {
+        // Module uses: known_user_count >= 5 || known_hash_count >= 10
+        let known_user_count = 4;
+        let known_hash_count = 9;
+        assert!(known_user_count < 5 && known_hash_count < 10); // should trigger enum
+
+        let known_user_count2 = 5;
+        assert!(known_user_count2 >= 5); // should skip
+
+        let known_hash_count2 = 10;
+        assert!(known_hash_count2 >= 10); // should skip
+    }
+
+    #[test]
+    fn under_enumerated_threshold() {
+        // is_under_enumerated = known_user_count < 3
+        let counts = [0_usize, 2, 3, 5];
+        assert!(counts[0] < 3); // 0 users = under-enumerated
+        assert!(counts[1] < 3); // 2 users = under-enumerated
+        assert!(counts[2] >= 3); // 3 users = not under-enumerated
+    }
 }

@@ -170,4 +170,88 @@ mod tests {
             "Single domain should skip foreign group enum"
         );
     }
+
+    #[test]
+    fn two_domains_meets_requirement() {
+        let domains: Vec<String> = vec!["contoso.local".to_string(), "fabrikam.local".to_string()];
+        assert!(domains.len() >= 2);
+    }
+
+    #[test]
+    fn payload_structure_has_correct_technique() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let payload = json!({
+            "technique": "foreign_group_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            },
+        });
+        assert_eq!(payload["technique"], "foreign_group_enumeration");
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "admin");
+    }
+
+    #[test]
+    fn work_struct_construction() {
+        let cred = ares_core::models::Credential {
+            id: "c1".into(),
+            username: "admin".into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        };
+        let work = ForeignGroupWork {
+            dedup_key: "foreign_group:contoso.local".into(),
+            domain: "contoso.local".into(),
+            dc_ip: "192.168.58.10".into(),
+            credential: cred,
+        };
+        assert_eq!(work.domain, "contoso.local");
+        assert_eq!(work.dc_ip, "192.168.58.10");
+        assert_eq!(work.credential.username, "admin");
+    }
+
+    #[test]
+    fn dedup_key_per_domain() {
+        let key1 = format!("foreign_group:{}", "contoso.local");
+        let key2 = format!("foreign_group:{}", "fabrikam.local");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn foreign_security_principal_resolution() {
+        // The payload includes credential for cross-domain FSP resolution
+        let payload = json!({
+            "technique": "foreign_group_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "credential": {
+                "username": "admin",
+                "password": "P@ssw0rd!",
+                "domain": "contoso.local",
+            },
+        });
+        // FSP resolution happens via the credential against the target domain
+        assert!(payload.get("credential").is_some());
+        assert_eq!(payload["technique"], "foreign_group_enumeration");
+    }
 }
