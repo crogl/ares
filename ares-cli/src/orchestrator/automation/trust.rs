@@ -720,6 +720,16 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     .await;
             }
 
+            // Skip self-referential trust (source == target)
+            if item.source_domain.to_lowercase() == item.target_domain.to_lowercase() {
+                debug!(
+                    source = %item.source_domain,
+                    target = %item.target_domain,
+                    "Skipping self-referential trust escalation"
+                );
+                continue;
+            }
+
             // 1. Dispatch inter-realm ticket creation.
             //    Use field names that match the tool and prompt expectations:
             //    - `vuln_type` routes to generate_trust_key_prompt
@@ -774,6 +784,27 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     let _ = dispatcher
                         .state
                         .mark_exploited(&dispatcher.queue, &vuln_id)
+                        .await;
+
+                    // Emit attack path timeline event for forest trust escalation
+                    let techniques = vec!["T1134.005".to_string(), "T1550.003".to_string()];
+                    let event_id = format!(
+                        "evt-trust-{}",
+                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                    );
+                    let event = serde_json::json!({
+                        "id": event_id,
+                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                        "source": "trust_automation",
+                        "description": format!(
+                            "Forest trust escalation: {} \u{2192} {} via trust key {}",
+                            item.source_domain, item.target_domain, item.hash.username
+                        ),
+                        "mitre_techniques": techniques,
+                    });
+                    let _ = dispatcher
+                        .state
+                        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
                         .await;
                 }
                 Ok(None) => {

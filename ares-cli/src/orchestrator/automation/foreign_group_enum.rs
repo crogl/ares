@@ -19,6 +19,62 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect foreign group enumeration work items from current state.
+///
+/// Pure logic extracted from `auto_foreign_group_enum` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_foreign_group_work(state: &StateInner) -> Vec<ForeignGroupWork> {
+    if state.credentials.is_empty() || state.domains.len() < 2 {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    // For each domain, enumerate foreign security principals
+    for domain in &state.domains {
+        let dedup_key = format!("foreign_group:{domain}");
+        if state.is_processed(DEDUP_FOREIGN_GROUP_ENUM, &dedup_key) {
+            continue;
+        }
+
+        let dc_ip = match state.domain_controllers.get(domain) {
+            Some(ip) => ip.clone(),
+            None => continue,
+        };
+
+        // Find a credential for this domain
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| {
+                !c.password.is_empty()
+                    && c.domain.to_lowercase() == domain.to_lowercase()
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                state.credentials.iter().find(|c| {
+                    !c.password.is_empty()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+            })
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(ForeignGroupWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Enumerate cross-domain foreign group memberships.
 /// Interval: 45s.
 pub async fn auto_foreign_group_enum(
@@ -43,56 +99,7 @@ pub async fn auto_foreign_group_enum(
 
         let work: Vec<ForeignGroupWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() || state.domains.len() < 2 {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // For each domain, enumerate foreign security principals
-            for domain in &state.domains {
-                let dedup_key = format!("foreign_group:{domain}");
-                if state.is_processed(DEDUP_FOREIGN_GROUP_ENUM, &dedup_key) {
-                    continue;
-                }
-
-                let dc_ip = match state.domain_controllers.get(domain) {
-                    Some(ip) => ip.clone(),
-                    None => continue,
-                };
-
-                // Find a credential for this domain
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !c.password.is_empty()
-                            && c.domain.to_lowercase() == domain.to_lowercase()
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    })
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(ForeignGroupWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_foreign_group_work(&state)
         };
 
         for item in work {
@@ -105,6 +112,26 @@ pub async fn auto_foreign_group_enum(
                     "password": item.credential.password,
                     "domain": item.credential.domain,
                 },
+                "filters": [
+                    "(objectClass=foreignSecurityPrincipal)",
+                    "(&(objectCategory=group)(groupType:1.2.840.113556.1.4.803:=4))"
+                ],
+                "attributes": [
+                    "sAMAccountName", "member", "memberOf", "objectSid",
+                    "groupType", "cn", "distinguishedName"
+                ],
+                "instructions": concat!(
+                    "Enumerate Foreign Security Principals and cross-domain group memberships. ",
+                    "1) Query CN=ForeignSecurityPrincipals,DC=... to list all foreign SIDs. ",
+                    "2) Resolve each SID to its source domain user/group using ldapsearch against ",
+                    "the source domain's DC. ",
+                    "3) Query Domain Local groups (groupType bit 4) and check for foreign members. ",
+                    "4) Report each cross-domain membership: source_domain\\source_user -> target_group ",
+                    "(target_domain). These are critical for cross-forest attack paths. ",
+                    "5) Register any discovered cross-domain memberships as vulnerabilities with ",
+                    "vuln_type='foreign_group_membership', source=foreign_user, target=local_group, ",
+                    "domain=target_domain, source_domain=foreign_domain."
+                ),
             });
 
             let priority = dispatcher.effective_priority("foreign_group_enum");
@@ -253,5 +280,187 @@ mod tests {
         // FSP resolution happens via the credential against the target domain
         assert!(payload.get("credential").is_some());
         assert_eq!(payload["technique"], "foreign_group_enumeration");
+    }
+
+    fn make_credential(
+        username: &str,
+        password: &str,
+        domain: &str,
+    ) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_foreign_group_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_foreign_group_work(&state);
+        // Requires at least 2 domains
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        let work = collect_foreign_group_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_two_domains_with_creds() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("fadmin", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_foreign_group_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(
+            DEDUP_FOREIGN_GROUP_ENUM,
+            "foreign_group:contoso.local".into(),
+        );
+        let work = collect_foreign_group_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_skips_domain_without_dc() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        // Only contoso has a DC
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_foreign_group_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_quarantined_credential_falls_back() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_foreign_group_work(&state);
+        // Both domains should still get work (gooduser fallback for contoso)
+        assert_eq!(work.len(), 2);
+        // contoso should fall back to gooduser
+        let contoso_work = work.iter().find(|w| w.domain == "contoso.local").unwrap();
+        assert_eq!(contoso_work.credential.username, "gooduser");
+    }
+
+    #[test]
+    fn collect_skips_empty_password() {
+        let mut state = StateInner::new("test-op".into());
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "", "contoso.local"));
+        let work = collect_foreign_group_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state.domains.push("contoso.local".into());
+            state.domains.push("fabrikam.local".into());
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            state
+                .domain_controllers
+                .insert("fabrikam.local".into(), "192.168.58.20".into());
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_foreign_group_work(&state);
+        assert_eq!(work.len(), 2);
     }
 }

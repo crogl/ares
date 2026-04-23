@@ -18,6 +18,49 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect DFS coercion work items from current state.
+///
+/// Pure logic extracted from `auto_dfs_coercion` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_dfs_coercion_work(state: &StateInner, listener: &str) -> Vec<DfsWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        if dc_ip.as_str() == listener {
+            continue;
+        }
+
+        let dedup_key = format!("dfs_coerce:{dc_ip}");
+        if state.is_processed(DEDUP_DFS_COERCION, &dedup_key) {
+            continue;
+        }
+
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
+            .or_else(|| state.credentials.first())
+        {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(DfsWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dispatches DFSCoerce against each DC that hasn't been DFS-coerced.
 /// Interval: 45s.
 pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -44,43 +87,7 @@ pub async fn auto_dfs_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
         let work: Vec<DfsWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                if dc_ip.as_str() == listener {
-                    continue;
-                }
-
-                let dedup_key = format!("dfs_coerce:{dc_ip}");
-                if state.is_processed(DEDUP_DFS_COERCION, &dedup_key) {
-                    continue;
-                }
-
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
-                    .or_else(|| state.credentials.first())
-                {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(DfsWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_dfs_coercion_work(&state, &listener)
         };
 
         for item in work {
@@ -141,6 +148,22 @@ struct DfsWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::StateInner;
+    use ares_core::models::Credential;
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
 
     #[test]
     fn dedup_key_format() {
@@ -256,5 +279,172 @@ mod tests {
             domain2.to_lowercase(),
             "Different domains should not match"
         );
+    }
+
+    // --- collect_dfs_coercion_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_dcs_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_dc_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "dfs_coerce:192.168.58.10");
+        assert_eq!(work[0].listener, "192.168.58.50");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_dc_matching_listener() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.50".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_DFS_COERCION, "dfs_coerce:192.168.58.10".into());
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_dcs_produces_work_for_each() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 2);
+        let domains: Vec<&str> = work.iter().map(|w| w.domain.as_str()).collect();
+        assert!(domains.contains(&"contoso.local"));
+        assert!(domains.contains(&"fabrikam.local"));
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "crossuser");
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed_keeps_unprocessed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_DFS_COERCION, "dfs_coerce:192.168.58.10".into());
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_dfs_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
     }
 }

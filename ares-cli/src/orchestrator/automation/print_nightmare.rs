@@ -18,6 +18,58 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect PrintNightmare work items from state (pure logic, no async).
+fn collect_print_nightmare_work(state: &StateInner, listener: &str) -> Vec<PrintNightmareWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    // Target all discovered hosts (DCs + member servers)
+    for host in &state.hosts {
+        let ip = &host.ip;
+
+        // Skip if we already tried PrintNightmare on this host
+        if state.is_processed(DEDUP_PRINTNIGHTMARE, ip) {
+            continue;
+        }
+
+        // Skip hosts where we already have admin (secretsdump handles those)
+        if state.is_processed(DEDUP_SECRETSDUMP, ip) {
+            continue;
+        }
+
+        // Infer domain from hostname (e.g. "dc01.contoso.local" -> "contoso.local")
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
+            .or_else(|| state.credentials.first());
+
+        let cred = match cred {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(PrintNightmareWork {
+            target_ip: ip.clone(),
+            hostname: host.hostname.clone(),
+            domain: domain.clone(),
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Monitors for PrintNightmare exploitation opportunities.
 /// Only targets hosts we don't already have admin on.
 /// Interval: 45s.
@@ -48,55 +100,7 @@ pub async fn auto_print_nightmare(
 
         let work: Vec<PrintNightmareWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // Target all discovered hosts (DCs + member servers)
-            for host in &state.hosts {
-                let ip = &host.ip;
-
-                // Skip if we already tried PrintNightmare on this host
-                if state.is_processed(DEDUP_PRINTNIGHTMARE, ip) {
-                    continue;
-                }
-
-                // Skip hosts where we already have admin (secretsdump handles those)
-                if state.is_processed(DEDUP_SECRETSDUMP, ip) {
-                    continue;
-                }
-
-                // Infer domain from hostname (e.g. "dc01.contoso.local" → "contoso.local")
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_lowercase())
-                    .unwrap_or_default();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-                    .or_else(|| state.credentials.first());
-
-                let cred = match cred {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(PrintNightmareWork {
-                    target_ip: ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain: domain.clone(),
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_print_nightmare_work(&state, &listener)
         };
 
         for item in work {
@@ -274,6 +278,140 @@ mod tests {
             .map(|i| hostname[i + 1..].to_lowercase())
             .unwrap_or_default();
         assert_eq!(domain, "contoso.local");
+    }
+
+    // --- collect_print_nightmare_work tests ---
+
+    use crate::orchestrator::state::StateInner;
+
+    fn make_cred(username: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str) -> ares_core::models::Host {
+        ares_core::models::Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_produces_no_work() {
+        let state = StateInner::new("test".into());
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_produces_no_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_host_with_cred_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
+        assert_eq!(work[0].hostname, "srv01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].listener, "192.168.58.50");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_already_processed_printnightmare() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_PRINTNIGHTMARE, "192.168.58.22".into());
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_already_secretsdumped_host() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.22".into());
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_cred("fab_user", "fabrikam.local"));
+        state
+            .credentials
+            .push(make_cred("con_user", "contoso.local"));
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "con_user");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_cred_for_bare_hostname() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host("192.168.58.22", "srv01"));
+        state
+            .credentials
+            .push(make_cred("fallback", "contoso.local"));
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fallback");
+        assert_eq!(work[0].domain, "");
+    }
+
+    #[test]
+    fn collect_multiple_hosts_mixed() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "ws01.fabrikam.local"));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        // Mark second host as already secretsdumped
+        state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.30".into());
+        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
     }
 
     #[test]

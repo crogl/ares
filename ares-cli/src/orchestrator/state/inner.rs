@@ -74,7 +74,7 @@ pub struct StateInner {
 }
 
 impl StateInner {
-    pub(super) fn new(operation_id: String) -> Self {
+    pub(crate) fn new(operation_id: String) -> Self {
         let mut dedup = HashMap::new();
         for name in ALL_DEDUP_SETS {
             dedup.insert(name.to_string(), HashSet::new());

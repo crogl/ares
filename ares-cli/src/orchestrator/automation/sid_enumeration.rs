@@ -18,6 +18,57 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect SID enumeration work items from current state.
+///
+/// Pure logic extracted from `auto_sid_enumeration` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_sid_enum_work(state: &StateInner) -> Vec<SidEnumWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        // Skip if we already have the SID for this domain
+        if state.domain_sids.contains_key(domain) {
+            continue;
+        }
+
+        let dedup_key = format!("sid_enum:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_SID_ENUMERATION, &dedup_key) {
+            continue;
+        }
+
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| {
+                !c.password.is_empty()
+                    && c.domain.to_lowercase() == domain.to_lowercase()
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                state.credentials.iter().find(|c| {
+                    !c.password.is_empty()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+            }) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(SidEnumWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Enumerate domain SIDs and well-known accounts.
 /// Interval: 45s.
 pub async fn auto_sid_enumeration(
@@ -42,51 +93,7 @@ pub async fn auto_sid_enumeration(
 
         let work: Vec<SidEnumWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                // Skip if we already have the SID for this domain
-                if state.domain_sids.contains_key(domain) {
-                    continue;
-                }
-
-                let dedup_key = format!("sid_enum:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_SID_ENUMERATION, &dedup_key) {
-                    continue;
-                }
-
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !c.password.is_empty()
-                            && c.domain.to_lowercase() == domain.to_lowercase()
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    }) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(SidEnumWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_sid_enum_work(&state)
         };
 
         for item in work {
@@ -219,5 +226,160 @@ mod tests {
         let key1 = format!("sid_enum:{}", "contoso.local");
         let key2 = format!("sid_enum:{}", "fabrikam.local");
         assert_ne!(key1, key2);
+    }
+
+    fn make_credential(
+        username: &str,
+        password: &str,
+        domain: &str,
+    ) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_with_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_sid_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_domain_with_known_sid() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .domain_sids
+            .insert("contoso.local".into(), "S-1-5-21-1234".into());
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_SID_ENUMERATION, "sid_enum:contoso.local".into());
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_cross_domain_fallback() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "P@ssw0rd!", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_sid_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "crossuser");
+        assert_eq!(work[0].credential.domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_skips_empty_password() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "", "contoso.local"));
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_quarantined_credential_skipped() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_sid_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercased() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_sid_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "sid_enum:contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_sid_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
     }
 }

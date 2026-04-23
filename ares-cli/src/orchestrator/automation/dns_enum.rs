@@ -18,6 +18,38 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect DNS enumeration work items from current state.
+///
+/// Pure logic extracted from `auto_dns_enum` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_dns_enum_work(state: &StateInner) -> Vec<DnsEnumWork> {
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("dns_enum:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_DNS_ENUM, &dedup_key) {
+            continue;
+        }
+
+        // DNS enum can work without creds (zone transfer, SRV queries)
+        // but we pass creds if available for authenticated queries
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !c.password.is_empty() && c.domain.to_lowercase() == domain.to_lowercase())
+            .cloned();
+
+        items.push(DnsEnumWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// DNS enumeration per domain.
 /// Interval: 45s.
 pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -39,34 +71,7 @@ pub async fn auto_dns_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Rec
 
         let work: Vec<DnsEnumWork> = {
             let state = dispatcher.state.read().await;
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("dns_enum:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_DNS_ENUM, &dedup_key) {
-                    continue;
-                }
-
-                // DNS enum can work without creds (zone transfer, SRV queries)
-                // but we pass creds if available for authenticated queries
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !c.password.is_empty() && c.domain.to_lowercase() == domain.to_lowercase()
-                    })
-                    .cloned();
-
-                items.push(DnsEnumWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_dns_enum_work(&state)
         };
 
         for item in work {
@@ -252,5 +257,142 @@ mod tests {
     fn case_normalization_mixed() {
         let key = format!("dns_enum:{}", "Contoso.Local".to_lowercase());
         assert_eq!(key, "dns_enum:contoso.local");
+    }
+
+    fn make_credential(
+        username: &str,
+        password: &str,
+        domain: &str,
+    ) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_dns_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_no_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert!(work[0].credential.is_none());
+    }
+
+    #[test]
+    fn collect_single_domain_with_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert!(work[0].credential.is_some());
+        assert_eq!(work[0].credential.as_ref().unwrap().username, "admin");
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.mark_processed(DEDUP_DNS_ENUM, "dns_enum:contoso.local".into());
+        let work = collect_dns_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_domains() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_skips_empty_password_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "", "contoso.local"));
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        // Empty password cred should not be selected
+        assert!(work[0].credential.is_none());
+    }
+
+    #[test]
+    fn collect_cred_only_matches_same_domain() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        // Cross-domain cred should NOT be selected (dns_enum only matches same domain)
+        assert!(work[0].credential.is_none());
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercased() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "dns_enum:contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_dns_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert!(work[0].credential.is_some());
     }
 }

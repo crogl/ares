@@ -23,6 +23,62 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect certifried work items from current state.
+///
+/// Pure logic extracted from `auto_certifried` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_certifried_work(state: &StateInner) -> Vec<CertifriedWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("certifried:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_CERTIFRIED, &dedup_key) {
+            continue;
+        }
+
+        // Find the DC host to get its hostname for spoofing
+        let dc_hostname = state
+            .hosts
+            .iter()
+            .find(|h| h.ip == *dc_ip && h.is_dc)
+            .map(|h| h.hostname.clone())
+            .filter(|h| !h.is_empty());
+
+        // Need a credential for this domain
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| {
+                c.domain.to_lowercase() == domain.to_lowercase()
+                    && !c.password.is_empty()
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                state.credentials.iter().find(|c| {
+                    !c.password.is_empty()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+            }) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(CertifriedWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            dc_hostname,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dispatches certifried (CVE-2022-26923) per domain with ADCS.
 /// Interval: 45s.
 pub async fn auto_certifried(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -42,58 +98,9 @@ pub async fn auto_certifried(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             continue;
         }
 
-        let work: Vec<CertifriedWork> = {
+        let work = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("certifried:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_CERTIFRIED, &dedup_key) {
-                    continue;
-                }
-
-                // Find the DC host to get its hostname for spoofing
-                let dc_hostname = state
-                    .hosts
-                    .iter()
-                    .find(|h| h.ip == *dc_ip && h.is_dc)
-                    .map(|h| h.hostname.clone())
-                    .filter(|h| !h.is_empty());
-
-                // Need a credential for this domain
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        c.domain.to_lowercase() == domain.to_lowercase()
-                            && !c.password.is_empty()
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    }) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(CertifriedWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    dc_hostname,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_certifried_work(&state)
         };
 
         for item in work {
@@ -154,6 +161,208 @@ struct CertifriedWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::{Credential, Host};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str, is_dc: bool) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc,
+            owned: false,
+        }
+    }
+
+    // --- collect_certifried_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_certifried_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_certifried_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "certifried:contoso.local");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_CERTIFRIED, "certifried:contoso.local".into());
+        let work = collect_certifried_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_domains() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 2);
+        let domains: Vec<&str> = work.iter().map(|w| w.domain.as_str()).collect();
+        assert!(domains.contains(&"contoso.local"));
+        assert!(domains.contains(&"fabrikam.local"));
+    }
+
+    #[test]
+    fn collect_dc_hostname_resolved_from_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .hosts
+            .push(make_host("192.168.58.10", "dc01.contoso.local", true));
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dc_hostname, Some("dc01.contoso.local".into()));
+    }
+
+    #[test]
+    fn collect_dc_hostname_none_when_no_host_match() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert!(work[0].dc_hostname.is_none());
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_falls_back_to_cross_domain_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "crossuser");
+    }
+
+    #[test]
+    fn collect_skips_empty_password_credentials() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "", "contoso.local"));
+        let work = collect_certifried_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_quarantined_credential_skipped() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_certifried_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercased() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_certifried_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "certifried:contoso.local");
+    }
 
     #[test]
     fn dedup_key_format() {

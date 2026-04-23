@@ -17,6 +17,82 @@ fn extract_domain_from_fqdn(fqdn: &str) -> Option<String> {
         .map(|(_, d)| d.to_string())
 }
 
+/// Work item for ADCS enumeration.
+struct AdcsWork {
+    host_ip: String,
+    domain: String,
+    credential: ares_core::models::Credential,
+}
+
+/// Collect ADCS enumeration work items from current state.
+///
+/// Pure logic extracted from `auto_adcs_enumeration` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    state
+        .shares
+        .iter()
+        .filter(|s| s.name.to_lowercase() == "certenroll")
+        .filter(|s| !state.is_processed(DEDUP_ADCS_SERVERS, &s.host))
+        .filter_map(|s| {
+            let host_lower = s.host.to_lowercase();
+            let domain = state
+                .hosts
+                .iter()
+                .find(|h| h.ip == s.host || h.hostname.to_lowercase() == host_lower)
+                .and_then(|h| extract_domain_from_fqdn(&h.hostname))
+                .and_then(|d| {
+                    if state.domains.iter().any(|known| known.to_lowercase() == d) {
+                        Some(d)
+                    } else {
+                        state
+                            .domains
+                            .iter()
+                            .find(|known| d.ends_with(&format!(".{}", known.to_lowercase())))
+                            .or_else(|| {
+                                state
+                                    .domains
+                                    .iter()
+                                    .find(|known| known.to_lowercase().ends_with(&format!(".{d}")))
+                            })
+                            .cloned()
+                            .or(Some(d))
+                    }
+                })
+                .or_else(|| state.domains.first().cloned())?;
+
+            let cred = state
+                .credentials
+                .iter()
+                .find(|c| {
+                    !c.password.is_empty()
+                        && c.domain.to_lowercase() == domain.to_lowercase()
+                        && !state.is_delegation_account(&c.username)
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+                .or_else(|| {
+                    state.credentials.iter().find(|c| {
+                        !c.password.is_empty()
+                            && !state.is_delegation_account(&c.username)
+                            && !state.is_credential_quarantined(&c.username, &c.domain)
+                    })
+                })
+                .or_else(|| state.credentials.first())
+                .cloned()?;
+
+            Some(AdcsWork {
+                host_ip: s.host.clone(),
+                domain,
+                credential: cred,
+            })
+        })
+        .collect()
+}
+
 /// Detects ADCS servers by looking for CertEnroll shares and dispatches certipy_find.
 /// Interval: 30s. Matches Python `_auto_adcs_enumeration`.
 pub async fn auto_adcs_enumeration(
@@ -35,95 +111,26 @@ pub async fn auto_adcs_enumeration(
             break;
         }
 
-        // Find CertEnroll shares on unprocessed hosts + get a per-domain credential
-        let work: Vec<(String, String, ares_core::models::Credential)> = {
+        let work = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            state
-                .shares
-                .iter()
-                .filter(|s| s.name.to_lowercase() == "certenroll")
-                .filter(|s| !state.is_processed(DEDUP_ADCS_SERVERS, &s.host))
-                .filter_map(|s| {
-                    // Resolve the domain for this ADCS host by matching the
-                    // host's FQDN against known domains, or finding which DC
-                    // subnet the host belongs to.  Falls back to first domain.
-                    let host_lower = s.host.to_lowercase();
-                    let domain = state
-                        .hosts
-                        .iter()
-                        .find(|h| h.ip == s.host || h.hostname.to_lowercase() == host_lower)
-                        .and_then(|h| extract_domain_from_fqdn(&h.hostname))
-                        .and_then(|d| {
-                            // Verify it's a known domain
-                            if state.domains.iter().any(|known| known.to_lowercase() == d) {
-                                Some(d)
-                            } else {
-                                // Try parent match (e.g. child.contoso.local → contoso.local)
-                                state
-                                    .domains
-                                    .iter()
-                                    .find(|known| {
-                                        d.ends_with(&format!(".{}", known.to_lowercase()))
-                                    })
-                                    .or_else(|| {
-                                        state.domains.iter().find(|known| {
-                                            known.to_lowercase().ends_with(&format!(".{d}"))
-                                        })
-                                    })
-                                    .cloned()
-                                    .or(Some(d))
-                            }
-                        })
-                        .or_else(|| state.domains.first().cloned())?;
-
-                    // Select credential matching the ADCS host's domain.
-                    // This is critical for cross-domain ADCS (e.g., essos DC03
-                    // requires essos creds to enumerate templates properly).
-                    let cred = state
-                        .credentials
-                        .iter()
-                        .find(|c| {
-                            !c.password.is_empty()
-                                && c.domain.to_lowercase() == domain.to_lowercase()
-                                && !state.is_delegation_account(&c.username)
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                        .or_else(|| {
-                            // Fall back to any non-delegation, non-quarantined credential
-                            state.credentials.iter().find(|c| {
-                                !c.password.is_empty()
-                                    && !state.is_delegation_account(&c.username)
-                                    && !state.is_credential_quarantined(&c.username, &c.domain)
-                            })
-                        })
-                        .or_else(|| state.credentials.first())
-                        .cloned()?;
-
-                    Some((s.host.clone(), domain, cred))
-                })
-                .collect()
+            collect_adcs_work(&state)
         };
 
-        for (host_ip, domain, cred) in work {
+        for item in work {
             match dispatcher
-                .request_certipy_find(&host_ip, &domain, &cred)
+                .request_certipy_find(&item.host_ip, &item.domain, &item.credential)
                 .await
             {
                 Ok(Some(task_id)) => {
-                    info!(task_id = %task_id, host = %host_ip, "ADCS enumeration dispatched");
+                    info!(task_id = %task_id, host = %item.host_ip, "ADCS enumeration dispatched");
                     dispatcher
                         .state
                         .write()
                         .await
-                        .mark_processed(DEDUP_ADCS_SERVERS, host_ip.clone());
+                        .mark_processed(DEDUP_ADCS_SERVERS, item.host_ip.clone());
                     let _ = dispatcher
                         .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_ADCS_SERVERS, &host_ip)
+                        .persist_dedup(&dispatcher.queue, DEDUP_ADCS_SERVERS, &item.host_ip)
                         .await;
                 }
                 Ok(None) => {}
@@ -136,6 +143,196 @@ pub async fn auto_adcs_enumeration(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::{Credential, Host, Share};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str, is_dc: bool) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc,
+            owned: false,
+        }
+    }
+
+    fn make_share(host: &str, name: &str) -> Share {
+        Share {
+            host: host.into(),
+            name: name.into(),
+            permissions: String::new(),
+            comment: String::new(),
+        }
+    }
+
+    // --- collect_adcs_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_adcs_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        let work = collect_adcs_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_certenroll_share_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].host_ip, "192.168.58.50");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_ADCS_SERVERS, "192.168.58.50".into());
+        let work = collect_adcs_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_non_certenroll_share_ignored() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "SYSVOL"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "dc01.contoso.local", true));
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.fabrikam.local", false));
+        state.domains.push("fabrikam.local".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("fabadmin", "Fab!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fabadmin");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_domain_when_no_host_match() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        // No matching host in state.hosts
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_certenroll_case_insensitive() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "certenroll"));
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn collect_multiple_adcs_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state.shares.push(make_share("192.168.58.51", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state
+            .hosts
+            .push(make_host("192.168.58.51", "ca02.fabrikam.local", false));
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("fabadmin", "Fab!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_quarantined_credential_falls_back() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "gooduser");
+    }
 
     #[test]
     fn extract_domain_from_fqdn_typical() {

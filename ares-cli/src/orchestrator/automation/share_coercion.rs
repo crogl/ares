@@ -18,6 +18,50 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect share coercion work items from current state.
+///
+/// Pure logic extracted from `auto_share_coercion` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime. Returns at most 3 items
+/// per call to avoid flooding the dispatcher.
+fn collect_share_coercion_work(state: &StateInner, listener: &str) -> Vec<ShareCoercionWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let cred = match state.credentials.first() {
+        Some(c) => c.clone(),
+        None => return Vec::new(),
+    };
+
+    state
+        .shares
+        .iter()
+        .filter(|s| {
+            let perms = s.permissions.to_uppercase();
+            perms == "WRITE" || perms == "READ/WRITE" || perms.contains("WRITE")
+        })
+        .filter(|s| {
+            // Skip default admin/system shares
+            let name_upper = s.name.to_uppercase();
+            !matches!(
+                name_upper.as_str(),
+                "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
+            )
+        })
+        .filter(|s| {
+            let dedup_key = format!("{}:{}", s.host, s.name);
+            !state.is_processed(DEDUP_WRITABLE_SHARES, &dedup_key)
+        })
+        .map(|s| ShareCoercionWork {
+            host: s.host.clone(),
+            share_name: s.name.clone(),
+            listener: listener.to_string(),
+            credential: cred.clone(),
+        })
+        .take(3) // limit per cycle to avoid flooding
+        .collect()
+}
+
 /// Monitors for writable shares and dispatches coercion file drops.
 /// Interval: 45s.
 pub async fn auto_share_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -44,43 +88,7 @@ pub async fn auto_share_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watc
 
         let work: Vec<ShareCoercionWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let cred = match state.credentials.first() {
-                Some(c) => c.clone(),
-                None => continue,
-            };
-
-            state
-                .shares
-                .iter()
-                .filter(|s| {
-                    let perms = s.permissions.to_uppercase();
-                    perms == "WRITE" || perms == "READ/WRITE" || perms.contains("WRITE")
-                })
-                .filter(|s| {
-                    // Skip default admin/system shares
-                    let name_upper = s.name.to_uppercase();
-                    !matches!(
-                        name_upper.as_str(),
-                        "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
-                    )
-                })
-                .filter(|s| {
-                    let dedup_key = format!("{}:{}", s.host, s.name);
-                    !state.is_processed(DEDUP_WRITABLE_SHARES, &dedup_key)
-                })
-                .map(|s| ShareCoercionWork {
-                    host: s.host.clone(),
-                    share_name: s.name.clone(),
-                    listener: listener.clone(),
-                    credential: cred.clone(),
-                })
-                .take(3) // limit per cycle to avoid flooding
-                .collect()
+            collect_share_coercion_work(&state, &listener)
         };
 
         for item in work {
@@ -150,6 +158,31 @@ struct ShareCoercionWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::StateInner;
+    use ares_core::models::{Credential, Share};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_share(host: &str, name: &str, permissions: &str) -> Share {
+        Share {
+            host: host.into(),
+            name: name.into(),
+            permissions: permissions.into(),
+            comment: String::new(),
+        }
+    }
 
     #[test]
     fn dedup_key_format() {
@@ -333,5 +366,150 @@ mod tests {
                 "{name} should be filtered regardless of case"
             );
         }
+    }
+
+    // --- collect_share_coercion_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Users", "WRITE"));
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_shares_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_writable_share_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Users", "WRITE"));
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].host, "192.168.58.22");
+        assert_eq!(work[0].share_name, "Users");
+        assert_eq!(work[0].listener, "192.168.58.50");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_readonly_share_skipped() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Users", "READ"));
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_admin_shares_filtered() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "ADMIN$", "WRITE"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "C$", "WRITE"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "IPC$", "WRITE"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "SYSVOL", "WRITE"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "NETLOGON", "WRITE"));
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Users", "WRITE"));
+        state.mark_processed(DEDUP_WRITABLE_SHARES, "192.168.58.22:Users".into());
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_limits_to_three_per_cycle() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        for i in 0..5 {
+            state
+                .shares
+                .push(make_share("192.168.58.22", &format!("Share{i}"), "WRITE"));
+        }
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 3);
+    }
+
+    #[test]
+    fn collect_read_write_permission_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Data", "READ/WRITE"));
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].share_name, "Data");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+            state
+                .shares
+                .push(make_share("192.168.58.22", "Public", "WRITE"));
+        }
+        let state = shared.read().await;
+        let work = collect_share_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].host, "192.168.58.22");
     }
 }

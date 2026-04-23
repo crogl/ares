@@ -40,100 +40,7 @@ pub async fn auto_dacl_abuse(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
 
         let work: Vec<DaclWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // Check discovered_vulnerabilities for ACL-related vulns
-            // (populated by BloodHound analysis or recon agents)
-            for vuln in state.discovered_vulnerabilities.values() {
-                let vtype = vuln.vuln_type.to_lowercase();
-
-                let is_acl_vuln = vtype.contains("forcechangepassword")
-                    || vtype.contains("genericwrite")
-                    || vtype.contains("writedacl")
-                    || vtype.contains("writeowner")
-                    || vtype.contains("genericall")
-                    || vtype.contains("self_membership")
-                    || vtype.contains("write_membership");
-
-                if !is_acl_vuln {
-                    continue;
-                }
-
-                if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-                    continue;
-                }
-
-                let dedup_key = format!("dacl:{}", vuln.vuln_id);
-                if state.is_processed(DEDUP_DACL_ABUSE, &dedup_key) {
-                    continue;
-                }
-
-                // Extract source user from vuln details
-                let source_user = vuln
-                    .details
-                    .get("source")
-                    .or_else(|| vuln.details.get("source_user"))
-                    .or_else(|| vuln.details.get("from"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let source_domain = vuln
-                    .details
-                    .get("source_domain")
-                    .or_else(|| vuln.details.get("domain"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                if source_user.is_empty() {
-                    continue;
-                }
-
-                // Find matching credential
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        c.username.to_lowercase() == source_user.to_lowercase()
-                            && (source_domain.is_empty()
-                                || c.domain.to_lowercase() == source_domain.to_lowercase())
-                    })
-                    .cloned();
-
-                if let Some(cred) = cred {
-                    let target_user = vuln
-                        .details
-                        .get("target")
-                        .or_else(|| vuln.details.get("target_user"))
-                        .or_else(|| vuln.details.get("to"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let dc_ip = state
-                        .domain_controllers
-                        .get(&cred.domain.to_lowercase())
-                        .cloned()
-                        .unwrap_or_default();
-
-                    items.push(DaclWork {
-                        dedup_key,
-                        vuln_id: vuln.vuln_id.clone(),
-                        vuln_type: vtype,
-                        source_user: source_user.to_string(),
-                        target_user,
-                        domain: cred.domain.clone(),
-                        dc_ip,
-                        credential: cred,
-                    });
-                }
-            }
-
-            items
+            collect_dacl_work(&state)
         };
 
         for item in work {
@@ -184,6 +91,106 @@ pub async fn auto_dacl_abuse(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             }
         }
     }
+}
+
+/// Collect DACL abuse work items from state without holding async locks.
+///
+/// Extracted for testability: scans `discovered_vulnerabilities` for ACL-type
+/// vulns that have a matching credential and haven't been processed yet.
+fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    // Check discovered_vulnerabilities for ACL-related vulns
+    // (populated by BloodHound analysis or recon agents)
+    for vuln in state.discovered_vulnerabilities.values() {
+        let vtype = vuln.vuln_type.to_lowercase();
+
+        let is_acl_vuln = vtype.contains("forcechangepassword")
+            || vtype.contains("genericwrite")
+            || vtype.contains("writedacl")
+            || vtype.contains("writeowner")
+            || vtype.contains("genericall")
+            || vtype.contains("self_membership")
+            || vtype.contains("write_membership");
+
+        if !is_acl_vuln {
+            continue;
+        }
+
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+
+        let dedup_key = format!("dacl:{}", vuln.vuln_id);
+        if state.is_processed(DEDUP_DACL_ABUSE, &dedup_key) {
+            continue;
+        }
+
+        // Extract source user from vuln details
+        let source_user = vuln
+            .details
+            .get("source")
+            .or_else(|| vuln.details.get("source_user"))
+            .or_else(|| vuln.details.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let source_domain = vuln
+            .details
+            .get("source_domain")
+            .or_else(|| vuln.details.get("domain"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if source_user.is_empty() {
+            continue;
+        }
+
+        // Find matching credential
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| {
+                c.username.to_lowercase() == source_user.to_lowercase()
+                    && (source_domain.is_empty()
+                        || c.domain.to_lowercase() == source_domain.to_lowercase())
+            })
+            .cloned();
+
+        if let Some(cred) = cred {
+            let target_user = vuln
+                .details
+                .get("target")
+                .or_else(|| vuln.details.get("target_user"))
+                .or_else(|| vuln.details.get("to"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let dc_ip = state
+                .domain_controllers
+                .get(&cred.domain.to_lowercase())
+                .cloned()
+                .unwrap_or_default();
+
+            items.push(DaclWork {
+                dedup_key,
+                vuln_id: vuln.vuln_id.clone(),
+                vuln_type: vtype,
+                source_user: source_user.to_string(),
+                target_user,
+                domain: cred.domain.clone(),
+                dc_ip,
+                credential: cred,
+            });
+        }
+    }
+
+    items
 }
 
 struct DaclWork {
@@ -452,5 +459,542 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(source, "svc_account");
+    }
+
+    // -- collect_dacl_work integration tests --
+
+    use crate::orchestrator::state::SharedState;
+    use ares_core::models::{Credential, VulnerabilityInfo};
+    use std::collections::HashMap;
+
+    fn make_credential(username: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("cred-{username}"),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_vuln(
+        vuln_id: &str,
+        vuln_type: &str,
+        details: HashMap<String, serde_json::Value>,
+    ) -> VulnerabilityInfo {
+        VulnerabilityInfo {
+            vuln_id: vuln_id.to_string(),
+            vuln_type: vuln_type.to_string(),
+            target: "192.168.58.10".to_string(),
+            discovered_by: "bloodhound".to_string(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    fn acl_details(source: &str, target: &str, domain: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        m.insert("source".to_string(), serde_json::json!(source));
+        m.insert("target".to_string(), serde_json::json!(target));
+        m.insert("source_domain".to_string(), serde_json::json!(domain));
+        m
+    }
+
+    #[tokio::test]
+    async fn collect_empty_state_no_work() {
+        let shared = SharedState::new("test".into());
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_no_credentials_no_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-001", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_forcechangepassword_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-001", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "forcechangepassword");
+        assert_eq!(work[0].source_user, "admin");
+        assert_eq!(work[0].target_user, "victim");
+        assert_eq!(work[0].domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_genericwrite_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("svc_sql", "contoso.local"));
+            let details = acl_details("svc_sql", "targetuser", "contoso.local");
+            let vuln = make_vuln("vuln-gw-001", "GenericWrite", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "genericwrite");
+    }
+
+    #[tokio::test]
+    async fn collect_writedacl_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("operator", "contoso.local"));
+            let details = acl_details("operator", "targetobj", "contoso.local");
+            let vuln = make_vuln("vuln-wd-001", "WriteDacl", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "writedacl");
+    }
+
+    #[tokio::test]
+    async fn collect_writeowner_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("operator", "contoso.local"));
+            let details = acl_details("operator", "targetobj", "contoso.local");
+            let vuln = make_vuln("vuln-wo-001", "WriteOwner", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "writeowner");
+    }
+
+    #[tokio::test]
+    async fn collect_genericall_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-ga-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "genericall");
+    }
+
+    #[tokio::test]
+    async fn collect_self_membership_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("user1", "contoso.local"));
+            let details = acl_details("user1", "Domain Admins", "contoso.local");
+            let vuln = make_vuln("vuln-sm-001", "self_membership", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "self_membership");
+    }
+
+    #[tokio::test]
+    async fn collect_write_membership_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("user1", "contoso.local"));
+            let details = acl_details("user1", "Domain Admins", "contoso.local");
+            let vuln = make_vuln("vuln-wm-001", "write_membership", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_type, "write_membership");
+    }
+
+    #[tokio::test]
+    async fn collect_non_acl_vuln_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "dc01", "contoso.local");
+            let vuln = make_vuln("vuln-smb-001", "smb_signing_disabled", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_already_exploited_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-002", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+            state
+                .exploited_vulnerabilities
+                .insert("vuln-fcp-002".to_string());
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_already_processed_dedup_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-003", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+            state.mark_processed(DEDUP_DACL_ABUSE, "dacl:vuln-fcp-003".to_string());
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_source_user_empty_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let mut details = HashMap::new();
+            details.insert("target".to_string(), serde_json::json!("victim"));
+            let vuln = make_vuln("vuln-fcp-004", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_no_matching_credential_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("otheruser", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-005", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_case_insensitive_credential_match() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("Admin", "CONTOSO.LOCAL"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-006", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].source_user, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_dc_ip_resolved_from_domain_controllers() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            state
+                .domain_controllers
+                .insert("contoso.local".to_string(), "192.168.58.10".to_string());
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-007", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+    }
+
+    #[tokio::test]
+    async fn collect_dc_ip_empty_when_no_dc_mapping() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-008", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dc_ip, "");
+    }
+
+    #[tokio::test]
+    async fn collect_credential_domain_mismatch_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "fabrikam.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-fcp-009", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_empty_source_domain_matches_any_cred_domain() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "fabrikam.local"));
+            let mut details = HashMap::new();
+            details.insert("source".to_string(), serde_json::json!("admin"));
+            details.insert("target".to_string(), serde_json::json!("victim"));
+            let vuln = make_vuln("vuln-fcp-010", "ForceChangePassword", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[tokio::test]
+    async fn collect_multiple_vulns_produces_multiple_work_items() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+
+            for (i, vtype) in ["ForceChangePassword", "GenericAll", "WriteDacl"]
+                .iter()
+                .enumerate()
+            {
+                let details = acl_details("admin", &format!("target{i}"), "contoso.local");
+                let vuln = make_vuln(&format!("vuln-multi-{i}"), vtype, details);
+                state
+                    .discovered_vulnerabilities
+                    .insert(vuln.vuln_id.clone(), vuln);
+            }
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn collect_dedup_key_format_matches() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let details = acl_details("admin", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-dk-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "dacl:vuln-dk-001");
+    }
+
+    #[tokio::test]
+    async fn collect_source_user_fallback_to_from_key() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("svc_account", "contoso.local"));
+            let mut details = HashMap::new();
+            details.insert("from".to_string(), serde_json::json!("svc_account"));
+            details.insert("target".to_string(), serde_json::json!("victim"));
+            details.insert(
+                "source_domain".to_string(),
+                serde_json::json!("contoso.local"),
+            );
+            let vuln = make_vuln("vuln-from-001", "GenericWrite", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].source_user, "svc_account");
+    }
+
+    #[tokio::test]
+    async fn collect_target_user_fallback_to_target_user_key() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "contoso.local"));
+            let mut details = HashMap::new();
+            details.insert("source".to_string(), serde_json::json!("admin"));
+            details.insert(
+                "target_user".to_string(),
+                serde_json::json!("fallback_target"),
+            );
+            details.insert(
+                "source_domain".to_string(),
+                serde_json::json!("contoso.local"),
+            );
+            let vuln = make_vuln("vuln-tu-001", "WriteDacl", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_user, "fallback_target");
     }
 }

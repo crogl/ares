@@ -18,6 +18,61 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect SearchConnector coercion work items from current state.
+///
+/// Pure logic extracted from `auto_searchconnector_coercion` so it can be
+/// unit-tested without needing a `Dispatcher` or async runtime.
+fn collect_searchconnector_work(state: &StateInner, listener: &str) -> Vec<SearchConnectorWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for share in &state.shares {
+        if !share.permissions.to_uppercase().contains("WRITE") {
+            continue;
+        }
+
+        let dedup_key = format!("searchconn:{}:{}", share.host, share.name);
+        if state.is_processed(DEDUP_SEARCHCONNECTOR, &dedup_key) {
+            continue;
+        }
+
+        // Find credential for the share's host
+        let host_info = state.hosts.iter().find(|h| h.ip == share.host);
+        let domain = host_info
+            .and_then(|h| {
+                h.hostname
+                    .find('.')
+                    .map(|i| h.hostname[i + 1..].to_lowercase())
+            })
+            .unwrap_or_default();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
+            .or_else(|| state.credentials.first())
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(SearchConnectorWork {
+            dedup_key,
+            share_host: share.host.clone(),
+            share_name: share.name.clone(),
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Drops .searchConnector-ms coercion files on writable shares.
 /// Interval: 45s.
 pub async fn auto_searchconnector_coercion(
@@ -47,55 +102,7 @@ pub async fn auto_searchconnector_coercion(
 
         let work: Vec<SearchConnectorWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for share in &state.shares {
-                if !share.permissions.to_uppercase().contains("WRITE") {
-                    continue;
-                }
-
-                let dedup_key = format!("searchconn:{}:{}", share.host, share.name);
-                if state.is_processed(DEDUP_SEARCHCONNECTOR, &dedup_key) {
-                    continue;
-                }
-
-                // Find credential for the share's host
-                let host_info = state.hosts.iter().find(|h| h.ip == share.host);
-                let domain = host_info
-                    .and_then(|h| {
-                        h.hostname
-                            .find('.')
-                            .map(|i| h.hostname[i + 1..].to_lowercase())
-                    })
-                    .unwrap_or_default();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-                    .or_else(|| state.credentials.first())
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(SearchConnectorWork {
-                    dedup_key,
-                    share_host: share.host.clone(),
-                    share_name: share.name.clone(),
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_searchconnector_work(&state, &listener)
         };
 
         for item in work {
@@ -156,6 +163,43 @@ struct SearchConnectorWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::StateInner;
+    use ares_core::models::{Credential, Host, Share};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_share(host: &str, name: &str, permissions: &str) -> Share {
+        Share {
+            host: host.into(),
+            name: name.into(),
+            permissions: permissions.into(),
+            comment: String::new(),
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        }
+    }
 
     #[test]
     fn dedup_key_format() {
@@ -305,5 +349,154 @@ mod tests {
                 "{p} should be detected as writable regardless of case"
             );
         }
+    }
+
+    // --- collect_searchconnector_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "WRITE"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_shares_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_writable_share_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "WRITE"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].share_host, "192.168.58.22");
+        assert_eq!(work[0].share_name, "Public");
+        assert_eq!(work[0].dedup_key, "searchconn:192.168.58.22:Public");
+        assert_eq!(work[0].listener, "192.168.58.50");
+    }
+
+    #[test]
+    fn collect_readonly_share_skipped() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "READ"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "WRITE"));
+        state.mark_processed(
+            DEDUP_SEARCHCONNECTOR,
+            "searchconn:192.168.58.22:Public".into(),
+        );
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_prefers_domain_matched_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .hosts
+            .push(make_host("192.168.58.22", "srv01.contoso.local"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Data", "READ/WRITE"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_credential_no_host() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+                                                                           // No host entry for this share IP, so domain is empty -> falls back to first cred
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "WRITE"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_multiple_shares_produces_work_for_each() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Public", "WRITE"));
+        state
+            .shares
+            .push(make_share("192.168.58.22", "Data", "READ/WRITE"));
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 2);
+        let names: Vec<&str> = work.iter().map(|w| w.share_name.as_str()).collect();
+        assert!(names.contains(&"Public"));
+        assert!(names.contains(&"Data"));
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+            state
+                .shares
+                .push(make_share("192.168.58.22", "Public", "WRITE"));
+        }
+        let state = shared.read().await;
+        let work = collect_searchconnector_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].share_host, "192.168.58.22");
     }
 }

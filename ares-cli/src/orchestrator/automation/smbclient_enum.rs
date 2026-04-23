@@ -14,6 +14,71 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect SMB enumeration work items from current state.
+///
+/// Pure logic extracted from the async loop so it can be unit-tested
+/// without a Dispatcher or runtime.
+fn collect_smbclient_work(state: &crate::orchestrator::state::StateInner) -> Vec<SmbEnumWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for host in &state.hosts {
+        // Check if host has SMB
+        let has_smb = host.services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        if !has_smb {
+            continue;
+        }
+
+        let dedup_key = format!("smb_auth_enum:{}", host.ip);
+        if state.is_processed(DEDUP_SMBCLIENT_ENUM, &dedup_key) {
+            continue;
+        }
+
+        // Infer domain from hostname
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_string())
+            .unwrap_or_default();
+
+        // Pick a credential for this domain
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| {
+                !domain.is_empty()
+                    && c.domain.to_lowercase() == domain.to_lowercase()
+                    && !c.password.is_empty()
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                state.credentials.iter().find(|c| {
+                    !c.password.is_empty()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+            }) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(SmbEnumWork {
+            dedup_key,
+            target_ip: host.ip.clone(),
+            hostname: host.hostname.clone(),
+            domain,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dispatches authenticated SMB share enumeration per host.
 /// Interval: 45s.
 pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -35,64 +100,10 @@ pub async fn auto_smbclient_enum(dispatcher: Arc<Dispatcher>, mut shutdown: watc
 
         let work: Vec<SmbEnumWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
+            let items = collect_smbclient_work(&state);
+            if items.is_empty() {
                 continue;
             }
-
-            let mut items = Vec::new();
-
-            for host in &state.hosts {
-                // Check if host has SMB
-                let has_smb = host.services.iter().any(|s| {
-                    let sl = s.to_lowercase();
-                    sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
-                });
-                if !has_smb {
-                    continue;
-                }
-
-                let dedup_key = format!("smb_auth_enum:{}", host.ip);
-                if state.is_processed(DEDUP_SMBCLIENT_ENUM, &dedup_key) {
-                    continue;
-                }
-
-                // Infer domain from hostname
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_string())
-                    .unwrap_or_default();
-
-                // Pick a credential for this domain
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !domain.is_empty()
-                            && c.domain.to_lowercase() == domain.to_lowercase()
-                            && !c.password.is_empty()
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    }) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(SmbEnumWork {
-                    dedup_key,
-                    target_ip: host.ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain,
-                    credential: cred,
-                });
-            }
-
             items
         };
 
@@ -152,6 +163,440 @@ struct SmbEnumWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::SharedState;
+
+    /// Helper: create a credential for tests.
+    fn make_cred(user: &str, pass: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{user}"),
+            username: user.into(),
+            password: pass.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    /// Helper: create a host with given services.
+    fn make_host(ip: &str, hostname: &str, services: Vec<&str>) -> ares_core::models::Host {
+        ares_core::models::Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: vec![],
+            services: services.into_iter().map(String::from).collect(),
+            is_dc: false,
+            owned: false,
+        }
+    }
+
+    // ---- collect_smbclient_work tests ----
+
+    #[tokio::test]
+    async fn collect_empty_state_returns_nothing() {
+        let shared = SharedState::new("op-test".into());
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_no_credentials_returns_nothing() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_no_smb_hosts_returns_nothing() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "web01.contoso.local",
+                vec!["80/tcp http", "443/tcp https"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_single_host_single_cred() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.10");
+        assert_eq!(work[0].hostname, "dc01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].dedup_key, "smb_auth_enum:192.168.58.10");
+    }
+
+    #[tokio::test]
+    async fn collect_multiple_hosts() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.20",
+                "srv01.contoso.local",
+                vec!["445/tcp smb", "80/tcp http"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 2);
+        let ips: Vec<&str> = work.iter().map(|w| w.target_ip.as_str()).collect();
+        assert!(ips.contains(&"192.168.58.10"));
+        assert!(ips.contains(&"192.168.58.20"));
+    }
+
+    #[tokio::test]
+    async fn collect_dedup_skips_already_processed() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.20",
+                "srv01.contoso.local",
+                vec!["445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+            state.mark_processed(DEDUP_SMBCLIENT_ENUM, "smb_auth_enum:192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.20");
+    }
+
+    #[tokio::test]
+    async fn collect_prefers_same_domain_credential() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state
+                .credentials
+                .push(make_cred("fab_user", "Fab123!", "fabrikam.local")); // pragma: allowlist secret
+            state
+                .credentials
+                .push(make_cred("con_user", "Con123!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "con_user");
+    }
+
+    #[tokio::test]
+    async fn collect_falls_back_to_any_credential_when_no_domain_match() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state
+                .credentials
+                .push(make_cred("fab_user", "Fab123!", "fabrikam.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fab_user");
+    }
+
+    #[tokio::test]
+    async fn collect_skips_empty_password_credentials() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "", "contoso.local"));
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_empty_password_falls_back() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "", "contoso.local"));
+            state
+                .credentials
+                .push(make_cred("fab_user", "Fab123!", "fabrikam.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fab_user");
+    }
+
+    #[tokio::test]
+    async fn collect_bare_hostname_empty_domain() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .hosts
+                .push(make_host("192.168.58.10", "srv01", vec!["445/tcp smb"]));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_cifs_service_detected() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "nas01.contoso.local",
+                vec!["cifs file share"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_case_insensitive_domain_matching() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.CONTOSO.LOCAL",
+                vec!["445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "CONTOSO.LOCAL");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_smb_and_non_smb_hosts() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp microsoft-ds", "88/tcp kerberos"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.20",
+                "web01.contoso.local",
+                vec!["80/tcp http", "443/tcp https"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.30",
+                "sql01.contoso.local",
+                vec!["1433/tcp mssql", "445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 2);
+        let ips: Vec<&str> = work.iter().map(|w| w.target_ip.as_str()).collect();
+        assert!(ips.contains(&"192.168.58.10"));
+        assert!(!ips.contains(&"192.168.58.20"));
+        assert!(ips.contains(&"192.168.58.30"));
+    }
+
+    #[tokio::test]
+    async fn collect_all_deduped_returns_nothing() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp smb"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.20",
+                "srv01.contoso.local",
+                vec!["445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+            state.mark_processed(DEDUP_SMBCLIENT_ENUM, "smb_auth_enum:192.168.58.10".into());
+            state.mark_processed(DEDUP_SMBCLIENT_ENUM, "smb_auth_enum:192.168.58.20".into());
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_cross_domain_hosts_get_correct_creds() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp smb"],
+            ));
+            state.hosts.push(make_host(
+                "192.168.58.20",
+                "dc02.fabrikam.local",
+                vec!["445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("con_admin", "ConPass!", "contoso.local")); // pragma: allowlist secret
+            state
+                .credentials
+                .push(make_cred("fab_admin", "FabPass!", "fabrikam.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert_eq!(work.len(), 2);
+
+        let contoso_work = work
+            .iter()
+            .find(|w| w.target_ip == "192.168.58.10")
+            .unwrap();
+        assert_eq!(contoso_work.credential.username, "con_admin");
+
+        let fabrikam_work = work
+            .iter()
+            .find(|w| w.target_ip == "192.168.58.20")
+            .unwrap();
+        assert_eq!(fabrikam_work.credential.username, "fab_admin");
+    }
+
+    #[tokio::test]
+    async fn collect_only_empty_password_creds_returns_nothing() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state.hosts.push(make_host(
+                "192.168.58.10",
+                "dc01.contoso.local",
+                vec!["445/tcp smb"],
+            ));
+            state
+                .credentials
+                .push(make_cred("user1", "", "contoso.local"));
+            state
+                .credentials
+                .push(make_cred("user2", "", "fabrikam.local"));
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_host_with_empty_services() {
+        let shared = SharedState::new("op-test".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .hosts
+                .push(make_host("192.168.58.10", "dc01.contoso.local", vec![]));
+            state
+                .credentials
+                .push(make_cred("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_smbclient_work(&state);
+        assert!(work.is_empty());
+    }
+
+    // ---- original tests ----
 
     #[test]
     fn dedup_key_format() {

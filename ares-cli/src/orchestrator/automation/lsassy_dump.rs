@@ -18,6 +18,70 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect lsassy dump work items from current state.
+///
+/// Pure logic extracted from `auto_lsassy_dump` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_lsassy_work(state: &StateInner) -> Vec<LsassyWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for host in &state.hosts {
+        // Only target hosts we've already owned (secretsdump succeeded)
+        if !host.owned {
+            continue;
+        }
+
+        let dedup_key = format!("lsassy:{}", host.ip);
+        if state.is_processed(DEDUP_LSASSY_DUMP, &dedup_key) {
+            continue;
+        }
+
+        // Infer domain from hostname
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+
+        // Find a credential for this host's domain
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| {
+                !c.password.is_empty()
+                    && (domain.is_empty() || c.domain.to_lowercase() == domain)
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                // Fall back to any admin credential
+                state
+                    .credentials
+                    .iter()
+                    .find(|c| c.is_admin && !c.password.is_empty())
+            })
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(LsassyWork {
+            dedup_key,
+            host_ip: host.ip.clone(),
+            hostname: host.hostname.clone(),
+            domain,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dumps LSASS credentials from owned hosts.
 /// Interval: 45s.
 pub async fn auto_lsassy_dump(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -37,66 +101,9 @@ pub async fn auto_lsassy_dump(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
             continue;
         }
 
-        let work: Vec<LsassyWork> = {
+        let work = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for host in &state.hosts {
-                // Only target hosts we've already owned (secretsdump succeeded)
-                if !host.owned {
-                    continue;
-                }
-
-                let dedup_key = format!("lsassy:{}", host.ip);
-                if state.is_processed(DEDUP_LSASSY_DUMP, &dedup_key) {
-                    continue;
-                }
-
-                // Infer domain from hostname
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_lowercase())
-                    .unwrap_or_default();
-
-                // Find a credential for this host's domain
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !c.password.is_empty()
-                            && (domain.is_empty() || c.domain.to_lowercase() == domain)
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        // Fall back to any admin credential
-                        state
-                            .credentials
-                            .iter()
-                            .find(|c| c.is_admin && !c.password.is_empty())
-                    })
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(LsassyWork {
-                    dedup_key,
-                    host_ip: host.ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_lsassy_work(&state)
         };
 
         for item in work {
@@ -156,6 +163,207 @@ struct LsassyWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::{Credential, Host};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_admin_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: true,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_owned_host(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: true,
+        }
+    }
+
+    fn make_unowned_host(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        }
+    }
+
+    // --- collect_lsassy_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_lsassy_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        let work = collect_lsassy_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_unowned_host_skipped() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_unowned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_lsassy_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_owned_host_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_lsassy_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].host_ip, "192.168.58.30");
+        assert_eq!(work[0].hostname, "srv01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dedup_key, "lsassy:192.168.58.30");
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_LSASSY_DUMP, "lsassy:192.168.58.30".into());
+        let work = collect_lsassy_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_falls_back_to_admin_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        // Only admin cred from different domain + quarantine the matching one
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        state.credentials.push(make_admin_credential(
+            "domadmin",
+            "Admin!1",
+            "fabrikam.local",
+        )); // pragma: allowlist secret
+        let work = collect_lsassy_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "domadmin");
+        assert!(work[0].credential.is_admin);
+    }
+
+    #[test]
+    fn collect_bare_hostname_matches_any_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state.hosts.push(make_owned_host("192.168.58.30", "ws01"));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_lsassy_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_multiple_owned_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.31", "srv02.fabrikam.local"));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_lsassy_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_quarantined_credential_skipped_with_fallback() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("gooduser", "Pass!456", "contoso.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_lsassy_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "gooduser");
+    }
+
+    #[test]
+    fn collect_skips_empty_password_credentials() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_owned_host("192.168.58.30", "srv01.contoso.local"));
+        state
+            .credentials
+            .push(make_credential("nopw", "", "contoso.local"));
+        let work = collect_lsassy_work(&state);
+        assert!(work.is_empty());
+    }
 
     #[test]
     fn dedup_key_format() {

@@ -38,64 +38,7 @@ pub async fn auto_certipy_auth(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
         let work: Vec<CertAuthWork> = {
             let state = dispatcher.state.read().await;
-
-            state
-                .discovered_vulnerabilities
-                .values()
-                .filter_map(|vuln| {
-                    let vtype = vuln.vuln_type.to_lowercase();
-                    if vtype != "certificate_obtained" && vtype != "adcs_certificate" {
-                        return None;
-                    }
-
-                    if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-                        return None;
-                    }
-
-                    let dedup_key = format!("cert_auth:{}", vuln.vuln_id);
-                    if state.is_processed(DEDUP_CERTIPY_AUTH, &dedup_key) {
-                        return None;
-                    }
-
-                    let pfx_path = vuln
-                        .details
-                        .get("pfx_path")
-                        .or_else(|| vuln.details.get("certificate_path"))
-                        .or_else(|| vuln.details.get("cert_file"))
-                        .and_then(|v| v.as_str())
-                        .map(|s| s.to_string())?;
-
-                    let domain = vuln
-                        .details
-                        .get("domain")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-
-                    let target_user = vuln
-                        .details
-                        .get("target_user")
-                        .or_else(|| vuln.details.get("upn"))
-                        .or_else(|| vuln.details.get("account_name"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("administrator")
-                        .to_string();
-
-                    let dc_ip = state
-                        .domain_controllers
-                        .get(&domain.to_lowercase())
-                        .cloned();
-
-                    Some(CertAuthWork {
-                        vuln_id: vuln.vuln_id.clone(),
-                        dedup_key,
-                        pfx_path,
-                        domain,
-                        target_user,
-                        dc_ip,
-                    })
-                })
-                .collect()
+            collect_cert_auth_work(&state)
         };
 
         for item in work {
@@ -143,6 +86,68 @@ pub async fn auto_certipy_auth(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             }
         }
     }
+}
+
+/// Pure logic extracted from `auto_certipy_auth` so it can be unit-tested without
+/// needing a `Dispatcher` or async runtime (beyond state construction).
+fn collect_cert_auth_work(state: &crate::orchestrator::state::StateInner) -> Vec<CertAuthWork> {
+    state
+        .discovered_vulnerabilities
+        .values()
+        .filter_map(|vuln| {
+            let vtype = vuln.vuln_type.to_lowercase();
+            if vtype != "certificate_obtained" && vtype != "adcs_certificate" {
+                return None;
+            }
+
+            if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+                return None;
+            }
+
+            let dedup_key = format!("cert_auth:{}", vuln.vuln_id);
+            if state.is_processed(DEDUP_CERTIPY_AUTH, &dedup_key) {
+                return None;
+            }
+
+            let pfx_path = vuln
+                .details
+                .get("pfx_path")
+                .or_else(|| vuln.details.get("certificate_path"))
+                .or_else(|| vuln.details.get("cert_file"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())?;
+
+            let domain = vuln
+                .details
+                .get("domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let target_user = vuln
+                .details
+                .get("target_user")
+                .or_else(|| vuln.details.get("upn"))
+                .or_else(|| vuln.details.get("account_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("administrator")
+                .to_string();
+
+            let dc_ip = state
+                .domain_controllers
+                .get(&domain.to_lowercase())
+                .cloned();
+
+            Some(CertAuthWork {
+                vuln_id: vuln.vuln_id.clone(),
+                dedup_key,
+                pfx_path,
+                domain,
+                target_user,
+                dc_ip,
+            })
+        })
+        .collect()
 }
 
 struct CertAuthWork {
@@ -349,5 +354,396 @@ mod tests {
             dc_ip: None,
         };
         assert!(work.dc_ip.is_none());
+    }
+
+    // -- Tests exercising the extracted `collect_cert_auth_work` function --
+
+    use crate::orchestrator::state::SharedState;
+
+    fn make_vuln(
+        vuln_id: &str,
+        vuln_type: &str,
+        details: std::collections::HashMap<String, serde_json::Value>,
+    ) -> ares_core::models::VulnerabilityInfo {
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.into(),
+            vuln_type: vuln_type.into(),
+            target: "192.168.58.10".into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_empty_state_returns_no_work() {
+        let shared = SharedState::new("test".into());
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_certificate_obtained_vuln_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/admin.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            details.insert("target_user".into(), serde_json::json!("administrator"));
+            s.discovered_vulnerabilities.insert(
+                "cert-001".into(),
+                make_vuln("cert-001", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_id, "cert-001");
+        assert_eq!(work[0].pfx_path, "/tmp/admin.pfx");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].target_user, "administrator");
+        assert_eq!(work[0].dedup_key, "cert_auth:cert-001");
+        assert!(work[0].dc_ip.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_adcs_certificate_vuln_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/svc.pfx"));
+            details.insert("domain".into(), serde_json::json!("fabrikam.local"));
+            details.insert("target_user".into(), serde_json::json!("svc_sql"));
+            s.discovered_vulnerabilities.insert(
+                "cert-002".into(),
+                make_vuln("cert-002", "adcs_certificate", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].vuln_id, "cert-002");
+        assert_eq!(work[0].domain, "fabrikam.local");
+        assert_eq!(work[0].target_user, "svc_sql");
+    }
+
+    #[tokio::test]
+    async fn collect_ignores_non_cert_vuln_types() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            s.discovered_vulnerabilities
+                .insert("vuln-esc1".into(), make_vuln("vuln-esc1", "esc1", details));
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_exploited_vulnerabilities() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-010".into(),
+                make_vuln("cert-010", "certificate_obtained", details),
+            );
+            s.exploited_vulnerabilities.insert("cert-010".into());
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_already_deduped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-020".into(),
+                make_vuln("cert-020", "certificate_obtained", details),
+            );
+            s.mark_processed(DEDUP_CERTIPY_AUTH, "cert_auth:cert-020".into());
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_skips_vuln_without_pfx_path() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            // No pfx_path, certificate_path, or cert_file key at all
+            let mut details = std::collections::HashMap::new();
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-030".into(),
+                make_vuln("cert-030", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_pfx_fallback_to_certificate_path() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("certificate_path".into(), serde_json::json!("/tmp/alt.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-040".into(),
+                make_vuln("cert-040", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].pfx_path, "/tmp/alt.pfx");
+    }
+
+    #[tokio::test]
+    async fn collect_pfx_fallback_to_cert_file() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("cert_file".into(), serde_json::json!("/tmp/other.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-050".into(),
+                make_vuln("cert-050", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].pfx_path, "/tmp/other.pfx");
+    }
+
+    #[tokio::test]
+    async fn collect_target_user_defaults_to_administrator() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            // No target_user, upn, or account_name
+            s.discovered_vulnerabilities.insert(
+                "cert-060".into(),
+                make_vuln("cert-060", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_user, "administrator");
+    }
+
+    #[tokio::test]
+    async fn collect_target_user_from_upn() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            details.insert("upn".into(), serde_json::json!("admin@contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-070".into(),
+                make_vuln("cert-070", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_user, "admin@contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_target_user_from_account_name() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            details.insert("account_name".into(), serde_json::json!("svc_web"));
+            s.discovered_vulnerabilities.insert(
+                "cert-080".into(),
+                make_vuln("cert-080", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_user, "svc_web");
+    }
+
+    #[tokio::test]
+    async fn collect_resolves_dc_ip_from_domain_controllers() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-090".into(),
+                make_vuln("cert-090", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dc_ip, Some("192.168.58.10".into()));
+    }
+
+    #[tokio::test]
+    async fn collect_dc_ip_none_when_domain_not_mapped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            // DC registered for a different domain
+            s.domain_controllers
+                .insert("fabrikam.local".into(), "192.168.58.20".into());
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-100".into(),
+                make_vuln("cert-100", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert!(work[0].dc_ip.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_domain_defaults_to_empty_string() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            // No domain key in details
+            s.discovered_vulnerabilities.insert(
+                "cert-110".into(),
+                make_vuln("cert-110", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "");
+    }
+
+    #[tokio::test]
+    async fn collect_case_insensitive_vuln_type() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            details.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-120".into(),
+                make_vuln("cert-120", "CERTIFICATE_OBTAINED", details.clone()),
+            );
+            s.discovered_vulnerabilities.insert(
+                "cert-121".into(),
+                make_vuln("cert-121", "Adcs_Certificate", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn collect_multiple_vulns_mixed_types() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            // Valid cert vuln
+            let mut d1 = std::collections::HashMap::new();
+            d1.insert("pfx_path".into(), serde_json::json!("/tmp/a.pfx"));
+            d1.insert("domain".into(), serde_json::json!("contoso.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-200".into(),
+                make_vuln("cert-200", "certificate_obtained", d1),
+            );
+
+            // Non-cert vuln (should be ignored)
+            let mut d2 = std::collections::HashMap::new();
+            d2.insert("target_ip".into(), serde_json::json!("192.168.58.22"));
+            s.discovered_vulnerabilities.insert(
+                "vuln-smb".into(),
+                make_vuln("vuln-smb", "smb_signing_disabled", d2),
+            );
+
+            // Another valid cert vuln
+            let mut d3 = std::collections::HashMap::new();
+            d3.insert("pfx_path".into(), serde_json::json!("/tmp/b.pfx"));
+            d3.insert("domain".into(), serde_json::json!("fabrikam.local"));
+            s.discovered_vulnerabilities.insert(
+                "cert-201".into(),
+                make_vuln("cert-201", "adcs_certificate", d3),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 2);
+        let ids: std::collections::HashSet<_> = work.iter().map(|w| w.vuln_id.as_str()).collect();
+        assert!(ids.contains("cert-200"));
+        assert!(ids.contains("cert-201"));
+    }
+
+    #[tokio::test]
+    async fn collect_dc_ip_lookup_is_case_insensitive() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            // DC stored under lowercase
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            let mut details = std::collections::HashMap::new();
+            details.insert("pfx_path".into(), serde_json::json!("/tmp/cert.pfx"));
+            // Domain in mixed case in vuln details
+            details.insert("domain".into(), serde_json::json!("CONTOSO.LOCAL"));
+            s.discovered_vulnerabilities.insert(
+                "cert-130".into(),
+                make_vuln("cert-130", "certificate_obtained", details),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_cert_auth_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dc_ip, Some("192.168.58.10".into()));
     }
 }

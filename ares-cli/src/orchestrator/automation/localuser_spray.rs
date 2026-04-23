@@ -16,6 +16,29 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect localuser spray work items from current state.
+///
+/// Pure logic extracted from `auto_localuser_spray` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_localuser_spray_work(state: &StateInner) -> Vec<LocaluserWork> {
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("localuser:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_LOCALUSER_SPRAY, &dedup_key) {
+            continue;
+        }
+
+        items.push(LocaluserWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+        });
+    }
+
+    items
+}
+
 /// Tests localuser:localuser credentials against each domain.
 /// Interval: 45s.
 pub async fn auto_localuser_spray(
@@ -38,25 +61,9 @@ pub async fn auto_localuser_spray(
             continue;
         }
 
-        let work: Vec<LocaluserWork> = {
+        let work = {
             let state = dispatcher.state.read().await;
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("localuser:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_LOCALUSER_SPRAY, &dedup_key) {
-                    continue;
-                }
-
-                items.push(LocaluserWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                });
-            }
-
-            items
+            collect_localuser_spray_work(&state)
         };
 
         for item in work {
@@ -114,6 +121,93 @@ struct LocaluserWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- collect_localuser_spray_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_localuser_spray_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_localuser_spray_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "localuser:contoso.local");
+    }
+
+    #[test]
+    fn collect_multiple_domains() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        let work = collect_localuser_spray_work(&state);
+        assert_eq!(work.len(), 2);
+        let domains: Vec<&str> = work.iter().map(|w| w.domain.as_str()).collect();
+        assert!(domains.contains(&"contoso.local"));
+        assert!(domains.contains(&"fabrikam.local"));
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.mark_processed(DEDUP_LOCALUSER_SPRAY, "localuser:contoso.local".into());
+        let work = collect_localuser_spray_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed_keeps_unprocessed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state.mark_processed(DEDUP_LOCALUSER_SPRAY, "localuser:contoso.local".into());
+        let work = collect_localuser_spray_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercased() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        let work = collect_localuser_spray_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "localuser:contoso.local");
+    }
+
+    #[test]
+    fn collect_no_credentials_needed() {
+        // localuser_spray does NOT require existing credentials (it uses hardcoded localuser:localuser)
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        assert!(state.credentials.is_empty());
+        let work = collect_localuser_spray_work(&state);
+        assert_eq!(work.len(), 1);
+    }
 
     #[test]
     fn dedup_key_format() {

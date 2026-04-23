@@ -14,6 +14,41 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect NTLMv1 downgrade work items from state (pure logic, no async).
+fn collect_ntlmv1_work(state: &StateInner) -> Vec<NtlmV1Work> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("ntlmv1:{}", dc_ip);
+        if state.is_processed(DEDUP_NTLMV1_DOWNGRADE, &dedup_key) {
+            continue;
+        }
+
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
+            .or_else(|| state.credentials.first())
+        {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(NtlmV1Work {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Checks each DC for NTLMv1 downgrade vulnerability.
 /// Interval: 45s.
 pub async fn auto_ntlmv1_downgrade(
@@ -38,38 +73,7 @@ pub async fn auto_ntlmv1_downgrade(
 
         let work: Vec<NtlmV1Work> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("ntlmv1:{}", dc_ip);
-                if state.is_processed(DEDUP_NTLMV1_DOWNGRADE, &dedup_key) {
-                    continue;
-                }
-
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
-                    .or_else(|| state.credentials.first())
-                {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(NtlmV1Work {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_ntlmv1_work(&state)
         };
 
         for item in work {
@@ -198,6 +202,130 @@ mod tests {
         let key = format!("ntlmv1:{}", "192.168.58.10");
         assert!(key.starts_with("ntlmv1:"));
         assert!(key.contains("192.168.58.10"));
+    }
+
+    // --- collect_ntlmv1_work tests ---
+
+    use crate::orchestrator::state::StateInner;
+
+    fn make_cred(username: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_produces_no_work() {
+        let state = StateInner::new("test".into());
+        let work = collect_ntlmv1_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_produces_no_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_ntlmv1_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dc_with_matching_cred_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_ntlmv1_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "ntlmv1:192.168.58.10");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_already_processed_dedup() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_NTLMV1_DOWNGRADE, "ntlmv1:192.168.58.10".into());
+        let work = collect_ntlmv1_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_cred("fabuser", "fabrikam.local"));
+        let work = collect_ntlmv1_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fabuser");
+    }
+
+    #[test]
+    fn collect_multiple_dcs_produces_multiple_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state
+            .credentials
+            .push(make_cred("fabadmin", "fabrikam.local"));
+        let work = collect_ntlmv1_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_dedup_key_uses_ip_not_domain() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_ntlmv1_work(&state);
+        assert_eq!(work.len(), 1);
+        assert!(work[0].dedup_key.starts_with("ntlmv1:"));
+        assert!(work[0].dedup_key.contains("192.168.58.10"));
+        assert!(!work[0].dedup_key.contains("contoso"));
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_cred("fabuser", "fabrikam.local"));
+        state
+            .credentials
+            .push(make_cred("conuser", "contoso.local"));
+        let work = collect_ntlmv1_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "conuser");
     }
 
     #[test]

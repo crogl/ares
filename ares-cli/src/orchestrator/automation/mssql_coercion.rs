@@ -44,64 +44,7 @@ pub async fn auto_mssql_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watc
 
         let work: Vec<MssqlCoercionWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // Target MSSQL hosts (identified by mssql_access vuln or host services)
-            for vuln in state.discovered_vulnerabilities.values() {
-                if vuln.vuln_type.to_lowercase() != "mssql_access" {
-                    continue;
-                }
-
-                let target_ip = vuln
-                    .details
-                    .get("target_ip")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&vuln.target);
-
-                if target_ip.is_empty() {
-                    continue;
-                }
-
-                let dedup_key = format!("mssql_coerce:{target_ip}");
-                if state.is_processed(DEDUP_MSSQL_COERCION, &dedup_key) {
-                    continue;
-                }
-
-                let domain = vuln
-                    .details
-                    .get("domain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        !domain.is_empty() && c.domain.to_lowercase() == domain.to_lowercase()
-                    })
-                    .or_else(|| state.credentials.first())
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(MssqlCoercionWork {
-                    dedup_key,
-                    target_ip: target_ip.to_string(),
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_mssql_coercion_work(&state, &listener)
         };
 
         for item in work {
@@ -147,6 +90,70 @@ pub async fn auto_mssql_coercion(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             }
         }
     }
+}
+
+/// Collect MSSQL coercion work items from the current state.
+///
+/// Extracted from the async loop so it can be unit-tested without a
+/// `Dispatcher` or real async runtime scaffolding.
+fn collect_mssql_coercion_work(
+    state: &crate::orchestrator::state::StateInner,
+    listener: &str,
+) -> Vec<MssqlCoercionWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for vuln in state.discovered_vulnerabilities.values() {
+        if vuln.vuln_type.to_lowercase() != "mssql_access" {
+            continue;
+        }
+
+        let target_ip = vuln
+            .details
+            .get("target_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&vuln.target);
+
+        if target_ip.is_empty() {
+            continue;
+        }
+
+        let dedup_key = format!("mssql_coerce:{target_ip}");
+        if state.is_processed(DEDUP_MSSQL_COERCION, &dedup_key) {
+            continue;
+        }
+
+        let domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain.to_lowercase())
+            .or_else(|| state.credentials.first())
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(MssqlCoercionWork {
+            dedup_key,
+            target_ip: target_ip.to_string(),
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    items
 }
 
 struct MssqlCoercionWork {
@@ -272,5 +279,420 @@ mod tests {
         };
         assert_eq!(work.target_ip, "192.168.58.22");
         assert_eq!(work.listener, "192.168.58.100");
+    }
+
+    // --- collect_mssql_coercion_work integration tests ---
+
+    use crate::orchestrator::state::SharedState;
+
+    fn make_cred(user: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{user}"),
+            username: user.into(),
+            password: "P@ssw0rd!".into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_vuln(
+        id: &str,
+        vuln_type: &str,
+        target: &str,
+        details: serde_json::Value,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let details_map: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_value(details).unwrap_or_default();
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: id.into(),
+            vuln_type: vuln_type.into(),
+            target: target.into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details: details_map,
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_empty_state_returns_nothing() {
+        let shared = SharedState::new("test".into());
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_no_vulns_with_creds_returns_nothing() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_mssql_access_vuln_produces_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
+        assert_eq!(work[0].listener, "192.168.58.100");
+        assert_eq!(work[0].dedup_key, "mssql_coerce:192.168.58.22");
+        assert_eq!(work[0].credential.username, "sa");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_skips_non_mssql_vulns() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "smb_signing_disabled",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_dedup_skips_already_processed() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+            state.mark_processed(DEDUP_MSSQL_COERCION, "mssql_coerce:192.168.58.22".into());
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_target_ip_falls_back_to_vuln_target() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln("v1", "mssql_access", "192.168.58.30", json!({})),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.30");
+    }
+
+    #[tokio::test]
+    async fn collect_skips_empty_target_ip() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln("v1", "mssql_access", "", json!({"target_ip": ""})),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
+    }
+
+    #[tokio::test]
+    async fn collect_prefers_domain_matching_credential() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("admin", "fabrikam.local"));
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "sa");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_falls_back_to_first_cred_when_no_domain_match() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("admin", "fabrikam.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_falls_back_to_first_cred_when_domain_empty() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "sa");
+    }
+
+    #[tokio::test]
+    async fn collect_multiple_vulns_produce_multiple_work_items() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+            state.discovered_vulnerabilities.insert(
+                "v2".into(),
+                make_vuln(
+                    "v2",
+                    "mssql_access",
+                    "192.168.58.23",
+                    json!({"target_ip": "192.168.58.23", "domain": "contoso.local"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 2);
+        let ips: std::collections::HashSet<&str> =
+            work.iter().map(|w| w.target_ip.as_str()).collect();
+        assert!(ips.contains("192.168.58.22"));
+        assert!(ips.contains("192.168.58.23"));
+    }
+
+    #[tokio::test]
+    async fn collect_case_insensitive_vuln_type() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "MSSQL_ACCESS",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_case_insensitive_domain_matching() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "CONTOSO.LOCAL"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22", "domain": "contoso.local"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "sa");
+    }
+
+    #[tokio::test]
+    async fn collect_partial_dedup_only_skips_processed() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+            state.discovered_vulnerabilities.insert(
+                "v2".into(),
+                make_vuln(
+                    "v2",
+                    "mssql_access",
+                    "192.168.58.23",
+                    json!({"target_ip": "192.168.58.23"}),
+                ),
+            );
+            state.mark_processed(DEDUP_MSSQL_COERCION, "mssql_coerce:192.168.58.22".into());
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.23");
+    }
+
+    #[tokio::test]
+    async fn collect_listener_propagated_to_work() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].listener, "192.168.58.50");
+    }
+
+    #[tokio::test]
+    async fn collect_mixed_vuln_types_only_mssql_access() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln(
+                    "v1",
+                    "mssql_access",
+                    "192.168.58.22",
+                    json!({"target_ip": "192.168.58.22"}),
+                ),
+            );
+            state.discovered_vulnerabilities.insert(
+                "v2".into(),
+                make_vuln(
+                    "v2",
+                    "constrained_delegation",
+                    "192.168.58.23",
+                    json!({"target_ip": "192.168.58.23"}),
+                ),
+            );
+            state.discovered_vulnerabilities.insert(
+                "v3".into(),
+                make_vuln(
+                    "v3",
+                    "mssql_impersonation",
+                    "192.168.58.24",
+                    json!({"target_ip": "192.168.58.24"}),
+                ),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
+    }
+
+    #[tokio::test]
+    async fn collect_vuln_with_empty_target_and_no_detail_ip_skipped() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            state.credentials.push(make_cred("sa", "contoso.local"));
+            state.discovered_vulnerabilities.insert(
+                "v1".into(),
+                make_vuln("v1", "mssql_access", "", json!({"domain": "contoso.local"})),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_mssql_coercion_work(&state, "192.168.58.100");
+        assert!(work.is_empty());
     }
 }

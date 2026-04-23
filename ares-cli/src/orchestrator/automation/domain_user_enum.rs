@@ -18,6 +18,54 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect user enumeration work items from current state.
+///
+/// Pure logic extracted from `auto_domain_user_enum` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_user_enum_work(state: &StateInner) -> Vec<UserEnumWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("user_enum:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_DOMAIN_USER_ENUM, &dedup_key) {
+            continue;
+        }
+
+        // Prefer a credential from the target domain.
+        // Fall back to any available credential (cross-domain LDAP may work).
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| {
+                c.domain.to_lowercase() == domain.to_lowercase()
+                    && !c.password.is_empty()
+                    && !state.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .or_else(|| {
+                state.credentials.iter().find(|c| {
+                    !c.password.is_empty()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+            }) {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(UserEnumWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dispatches per-domain LDAP user enumeration.
 /// Interval: 45s.
 pub async fn auto_domain_user_enum(
@@ -42,48 +90,7 @@ pub async fn auto_domain_user_enum(
 
         let work: Vec<UserEnumWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("user_enum:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_DOMAIN_USER_ENUM, &dedup_key) {
-                    continue;
-                }
-
-                // Prefer a credential from the target domain.
-                // Fall back to any available credential (cross-domain LDAP may work).
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| {
-                        c.domain.to_lowercase() == domain.to_lowercase()
-                            && !c.password.is_empty()
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
-                    })
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    }) {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(UserEnumWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_user_enum_work(&state)
         };
 
         for item in work {
@@ -277,5 +284,149 @@ mod tests {
         let fallback = creds.iter().find(|c| !c.password.is_empty());
         assert!(fallback.is_some());
         assert_eq!(fallback.unwrap().domain, "fabrikam.local");
+    }
+
+    fn make_credential(
+        username: &str,
+        password: &str,
+        domain: &str,
+    ) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_user_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_user_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_domain_with_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_user_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.mark_processed(DEDUP_DOMAIN_USER_ENUM, "user_enum:contoso.local".into());
+        let work = collect_user_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_cross_domain_fallback() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        // Only fabrikam cred available, should fall back
+        state
+            .credentials
+            .push(make_credential("crossuser", "P@ssw0rd!", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_user_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "crossuser");
+        assert_eq!(work[0].credential.domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_skips_empty_password() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "", "contoso.local"));
+        let work = collect_user_enum_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_quarantined_credential_falls_back() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_user_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "gooduser");
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercased() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_user_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "user_enum:contoso.local");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        }
+        let state = shared.read().await;
+        let work = collect_user_enum_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
     }
 }

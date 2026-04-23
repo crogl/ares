@@ -49,119 +49,7 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
 
         let work: Vec<RelayWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // Path 1: Relay to hosts with SMB signing disabled → LDAP shadow creds / RBCD
-            for vuln in state.discovered_vulnerabilities.values() {
-                if vuln.vuln_type.to_lowercase() != "smb_signing_disabled" {
-                    continue;
-                }
-                if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-                    continue;
-                }
-
-                let target_ip = vuln
-                    .details
-                    .get("target_ip")
-                    .or_else(|| vuln.details.get("ip"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&vuln.target);
-
-                if target_ip.is_empty() {
-                    continue;
-                }
-
-                let relay_key = format!("smb_relay:{target_ip}");
-                if state.is_processed(DEDUP_SET, &relay_key) {
-                    continue;
-                }
-
-                // Find a DC we can coerce (PetitPotam)
-                let coercion_source = find_coercion_source(&state.domain_controllers, |ip| {
-                    state.is_processed(DEDUP_COERCED_DCS, ip)
-                });
-
-                let cred = match state.credentials.first() {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(RelayWork {
-                    dedup_key: relay_key,
-                    relay_type: RelayType::SmbToLdap,
-                    relay_target: target_ip.to_string(),
-                    coercion_source,
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            // Path 2: Relay to ADCS web enrollment (ESC8)
-            // Look for ADCS servers with HTTP enrollment that haven't been ESC8-relayed
-            for vuln in state.discovered_vulnerabilities.values() {
-                let vtype = vuln.vuln_type.to_lowercase();
-                if vtype != "esc8" && vtype != "adcs_web_enrollment" {
-                    continue;
-                }
-                if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-                    continue;
-                }
-
-                let ca_host = vuln
-                    .details
-                    .get("ca_host")
-                    .or_else(|| vuln.details.get("target_ip"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or(&vuln.target);
-
-                if ca_host.is_empty() {
-                    continue;
-                }
-
-                let relay_key = format!("esc8_relay:{ca_host}");
-                if state.is_processed(DEDUP_SET, &relay_key) {
-                    continue;
-                }
-
-                let coercion_source = find_coercion_source(&state.domain_controllers, |ip| {
-                    state.is_processed(DEDUP_COERCED_DCS, ip)
-                });
-
-                let cred = match state.credentials.first() {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                let ca_name = vuln
-                    .details
-                    .get("ca_name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                let domain = vuln
-                    .details
-                    .get("domain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-
-                items.push(RelayWork {
-                    dedup_key: relay_key,
-                    relay_type: RelayType::Esc8 { ca_name, domain },
-                    relay_target: ca_host.to_string(),
-                    coercion_source,
-                    listener: listener.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_relay_work(&state, &listener)
         };
 
         for item in work {
@@ -224,6 +112,126 @@ pub async fn auto_ntlm_relay(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             }
         }
     }
+}
+
+/// Collect relay work items from current state.
+///
+/// Pure logic extracted from `auto_ntlm_relay` so it can be unit-tested without
+/// needing a `Dispatcher` or async runtime (beyond state construction).
+fn collect_relay_work(
+    state: &crate::orchestrator::state::StateInner,
+    listener: &str,
+) -> Vec<RelayWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    // Path 1: Relay to hosts with SMB signing disabled → LDAP shadow creds / RBCD
+    for vuln in state.discovered_vulnerabilities.values() {
+        if vuln.vuln_type.to_lowercase() != "smb_signing_disabled" {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+
+        let target_ip = vuln
+            .details
+            .get("target_ip")
+            .or_else(|| vuln.details.get("ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&vuln.target);
+
+        if target_ip.is_empty() {
+            continue;
+        }
+
+        let relay_key = format!("smb_relay:{target_ip}");
+        if state.is_processed(DEDUP_SET, &relay_key) {
+            continue;
+        }
+
+        let coercion_source = find_coercion_source(&state.domain_controllers, |ip| {
+            state.is_processed(DEDUP_COERCED_DCS, ip)
+        });
+
+        let cred = match state.credentials.first() {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(RelayWork {
+            dedup_key: relay_key,
+            relay_type: RelayType::SmbToLdap,
+            relay_target: target_ip.to_string(),
+            coercion_source,
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    // Path 2: Relay to ADCS web enrollment (ESC8)
+    for vuln in state.discovered_vulnerabilities.values() {
+        let vtype = vuln.vuln_type.to_lowercase();
+        if vtype != "esc8" && vtype != "adcs_web_enrollment" {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+
+        let ca_host = vuln
+            .details
+            .get("ca_host")
+            .or_else(|| vuln.details.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(&vuln.target);
+
+        if ca_host.is_empty() {
+            continue;
+        }
+
+        let relay_key = format!("esc8_relay:{ca_host}");
+        if state.is_processed(DEDUP_SET, &relay_key) {
+            continue;
+        }
+
+        let coercion_source = find_coercion_source(&state.domain_controllers, |ip| {
+            state.is_processed(DEDUP_COERCED_DCS, ip)
+        });
+
+        let cred = match state.credentials.first() {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        let ca_name = vuln
+            .details
+            .get("ca_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        items.push(RelayWork {
+            dedup_key: relay_key,
+            relay_type: RelayType::Esc8 { ca_name, domain },
+            relay_target: ca_host.to_string(),
+            coercion_source,
+            listener: listener.to_string(),
+            credential: cred,
+        });
+    }
+
+    items
 }
 
 /// Find the best coercion source (a DC IP we can PetitPotam/PrinterBug).
@@ -539,5 +547,304 @@ mod tests {
             domain: String::new(),
         };
         assert_eq!(format!("{esc8}"), "esc8_adcs");
+    }
+
+    // --- collect_relay_work integration tests ---
+
+    use crate::orchestrator::state::SharedState;
+
+    fn make_cred() -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: "c1".into(),
+            username: "svcadmin".into(),
+            password: "S3cure!Pass".into(), // pragma: allowlist secret
+            domain: "contoso.local".into(),
+            source: "kerberoast".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_smb_vuln(id: &str, target_ip: &str) -> ares_core::models::VulnerabilityInfo {
+        let mut details = HashMap::new();
+        details.insert(
+            "target_ip".to_string(),
+            serde_json::Value::String(target_ip.to_string()),
+        );
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: id.to_string(),
+            vuln_type: "smb_signing_disabled".to_string(),
+            target: target_ip.to_string(),
+            discovered_by: "scanner".to_string(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    fn make_esc8_vuln(
+        id: &str,
+        ca_host: &str,
+        ca_name: &str,
+        domain: &str,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut details = HashMap::new();
+        details.insert(
+            "ca_host".to_string(),
+            serde_json::Value::String(ca_host.to_string()),
+        );
+        details.insert(
+            "ca_name".to_string(),
+            serde_json::Value::String(ca_name.to_string()),
+        );
+        details.insert(
+            "domain".to_string(),
+            serde_json::Value::String(domain.to_string()),
+        );
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: id.to_string(),
+            vuln_type: "esc8".to_string(),
+            target: ca_host.to_string(),
+            discovered_by: "scanner".to_string(),
+            discovered_at: chrono::Utc::now(),
+            details,
+            recommended_agent: String::new(),
+            priority: 8,
+        }
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_empty_state() {
+        let shared = SharedState::new("test".into());
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(work.is_empty(), "empty state should produce no work");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_no_credentials() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(work.is_empty(), "no credentials should produce no work");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_smb_signing_disabled() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "smb_relay:192.168.58.22");
+        assert_eq!(work[0].relay_target, "192.168.58.22");
+        assert_eq!(work[0].listener, "192.168.58.100");
+        assert!(matches!(work[0].relay_type, RelayType::SmbToLdap));
+        assert_eq!(work[0].coercion_source, Some("192.168.58.10".into()));
+        assert_eq!(work[0].credential.username, "svcadmin");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_esc8_vuln() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities.insert(
+                "v2".into(),
+                make_esc8_vuln("v2", "192.168.58.30", "contoso-CA", "contoso.local"),
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "esc8_relay:192.168.58.30");
+        assert_eq!(work[0].relay_target, "192.168.58.30");
+        match &work[0].relay_type {
+            RelayType::Esc8 { ca_name, domain } => {
+                assert_eq!(ca_name, "contoso-CA");
+                assert_eq!(domain, "contoso.local");
+            }
+            _ => panic!("expected Esc8 relay type"),
+        }
+        // No DCs configured → coercion_source is None
+        assert!(work[0].coercion_source.is_none());
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_skips_already_processed_dedup() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            // Mark the relay key as already processed
+            s.mark_processed(DEDUP_SET, "smb_relay:192.168.58.22".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(
+            work.is_empty(),
+            "already-processed dedup key should be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_skips_exploited_vulns() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            s.exploited_vulnerabilities.insert("v1".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(work.is_empty(), "exploited vulns should be skipped");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_multiple_vulns() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            s.discovered_vulnerabilities
+                .insert("v2".into(), make_smb_vuln("v2", "192.168.58.23"));
+            s.discovered_vulnerabilities.insert(
+                "v3".into(),
+                make_esc8_vuln("v3", "192.168.58.30", "contoso-CA", "contoso.local"),
+            );
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 3, "should produce work for all 3 vulns");
+
+        let smb_count = work
+            .iter()
+            .filter(|w| matches!(w.relay_type, RelayType::SmbToLdap))
+            .count();
+        let esc8_count = work
+            .iter()
+            .filter(|w| matches!(w.relay_type, RelayType::Esc8 { .. }))
+            .count();
+        assert_eq!(smb_count, 2);
+        assert_eq!(esc8_count, 1);
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_ignores_unrelated_vuln_types() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            // Add an unrelated vuln type
+            let mut details = HashMap::new();
+            details.insert(
+                "target_ip".to_string(),
+                serde_json::Value::String("192.168.58.40".to_string()),
+            );
+            s.discovered_vulnerabilities.insert(
+                "v_unrelated".into(),
+                ares_core::models::VulnerabilityInfo {
+                    vuln_id: "v_unrelated".into(),
+                    vuln_type: "mssql_impersonation".into(),
+                    target: "192.168.58.40".into(),
+                    discovered_by: "scanner".into(),
+                    discovered_at: chrono::Utc::now(),
+                    details,
+                    recommended_agent: String::new(),
+                    priority: 3,
+                },
+            );
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(
+            work.is_empty(),
+            "unrelated vuln types should not produce work"
+        );
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_esc8_already_processed() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities.insert(
+                "v2".into(),
+                make_esc8_vuln("v2", "192.168.58.30", "contoso-CA", "contoso.local"),
+            );
+            s.mark_processed(DEDUP_SET, "esc8_relay:192.168.58.30".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert!(work.is_empty(), "already-processed esc8 should be skipped");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_mixed_exploited_and_fresh() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            s.discovered_vulnerabilities
+                .insert("v2".into(), make_smb_vuln("v2", "192.168.58.23"));
+            // Only v1 is exploited
+            s.exploited_vulnerabilities.insert("v1".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].relay_target, "192.168.58.23");
+    }
+
+    #[tokio::test]
+    async fn collect_relay_work_coercion_source_prefers_uncoerced_dc() {
+        let shared = SharedState::new("test".into());
+        {
+            let mut s = shared.write().await;
+            s.credentials.push(make_cred());
+            s.discovered_vulnerabilities
+                .insert("v1".into(), make_smb_vuln("v1", "192.168.58.22"));
+            s.domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+            s.domain_controllers
+                .insert("fabrikam.local".into(), "192.168.58.20".into());
+            // Mark first DC as already coerced
+            s.mark_processed(DEDUP_COERCED_DCS, "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_relay_work(&state, "192.168.58.100");
+        assert_eq!(work.len(), 1);
+        assert_eq!(
+            work[0].coercion_source,
+            Some("192.168.58.20".into()),
+            "should prefer the uncoerced DC"
+        );
     }
 }

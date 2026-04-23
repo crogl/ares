@@ -39,73 +39,10 @@ pub async fn auto_pth_spray(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
 
         let work: Vec<PthWork> = {
             let state = dispatcher.state.read().await;
-
-            // Need NTLM hashes
-            let ntlm_hashes: Vec<_> = state
-                .hashes
-                .iter()
-                .filter(|h| {
-                    h.hash_type.to_lowercase().contains("ntlm")
-                        && !h.hash_value.is_empty()
-                        && h.hash_value.len() == 32
-                })
-                .collect();
-
-            if ntlm_hashes.is_empty() {
-                continue;
+            match collect_pth_work(&state) {
+                Some(items) => items,
+                None => continue,
             }
-
-            let mut items = Vec::new();
-
-            // For each non-owned host, try PTH with available NTLM hashes
-            for host in &state.hosts {
-                if host.owned {
-                    continue;
-                }
-
-                // Check if host has SMB (port 445)
-                let has_smb = host.services.iter().any(|s| {
-                    let sl = s.to_lowercase();
-                    sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
-                });
-                if !has_smb {
-                    continue;
-                }
-
-                // Try each unique NTLM hash against this host
-                for hash in &ntlm_hashes {
-                    let dedup_key = format!(
-                        "pth:{}:{}:{}",
-                        host.ip,
-                        hash.username.to_lowercase(),
-                        &hash.hash_value[..8]
-                    );
-                    if state.is_processed(DEDUP_PTH_SPRAY, &dedup_key) {
-                        continue;
-                    }
-
-                    // Infer domain from hash or host
-                    let domain = if !hash.domain.is_empty() {
-                        hash.domain.clone()
-                    } else {
-                        host.hostname
-                            .find('.')
-                            .map(|i| host.hostname[i + 1..].to_string())
-                            .unwrap_or_default()
-                    };
-
-                    items.push(PthWork {
-                        dedup_key,
-                        target_ip: host.ip.clone(),
-                        hostname: host.hostname.clone(),
-                        username: hash.username.clone(),
-                        ntlm_hash: hash.hash_value.clone(),
-                        domain,
-                    });
-                }
-            }
-
-            items
         };
 
         // Limit to 5 per cycle to avoid overwhelming the throttler
@@ -153,6 +90,77 @@ pub async fn auto_pth_spray(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Re
     }
 }
 
+/// Collects PTH spray work items from state. Returns `None` when there are no
+/// NTLM hashes (caller should skip the cycle).
+fn collect_pth_work(state: &StateInner) -> Option<Vec<PthWork>> {
+    // Need NTLM hashes
+    let ntlm_hashes: Vec<_> = state
+        .hashes
+        .iter()
+        .filter(|h| {
+            h.hash_type.to_lowercase().contains("ntlm")
+                && !h.hash_value.is_empty()
+                && h.hash_value.len() == 32
+        })
+        .collect();
+
+    if ntlm_hashes.is_empty() {
+        return None;
+    }
+
+    let mut items = Vec::new();
+
+    // For each non-owned host, try PTH with available NTLM hashes
+    for host in &state.hosts {
+        if host.owned {
+            continue;
+        }
+
+        // Check if host has SMB (port 445)
+        let has_smb = host.services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        if !has_smb {
+            continue;
+        }
+
+        // Try each unique NTLM hash against this host
+        for hash in &ntlm_hashes {
+            let dedup_key = format!(
+                "pth:{}:{}:{}",
+                host.ip,
+                hash.username.to_lowercase(),
+                &hash.hash_value[..8]
+            );
+            if state.is_processed(DEDUP_PTH_SPRAY, &dedup_key) {
+                continue;
+            }
+
+            // Infer domain from hash or host
+            let domain = if !hash.domain.is_empty() {
+                hash.domain.clone()
+            } else {
+                host.hostname
+                    .find('.')
+                    .map(|i| host.hostname[i + 1..].to_string())
+                    .unwrap_or_default()
+            };
+
+            items.push(PthWork {
+                dedup_key,
+                target_ip: host.ip.clone(),
+                hostname: host.hostname.clone(),
+                username: hash.username.clone(),
+                ntlm_hash: hash.hash_value.clone(),
+                domain,
+            });
+        }
+    }
+
+    Some(items)
+}
+
 struct PthWork {
     dedup_key: String,
     target_ip: String,
@@ -165,6 +173,47 @@ struct PthWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::{Hash, Host};
+
+    fn make_ntlm_hash(username: &str, hash_value: &str, domain: &str) -> Hash {
+        Hash {
+            id: format!("hash-{username}"),
+            username: username.to_string(),
+            hash_value: hash_value.to_string(),
+            hash_type: "NTLM".to_string(),
+            domain: domain.to_string(),
+            cracked_password: None, // pragma: allowlist secret
+            source: "secretsdump".to_string(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+        }
+    }
+
+    fn make_smb_host(ip: &str, hostname: &str, owned: bool) -> Host {
+        Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: vec!["445/tcp microsoft-ds".to_string()],
+            is_dc: false,
+            owned,
+        }
+    }
+
+    fn make_host_no_smb(ip: &str, hostname: &str) -> Host {
+        Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: vec!["80/tcp http".to_string()],
+            is_dc: false,
+            owned: false,
+        }
+    }
 
     #[test]
     fn dedup_key_format() {
@@ -342,5 +391,398 @@ mod tests {
         let items: Vec<i32> = (0..20).collect();
         let taken: Vec<_> = items.into_iter().take(5).collect();
         assert_eq!(taken.len(), 5);
+    }
+
+    // --- collect_pth_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_none() {
+        let state = StateInner::new("test".into());
+        assert!(collect_pth_work(&state).is_none());
+    }
+
+    #[test]
+    fn collect_no_hashes_returns_none() {
+        let mut state = StateInner::new("test".into());
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        assert!(collect_pth_work(&state).is_none());
+    }
+
+    #[test]
+    fn collect_hashes_no_hosts_returns_empty() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_hash_and_smb_host_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.10");
+        assert_eq!(work[0].username, "admin");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].ntlm_hash, "aad3b435b51404eeaad3b435b51404ee");
+    }
+
+    #[test]
+    fn collect_skips_owned_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.10",
+            "srv01.contoso.local",
+            true, // owned
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_non_smb_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_host_no_smb("192.168.58.20", "web01.contoso.local"));
+        let work = collect_pth_work(&state).unwrap();
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_dedup_processed() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        // Mark as already processed
+        state.mark_processed(
+            DEDUP_PTH_SPRAY,
+            "pth:192.168.58.10:admin:aad3b435".to_string(),
+        );
+        let work = collect_pth_work(&state).unwrap();
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_filters_non_ntlm_hashes() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(Hash {
+            id: "hash-aes".into(),
+            username: "admin".into(),
+            hash_value: "abcdef1234567890abcdef1234567890".into(), // pragma: allowlist secret
+            hash_type: "aes256-cts-hmac-sha1-96".into(),
+            domain: "contoso.local".into(),
+            cracked_password: None, // pragma: allowlist secret
+            source: "secretsdump".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+        });
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        // AES hash type should be rejected
+        assert!(collect_pth_work(&state).is_none());
+    }
+
+    #[test]
+    fn collect_filters_short_hash_values() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435", // too short, not 32 chars - pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        assert!(collect_pth_work(&state).is_none());
+    }
+
+    #[test]
+    fn collect_filters_empty_hash_values() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "", // empty - pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        assert!(collect_pth_work(&state).is_none());
+    }
+
+    #[test]
+    fn collect_domain_fallback_from_hostname() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "",                                 // empty domain on hash
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.10",
+            "srv01.fabrikam.local",
+            false,
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_domain_fallback_bare_hostname_empty() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "",                                 // empty domain on hash
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.10",
+            "srv01", // no dot, no domain part
+            false,
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "");
+    }
+
+    #[test]
+    fn collect_multiple_hashes_multiple_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hashes.push(make_ntlm_hash(
+            "svcacct",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.20", "srv02.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        // 2 hashes x 2 hosts = 4 work items
+        assert_eq!(work.len(), 4);
+    }
+
+    #[test]
+    fn collect_dedup_key_lowercases_username() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "Administrator",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert!(work[0].dedup_key.contains(":administrator:"));
+    }
+
+    #[test]
+    fn collect_mixed_owned_and_unowned_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.10",
+            "srv01.contoso.local",
+            true, // owned
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.20",
+            "srv02.contoso.local",
+            false, // not owned
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.20");
+    }
+
+    #[test]
+    fn collect_mixed_smb_and_non_smb_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_host_no_smb("192.168.58.10", "web01.contoso.local"));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.20", "srv01.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.20");
+    }
+
+    #[test]
+    fn collect_smb_detection_via_smb_string() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hosts.push(Host {
+            ip: "192.168.58.10".into(),
+            hostname: "srv01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: vec!["SMB".to_string()],
+            is_dc: false,
+            owned: false,
+        });
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn collect_smb_detection_via_cifs_string() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hosts.push(Host {
+            ip: "192.168.58.10".into(),
+            hostname: "srv01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: vec!["cifs/srv01.contoso.local".to_string()],
+            is_dc: false,
+            owned: false,
+        });
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn collect_partial_dedup_only_skips_processed() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hashes.push(make_ntlm_hash(
+            "svcacct",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        // Mark only admin as processed
+        state.mark_processed(
+            DEDUP_PTH_SPRAY,
+            "pth:192.168.58.10:admin:aad3b435".to_string(),
+        );
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].username, "svcacct");
+    }
+
+    #[test]
+    fn collect_hostname_preserved_in_work() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "dc01.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work[0].hostname, "dc01.contoso.local");
+    }
+
+    #[test]
+    fn collect_hash_domain_preferred_over_hostname_domain() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(make_ntlm_hash(
+            "admin",
+            "aad3b435b51404eeaad3b435b51404ee", // pragma: allowlist secret
+            "contoso.local",
+        ));
+        state.hosts.push(make_smb_host(
+            "192.168.58.10",
+            "srv01.fabrikam.local",
+            false,
+        ));
+        let work = collect_pth_work(&state).unwrap();
+        // Hash domain takes priority over hostname domain
+        assert_eq!(work[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_ntlm_hash_type_case_insensitive() {
+        let mut state = StateInner::new("test".into());
+        state.hashes.push(Hash {
+            id: "hash-1".into(),
+            username: "admin".into(),
+            hash_value: "aad3b435b51404eeaad3b435b51404ee".into(), // pragma: allowlist secret
+            hash_type: "Ntlm".into(),                              // mixed case
+            domain: "contoso.local".into(),
+            cracked_password: None, // pragma: allowlist secret
+            source: "secretsdump".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+        });
+        state
+            .hosts
+            .push(make_smb_host("192.168.58.10", "srv01.contoso.local", false));
+        let work = collect_pth_work(&state).unwrap();
+        assert_eq!(work.len(), 1);
     }
 }

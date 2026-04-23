@@ -18,6 +18,68 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect WinRM lateral movement work items from current state.
+///
+/// Pure logic extracted from `auto_winrm_lateral` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_winrm_lateral_work(state: &StateInner) -> Vec<WinRmWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for host in &state.hosts {
+        // Check if host has WinRM indicators in services
+        let has_winrm = host.services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+        });
+
+        if !has_winrm {
+            continue;
+        }
+
+        // Skip hosts we already own via secretsdump
+        if state.is_processed(DEDUP_SECRETSDUMP, &host.ip) {
+            continue;
+        }
+
+        let dedup_key = format!("winrm:{}", host.ip);
+        if state.is_processed(DEDUP_WINRM_LATERAL, &dedup_key) {
+            continue;
+        }
+
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
+            .or_else(|| state.credentials.first())
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(WinRmWork {
+            dedup_key,
+            target_ip: host.ip.clone(),
+            hostname: host.hostname.clone(),
+            domain,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Attempts WinRM lateral movement against hosts with owned credentials.
 /// Interval: 45s.
 pub async fn auto_winrm_lateral(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -39,62 +101,7 @@ pub async fn auto_winrm_lateral(dispatcher: Arc<Dispatcher>, mut shutdown: watch
 
         let work: Vec<WinRmWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for host in &state.hosts {
-                // Check if host has WinRM indicators in services
-                let has_winrm = host.services.iter().any(|s| {
-                    let sl = s.to_lowercase();
-                    sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
-                });
-
-                if !has_winrm {
-                    continue;
-                }
-
-                // Skip hosts we already own via secretsdump
-                if state.is_processed(DEDUP_SECRETSDUMP, &host.ip) {
-                    continue;
-                }
-
-                let dedup_key = format!("winrm:{}", host.ip);
-                if state.is_processed(DEDUP_WINRM_LATERAL, &dedup_key) {
-                    continue;
-                }
-
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_lowercase())
-                    .unwrap_or_default();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-                    .or_else(|| state.credentials.first())
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(WinRmWork {
-                    dedup_key,
-                    target_ip: host.ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_winrm_lateral_work(&state)
         };
 
         for item in work {
@@ -155,6 +162,34 @@ struct WinRmWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::StateInner;
+    use ares_core::models::{Credential, Host};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str, services: Vec<String>) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services,
+            is_dc: false,
+            owned: false,
+        }
+    }
 
     #[test]
     fn dedup_key_format() {
@@ -329,5 +364,174 @@ mod tests {
             sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
         });
         assert!(!has_winrm, "Empty services should not detect WinRM");
+    }
+
+    // --- collect_winrm_lateral_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_winrm_lateral_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_winrm_hosts_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["445/tcp smb".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_winrm_host_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.30");
+        assert_eq!(work[0].hostname, "srv01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dedup_key, "winrm:192.168.58.30");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_already_secretsdumped_host() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.30".into());
+        let work = collect_winrm_lateral_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        state.mark_processed(DEDUP_WINRM_LATERAL, "winrm:192.168.58.30".into());
+        let work = collect_winrm_lateral_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_hosts_produces_work_for_each() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        state.hosts.push(make_host(
+            "192.168.58.31",
+            "web01.contoso.local",
+            vec!["5986/tcp ssl/http".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert_eq!(work.len(), 2);
+        let ips: Vec<&str> = work.iter().map(|w| w.target_ip.as_str()).collect();
+        assert!(ips.contains(&"192.168.58.30"));
+        assert!(ips.contains(&"192.168.58.31"));
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01.contoso.local",
+            vec!["5985/tcp http".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_credential_bare_hostname() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "srv01",
+            vec!["5985/tcp http".into()],
+        ));
+        let work = collect_winrm_lateral_work(&state);
+        assert_eq!(work.len(), 1);
+        // Bare hostname -> empty domain -> falls back to first cred
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].domain, "");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .credentials
+                .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+            state.hosts.push(make_host(
+                "192.168.58.30",
+                "srv01.contoso.local",
+                vec!["5985/tcp http".into()],
+            ));
+        }
+        let state = shared.read().await;
+        let work = collect_winrm_lateral_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.30");
     }
 }

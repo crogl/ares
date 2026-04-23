@@ -18,6 +18,41 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect GPP/SYSVOL work items from state (pure logic, no async).
+fn collect_gpp_sysvol_work(state: &StateInner) -> Vec<GppSysvolWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        let dedup_key = format!("gpp:{}", domain.to_lowercase());
+        if state.is_processed(DEDUP_GPP_SYSVOL, &dedup_key) {
+            continue;
+        }
+
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
+            .or_else(|| state.credentials.first())
+        {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        items.push(GppSysvolWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Searches SYSVOL for GPP passwords and script credentials.
 /// Interval: 45s.
 pub async fn auto_gpp_sysvol(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -39,38 +74,7 @@ pub async fn auto_gpp_sysvol(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
 
         let work: Vec<GppSysvolWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                let dedup_key = format!("gpp:{}", domain.to_lowercase());
-                if state.is_processed(DEDUP_GPP_SYSVOL, &dedup_key) {
-                    continue;
-                }
-
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
-                    .or_else(|| state.credentials.first())
-                {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                items.push(GppSysvolWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_gpp_sysvol_work(&state)
         };
 
         for item in work {
@@ -205,6 +209,128 @@ mod tests {
         // The payload dispatches two techniques in a single submission per domain
         let techniques = ["gpp_password_finder", "sysvol_script_search"];
         assert_eq!(techniques.len(), 2);
+    }
+
+    // --- collect_gpp_sysvol_work tests ---
+
+    use crate::orchestrator::state::StateInner;
+
+    fn make_cred(username: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_produces_no_work() {
+        let state = StateInner::new("test".into());
+        let work = collect_gpp_sysvol_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_produces_no_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_gpp_sysvol_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dc_with_matching_cred_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_gpp_sysvol_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "gpp:contoso.local");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_already_processed_dedup() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_GPP_SYSVOL, "gpp:contoso.local".into());
+        let work = collect_gpp_sysvol_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_cred("fabuser", "fabrikam.local"));
+        let work = collect_gpp_sysvol_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "fabuser");
+    }
+
+    #[test]
+    fn collect_multiple_domains_produces_multiple_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state
+            .credentials
+            .push(make_cred("fabadmin", "fabrikam.local"));
+        let work = collect_gpp_sysvol_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .credentials
+            .push(make_cred("fabuser", "fabrikam.local"));
+        state
+            .credentials
+            .push(make_cred("conuser", "contoso.local"));
+        let work = collect_gpp_sysvol_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "conuser");
+    }
+
+    #[test]
+    fn collect_case_insensitive_domain_match() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_gpp_sysvol_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "gpp:contoso.local");
     }
 
     #[test]

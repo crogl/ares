@@ -19,6 +19,73 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect KrbRelayUp work items from current state.
+///
+/// Pure logic extracted from `auto_krbrelayup` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_krbrelayup_work(state: &StateInner) -> Vec<KrbRelayUpWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    // Check if any DC has LDAP signing disabled (vuln registered by auto_ldap_signing)
+    let has_ldap_weak = state.discovered_vulnerabilities.values().any(|v| {
+        let vtype = v.vuln_type.to_lowercase();
+        vtype == "ldap_signing_disabled" || vtype == "ldap_signing_not_required"
+    });
+
+    if !has_ldap_weak {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    // Target non-DC hosts (priv esc on member servers)
+    for host in &state.hosts {
+        if host.is_dc {
+            continue;
+        }
+
+        // Skip hosts we already own
+        if state.is_processed(DEDUP_SECRETSDUMP, &host.ip) {
+            continue;
+        }
+
+        let dedup_key = format!("krbrelayup:{}", host.ip);
+        if state.is_processed(DEDUP_KRBRELAYUP, &dedup_key) {
+            continue;
+        }
+
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
+            .or_else(|| state.credentials.first())
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(KrbRelayUpWork {
+            dedup_key,
+            target_ip: host.ip.clone(),
+            hostname: host.hostname.clone(),
+            domain,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Dispatches KrbRelayUp exploitation against hosts when LDAP signing is weak.
 /// Interval: 45s.
 pub async fn auto_krbrelayup(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -38,69 +105,9 @@ pub async fn auto_krbrelayup(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             continue;
         }
 
-        let work: Vec<KrbRelayUpWork> = {
+        let work = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            // Check if any DC has LDAP signing disabled (vuln registered by auto_ldap_signing)
-            let has_ldap_weak = state.discovered_vulnerabilities.values().any(|v| {
-                let vtype = v.vuln_type.to_lowercase();
-                vtype == "ldap_signing_disabled" || vtype == "ldap_signing_not_required"
-            });
-
-            if !has_ldap_weak {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            // Target non-DC hosts (priv esc on member servers)
-            for host in &state.hosts {
-                if host.is_dc {
-                    continue;
-                }
-
-                // Skip hosts we already own
-                if state.is_processed(DEDUP_SECRETSDUMP, &host.ip) {
-                    continue;
-                }
-
-                let dedup_key = format!("krbrelayup:{}", host.ip);
-                if state.is_processed(DEDUP_KRBRELAYUP, &dedup_key) {
-                    continue;
-                }
-
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_lowercase())
-                    .unwrap_or_default();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-                    .or_else(|| state.credentials.first())
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(KrbRelayUpWork {
-                    dedup_key,
-                    target_ip: host.ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_krbrelayup_work(&state)
         };
 
         for item in work {
@@ -161,6 +168,205 @@ struct KrbRelayUpWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ares_core::models::{Credential, Host, VulnerabilityInfo};
+
+    fn make_credential(username: &str, password: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("c-{username}"),
+            username: username.into(),
+            password: password.into(), // pragma: allowlist secret
+            domain: domain.into(),
+            source: "test".into(),
+            is_admin: false,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_host(ip: &str, hostname: &str, is_dc: bool) -> Host {
+        Host {
+            ip: ip.into(),
+            hostname: hostname.into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc,
+            owned: false,
+        }
+    }
+
+    fn make_ldap_vuln() -> VulnerabilityInfo {
+        VulnerabilityInfo {
+            vuln_id: "ldap-weak-1".into(),
+            vuln_type: "ldap_signing_disabled".into(),
+            target: "192.168.58.10".into(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details: Default::default(),
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    // --- collect_krbrelayup_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_ldap_vuln_returns_no_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_non_dc_host_with_ldap_vuln_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.30");
+        assert_eq!(work[0].hostname, "srv01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dedup_key, "krbrelayup:192.168.58.30");
+    }
+
+    #[test]
+    fn collect_skips_dc_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.10", "dc01.contoso.local", true));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        state.mark_processed(DEDUP_KRBRELAYUP, "krbrelayup:192.168.58.30".into());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_already_owned_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.30".into());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_ldap_signing_not_required_also_triggers() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        let mut vuln = make_ldap_vuln();
+        vuln.vuln_type = "ldap_signing_not_required".into();
+        state.discovered_vulnerabilities.insert("v1".into(), vuln);
+        let work = collect_krbrelayup_work(&state);
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn collect_bare_hostname_uses_fallback_cred() {
+        let mut state = StateInner::new("test-op".into());
+        state.hosts.push(make_host("192.168.58.30", "ws01", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_multiple_non_dc_hosts() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.30", "srv01.contoso.local", false));
+        state
+            .hosts
+            .push(make_host("192.168.58.31", "srv02.fabrikam.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert_eq!(work.len(), 2);
+    }
 
     #[test]
     fn dedup_key_format() {

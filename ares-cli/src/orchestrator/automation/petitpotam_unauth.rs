@@ -18,6 +18,28 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect PetitPotam unauth work items from current state.
+///
+/// Pure logic extracted from `auto_petitpotam_unauth` so it can be unit-tested
+/// without needing a `Dispatcher` or async runtime.
+fn collect_petitpotam_unauth_work(state: &StateInner, listener: &str) -> Vec<PetitPotamWork> {
+    state
+        .domain_controllers
+        .iter()
+        .filter(|(_, dc_ip)| dc_ip.as_str() != listener)
+        .filter(|(_, dc_ip)| {
+            let dedup_key = format!("petitpotam_unauth:{dc_ip}");
+            !state.is_processed(DEDUP_PETITPOTAM_UNAUTH, &dedup_key)
+        })
+        .map(|(domain, dc_ip)| PetitPotamWork {
+            dedup_key: format!("petitpotam_unauth:{dc_ip}"),
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            listener: listener.to_string(),
+        })
+        .collect()
+}
+
 /// Attempts unauthenticated PetitPotam against each DC once.
 /// Interval: 45s.
 pub async fn auto_petitpotam_unauth(
@@ -47,22 +69,7 @@ pub async fn auto_petitpotam_unauth(
 
         let work: Vec<PetitPotamWork> = {
             let state = dispatcher.state.read().await;
-
-            state
-                .domain_controllers
-                .iter()
-                .filter(|(_, dc_ip)| dc_ip.as_str() != listener)
-                .filter(|(_, dc_ip)| {
-                    let dedup_key = format!("petitpotam_unauth:{dc_ip}");
-                    !state.is_processed(DEDUP_PETITPOTAM_UNAUTH, &dedup_key)
-                })
-                .map(|(domain, dc_ip)| PetitPotamWork {
-                    dedup_key: format!("petitpotam_unauth:{dc_ip}"),
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    listener: listener.clone(),
-                })
-                .collect()
+            collect_petitpotam_unauth_work(&state, &listener)
         };
 
         for item in work {
@@ -117,6 +124,7 @@ struct PetitPotamWork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orchestrator::state::StateInner;
 
     #[test]
     fn dedup_key_format() {
@@ -197,5 +205,119 @@ mod tests {
 
         let self_target_dc = "192.168.58.50";
         assert_eq!(self_target_dc, listener, "Self-targeting should be skipped");
+    }
+
+    // --- collect_petitpotam_unauth_work tests ---
+
+    #[test]
+    fn collect_empty_state_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_dcs_returns_no_work() {
+        let state = StateInner::new("test-op".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_single_dc_produces_work() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].dedup_key, "petitpotam_unauth:192.168.58.10");
+        assert_eq!(work[0].listener, "192.168.58.50");
+    }
+
+    #[test]
+    fn collect_no_credentials_still_produces_work() {
+        // PetitPotam unauth does NOT require credentials
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+    }
+
+    #[test]
+    fn collect_skips_dc_matching_listener() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.50".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dedup_skips_already_processed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.mark_processed(
+            DEDUP_PETITPOTAM_UNAUTH,
+            "petitpotam_unauth:192.168.58.10".into(),
+        );
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_dcs_produces_work_for_each() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 2);
+        let domains: Vec<&str> = work.iter().map(|w| w.domain.as_str()).collect();
+        assert!(domains.contains(&"contoso.local"));
+        assert!(domains.contains(&"fabrikam.local"));
+    }
+
+    #[test]
+    fn collect_dedup_skips_processed_keeps_unprocessed() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state.mark_processed(
+            DEDUP_PETITPOTAM_UNAUTH,
+            "petitpotam_unauth:192.168.58.10".into(),
+        );
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[tokio::test]
+    async fn collect_via_shared_state() {
+        let shared = SharedState::new("test-op".into());
+        {
+            let mut state = shared.write().await;
+            state
+                .domain_controllers
+                .insert("contoso.local".into(), "192.168.58.10".into());
+        }
+        let state = shared.read().await;
+        let work = collect_petitpotam_unauth_work(&state, "192.168.58.50");
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
     }
 }

@@ -16,8 +16,78 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
-use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
+
+/// Collect WebDAV work items from state (pure logic, no async).
+fn collect_webdav_work(state: &StateInner) -> Vec<WebDavWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for host in &state.hosts {
+        // Skip DCs (WebDAV relay is for member servers)
+        if host.is_dc {
+            continue;
+        }
+
+        // Check if host has WebDAV indicators in services
+        let has_webdav = host.services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+
+        if !has_webdav {
+            continue;
+        }
+
+        let dedup_key = format!("webdav:{}", host.ip);
+        if state.is_processed(DEDUP_WEBDAV_DETECTION, &dedup_key) {
+            continue;
+        }
+
+        // Check if vuln already registered
+        let vuln_id = format!("webdav_enabled_{}", host.ip.replace('.', "_"));
+        if state.discovered_vulnerabilities.contains_key(&vuln_id) {
+            continue;
+        }
+
+        let domain = host
+            .hostname
+            .find('.')
+            .map(|i| host.hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+
+        let cred = state
+            .credentials
+            .iter()
+            .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
+            .or_else(|| state.credentials.first())
+            .cloned();
+
+        let cred = match cred {
+            Some(c) => c,
+            None => continue,
+        };
+
+        items.push(WebDavWork {
+            dedup_key,
+            vuln_id,
+            target_ip: host.ip.clone(),
+            hostname: host.hostname.clone(),
+            domain,
+            credential: cred,
+        });
+    }
+
+    items
+}
+
+use crate::orchestrator::dispatcher::Dispatcher;
 
 /// Checks discovered hosts for WebDAV service and registers vulnerabilities.
 /// Interval: 45s.
@@ -43,72 +113,7 @@ pub async fn auto_webdav_detection(
 
         let work: Vec<WebDavWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for host in &state.hosts {
-                // Skip DCs (WebDAV relay is for member servers)
-                if host.is_dc {
-                    continue;
-                }
-
-                // Check if host has WebDAV indicators in services
-                let has_webdav = host.services.iter().any(|s| {
-                    let sl = s.to_lowercase();
-                    sl.contains("webdav")
-                        || sl.contains("webclient")
-                        || sl.contains("iis")
-                        || (sl.contains("80/") && sl.contains("http"))
-                });
-
-                if !has_webdav {
-                    continue;
-                }
-
-                let dedup_key = format!("webdav:{}", host.ip);
-                if state.is_processed(DEDUP_WEBDAV_DETECTION, &dedup_key) {
-                    continue;
-                }
-
-                // Check if vuln already registered
-                let vuln_id = format!("webdav_enabled_{}", host.ip.replace('.', "_"));
-                if state.discovered_vulnerabilities.contains_key(&vuln_id) {
-                    continue;
-                }
-
-                let domain = host
-                    .hostname
-                    .find('.')
-                    .map(|i| host.hostname[i + 1..].to_lowercase())
-                    .unwrap_or_default();
-
-                let cred = state
-                    .credentials
-                    .iter()
-                    .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-                    .or_else(|| state.credentials.first())
-                    .cloned();
-
-                let cred = match cred {
-                    Some(c) => c,
-                    None => continue,
-                };
-
-                items.push(WebDavWork {
-                    dedup_key,
-                    vuln_id,
-                    target_ip: host.ip.clone(),
-                    hostname: host.hostname.clone(),
-                    domain,
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_webdav_work(&state)
         };
 
         for item in work {
@@ -431,5 +436,264 @@ mod tests {
                 || (sl.contains("80/") && sl.contains("http"))
         });
         assert!(!has_webdav);
+    }
+
+    // --- collect_webdav_work tests ---
+
+    use crate::orchestrator::state::StateInner;
+
+    fn make_host(
+        ip: &str,
+        hostname: &str,
+        is_dc: bool,
+        services: Vec<String>,
+    ) -> ares_core::models::Host {
+        ares_core::models::Host {
+            ip: ip.to_string(),
+            hostname: hostname.to_string(),
+            os: String::new(),
+            roles: Vec::new(),
+            services,
+            is_dc,
+            owned: false,
+        }
+    }
+
+    fn make_cred(username: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_produces_no_work() {
+        let state = StateInner::new("test".into());
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_produces_no_work() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_host_with_webdav_and_creds_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
+        assert_eq!(work[0].hostname, "web01.contoso.local");
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dedup_key, "webdav:192.168.58.22");
+        assert_eq!(work[0].vuln_id, "webdav_enabled_192_168_58_22");
+        assert_eq!(work[0].credential.username, "admin");
+    }
+
+    #[test]
+    fn collect_skips_dc_hosts() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.10",
+            "dc01.contoso.local",
+            true,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_host_without_webdav_services() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["445/tcp microsoft-ds".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_already_processed_dedup() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_WEBDAV_DETECTION, "webdav:192.168.58.22".into());
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_already_registered_vuln() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.discovered_vulnerabilities.insert(
+            "webdav_enabled_192_168_58_22".to_string(),
+            ares_core::models::VulnerabilityInfo {
+                vuln_id: "webdav_enabled_192_168_58_22".to_string(),
+                vuln_type: "webdav_enabled".to_string(),
+                target: "192.168.58.22".to_string(),
+                discovered_by: "test".to_string(),
+                discovered_at: chrono::Utc::now(),
+                details: std::collections::HashMap::new(),
+                recommended_agent: "coercion".to_string(),
+                priority: 4,
+            },
+        );
+        let work = collect_webdav_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_extracts_domain_from_hostname() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.30",
+            "web01.fabrikam.local",
+            false,
+            vec!["80/tcp iis httpd".to_string()],
+        ));
+        state
+            .credentials
+            .push(make_cred("svc_web", "fabrikam.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn collect_prefers_same_domain_credential() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["WebClient service running".to_string()],
+        ));
+        // First cred is fabrikam, second is contoso (matching host domain)
+        state
+            .credentials
+            .push(make_cred("user_fab", "fabrikam.local"));
+        state
+            .credentials
+            .push(make_cred("user_con", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "user_con");
+        assert_eq!(work[0].credential.domain, "contoso.local");
+    }
+
+    #[test]
+    fn collect_falls_back_to_first_cred_when_no_domain_match() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        // Only fabrikam creds, host is contoso
+        state
+            .credentials
+            .push(make_cred("user_fab", "fabrikam.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "user_fab");
+    }
+
+    #[test]
+    fn collect_bare_hostname_falls_back_to_first_cred() {
+        let mut state = StateInner::new("test".into());
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        state
+            .credentials
+            .push(make_cred("fallback_user", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 1);
+        // bare hostname has empty domain, so domain match fails; falls back to first
+        assert_eq!(work[0].credential.username, "fallback_user");
+        assert_eq!(work[0].domain, "");
+    }
+
+    #[test]
+    fn collect_multiple_hosts_mixed() {
+        let mut state = StateInner::new("test".into());
+        // Good: member server with webdav
+        state.hosts.push(make_host(
+            "192.168.58.22",
+            "web01.contoso.local",
+            false,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        // Skipped: DC
+        state.hosts.push(make_host(
+            "192.168.58.10",
+            "dc01.contoso.local",
+            true,
+            vec!["80/tcp webdav".to_string()],
+        ));
+        // Skipped: no webdav service
+        state.hosts.push(make_host(
+            "192.168.58.40",
+            "sql01.contoso.local",
+            false,
+            vec!["1433/tcp ms-sql-s".to_string()],
+        ));
+        // Good: IIS server
+        state.hosts.push(make_host(
+            "192.168.58.50",
+            "ws01.fabrikam.local",
+            false,
+            vec!["80/tcp iis httpd".to_string()],
+        ));
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_webdav_work(&state);
+        assert_eq!(work.len(), 2);
+        assert_eq!(work[0].target_ip, "192.168.58.22");
+        assert_eq!(work[1].target_ip, "192.168.58.50");
     }
 }

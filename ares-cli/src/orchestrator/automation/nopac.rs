@@ -17,6 +17,46 @@ use tracing::{debug, info, warn};
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
+/// Collect noPac work items from state (pure logic, no async).
+fn collect_nopac_work(state: &StateInner) -> Vec<NopacWork> {
+    if state.credentials.is_empty() {
+        return Vec::new();
+    }
+
+    let mut items = Vec::new();
+
+    for (domain, dc_ip) in &state.domain_controllers {
+        // Skip domains we already dominate -- noPac is pointless if we have krbtgt
+        if state.dominated_domains.contains(&domain.to_lowercase()) {
+            continue;
+        }
+
+        // Find a credential for this domain
+        let cred = match state
+            .credentials
+            .iter()
+            .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
+        {
+            Some(c) => c.clone(),
+            None => continue,
+        };
+
+        let dedup_key = format!("nopac:{}:{}", domain.to_lowercase(), dc_ip);
+        if state.is_processed(DEDUP_NOPAC, &dedup_key) {
+            continue;
+        }
+
+        items.push(NopacWork {
+            dedup_key,
+            domain: domain.clone(),
+            dc_ip: dc_ip.clone(),
+            credential: cred,
+        });
+    }
+
+    items
+}
+
 /// Monitors for noPac exploitation opportunities.
 /// Dispatches against each DC+credential pair once.
 /// Interval: 45s (low-priority CVE check).
@@ -39,43 +79,7 @@ pub async fn auto_nopac(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiv
 
         let work: Vec<NopacWork> = {
             let state = dispatcher.state.read().await;
-
-            if state.credentials.is_empty() {
-                continue;
-            }
-
-            let mut items = Vec::new();
-
-            for (domain, dc_ip) in &state.domain_controllers {
-                // Skip domains we already dominate — noPac is pointless if we have krbtgt
-                if state.dominated_domains.contains(&domain.to_lowercase()) {
-                    continue;
-                }
-
-                // Find a credential for this domain
-                let cred = match state
-                    .credentials
-                    .iter()
-                    .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
-                {
-                    Some(c) => c.clone(),
-                    None => continue,
-                };
-
-                let dedup_key = format!("nopac:{}:{}", domain.to_lowercase(), dc_ip);
-                if state.is_processed(DEDUP_NOPAC, &dedup_key) {
-                    continue;
-                }
-
-                items.push(NopacWork {
-                    dedup_key,
-                    domain: domain.clone(),
-                    dc_ip: dc_ip.clone(),
-                    credential: cred,
-                });
-            }
-
-            items
+            collect_nopac_work(&state)
         };
 
         for item in work {
@@ -226,6 +230,120 @@ mod tests {
         let domain2 = "Fabrikam.Local";
         let key2 = format!("nopac:{}:{}", domain2.to_lowercase(), "192.168.58.20");
         assert_eq!(key2, "nopac:fabrikam.local:192.168.58.20");
+    }
+
+    // --- collect_nopac_work tests ---
+
+    use crate::orchestrator::state::StateInner;
+
+    fn make_cred(username: &str, domain: &str) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: username.to_string(),
+            password: "P@ssw0rd!".to_string(), // pragma: allowlist secret
+            domain: domain.to_string(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn collect_empty_state_produces_no_work() {
+        let state = StateInner::new("test".into());
+        let work = collect_nopac_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_no_credentials_produces_no_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        let work = collect_nopac_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_dc_with_matching_cred_produces_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_nopac_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].domain, "contoso.local");
+        assert_eq!(work[0].dc_ip, "192.168.58.10");
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].dedup_key, "nopac:contoso.local:192.168.58.10");
+    }
+
+    #[test]
+    fn collect_skips_dominated_domain() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.dominated_domains.insert("contoso.local".into());
+        let work = collect_nopac_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_no_matching_credential() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        // Credential for different domain, noPac requires exact domain match
+        state.credentials.push(make_cred("admin", "fabrikam.local"));
+        let work = collect_nopac_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_already_processed_dedup() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state.mark_processed(DEDUP_NOPAC, "nopac:contoso.local:192.168.58.10".into());
+        let work = collect_nopac_work(&state);
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_multiple_domains_produces_multiple_work() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        state
+            .domain_controllers
+            .insert("fabrikam.local".into(), "192.168.58.20".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        state
+            .credentials
+            .push(make_cred("fabadmin", "fabrikam.local"));
+        let work = collect_nopac_work(&state);
+        assert_eq!(work.len(), 2);
+    }
+
+    #[test]
+    fn collect_case_insensitive_domain_match() {
+        let mut state = StateInner::new("test".into());
+        state
+            .domain_controllers
+            .insert("CONTOSO.LOCAL".into(), "192.168.58.10".into());
+        state.credentials.push(make_cred("admin", "contoso.local"));
+        let work = collect_nopac_work(&state);
+        assert_eq!(work.len(), 1);
     }
 
     #[test]
