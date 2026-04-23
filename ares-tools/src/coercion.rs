@@ -58,6 +58,7 @@ pub async fn coercer(args: &Value) -> Result<ToolOutput> {
         .arg("coerce")
         .flag("-t", target)
         .flag("-l", listener)
+        .arg("--always-continue")
         .timeout_secs(120);
 
     if let Some(u) = username {
@@ -89,6 +90,7 @@ pub async fn petitpotam(args: &Value) -> Result<ToolOutput> {
         .flag("-t", target)
         .flag("-l", listener)
         .args(["--filter-protocol-name", "MS-EFSR"])
+        .arg("--always-continue")
         .timeout_secs(60);
 
     if let Some(u) = username {
@@ -116,8 +118,8 @@ pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
     let domain = optional_str(args, "domain");
 
     let mut cmd = CommandBuilder::new("dfscoerce")
-        .flag("-t", target)
-        .flag("-l", listener)
+        .arg(listener)
+        .arg(target)
         .timeout_secs(60);
 
     if let Some(u) = username {
