@@ -837,6 +837,8 @@ mod tests {
         assert_eq!(action_flag, "--AddComputerTask");
     }
 
+    // --- mock executor tests: exercise full CommandBuilder code paths ---
+
     use crate::executor::mock;
 
     #[tokio::test]

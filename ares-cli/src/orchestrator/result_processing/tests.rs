@@ -669,6 +669,8 @@ fn parse_shares_with_comment() {
     assert_eq!(parsed.shares[0].comment, "Logon server share");
 }
 
+// --- parse_pwned_line tests ---
+
 #[test]
 fn pwned_line_standard_format() {
     let line = "[+] CONTOSO\\admin:P@ssw0rd! (Pwn3d!)";
@@ -745,6 +747,8 @@ fn pwned_line_username_with_special_chars() {
     );
 }
 
+// --- extract_ip_from_line tests ---
+
 #[test]
 fn extract_ip_basic() {
     let line = "SMB 192.168.58.10 445 DC01 [+] CONTOSO\\admin (Pwn3d!)";
@@ -789,6 +793,8 @@ fn extract_ip_boundary_values() {
     assert_eq!(extract_ip_from_line(line), Some("0.0.0.0".to_string()));
 }
 
+// --- has_golden_ticket_indicator tests ---
+
 #[test]
 fn golden_ticket_indicator_present() {
     let text = "Saving ticket in administrator.ccache";
@@ -817,6 +823,8 @@ fn golden_ticket_indicator_both_present_not_adjacent() {
     let text = "Saving ticket in /tmp/krbtgt@CONTOSO.LOCAL.ccache\nDone";
     assert!(has_golden_ticket_indicator(text));
 }
+
+// --- resolve_da_path tests ---
 
 #[test]
 fn da_path_explicit_flag_with_path() {
@@ -862,6 +870,8 @@ fn da_path_null_flag_defaults_to_krbtgt() {
         Some("secretsdump -> krbtgt hash".to_string())
     );
 }
+
+// --- credential_techniques tests ---
 
 #[test]
 fn credential_techniques_admin_base() {
@@ -919,6 +929,8 @@ fn credential_techniques_empty_source() {
     let t = credential_techniques("", false);
     assert_eq!(t, vec!["T1552"]);
 }
+
+// --- hash_techniques tests ---
 
 #[test]
 fn hash_techniques_base() {
@@ -1004,6 +1016,8 @@ fn hash_techniques_as_rep_hyphenated_source() {
     let t = hash_techniques("aabb", "unknown", "as-rep_roast");
     assert!(t.contains(&"T1558.004".to_string()));
 }
+
+// --- is_critical_hash tests ---
 
 #[test]
 fn critical_hash_krbtgt() {

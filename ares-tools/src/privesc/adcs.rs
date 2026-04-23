@@ -164,6 +164,8 @@ mod tests {
     use crate::args::{optional_bool, optional_str, required_str};
     use serde_json::json;
 
+    // --- certipy_find ---
+
     #[test]
     fn certipy_find_missing_username() {
         let args = json!({
@@ -243,6 +245,8 @@ mod tests {
         assert!(vulnerable);
     }
 
+    // --- certipy_request ---
+
     #[test]
     fn certipy_request_missing_ca() {
         let args = json!({
@@ -313,6 +317,8 @@ mod tests {
         assert!(optional_str(&args, "upn").is_none());
     }
 
+    // --- certipy_auth ---
+
     #[test]
     fn certipy_auth_missing_pfx_path() {
         let args = json!({
@@ -352,6 +358,8 @@ mod tests {
         assert_eq!(required_str(&args, "domain").unwrap(), "contoso.local");
     }
 
+    // --- certipy_shadow ---
+
     #[test]
     fn certipy_shadow_missing_target() {
         let args = json!({
@@ -378,6 +386,8 @@ mod tests {
         assert_eq!(user_at_domain, "admin@contoso.local");
     }
 
+    // --- certipy_template_esc4 ---
+
     #[test]
     fn certipy_template_esc4_missing_template() {
         let args = json!({
@@ -403,6 +413,8 @@ mod tests {
         let user_at_domain = format!("{username}@{domain}");
         assert_eq!(user_at_domain, "admin@contoso.local");
     }
+
+    // --- mock executor tests ---
 
     use crate::executor::mock;
 

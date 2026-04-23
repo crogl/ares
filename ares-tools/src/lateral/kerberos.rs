@@ -123,6 +123,8 @@ mod tests {
         assert!(optional_str(&args, "dc_ip").is_none());
     }
 
+    // --- mock executor tests ---
+
     use crate::executor::mock;
 
     #[tokio::test]

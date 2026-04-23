@@ -552,6 +552,8 @@ pub async fn auto_credential_access(
 mod tests {
     use super::*;
 
+    // --- kerberoast_dedup_key ---
+
     #[test]
     fn kerberoast_dedup_key_basic() {
         assert_eq!(
@@ -573,6 +575,8 @@ mod tests {
         assert_eq!(kerberoast_dedup_key("", ""), "krb::");
     }
 
+    // --- spray_dedup_key ---
+
     #[test]
     fn spray_dedup_key_basic() {
         assert_eq!(
@@ -591,6 +595,8 @@ mod tests {
         assert_eq!(spray_dedup_key("", ""), ":");
     }
 
+    // --- common_spray_dedup_key ---
+
     #[test]
     fn common_spray_dedup_key_basic() {
         assert_eq!(
@@ -604,6 +610,8 @@ mod tests {
         assert_eq!(common_spray_dedup_key(""), "common:");
     }
 
+    // --- low_hanging_dedup_key ---
+
     #[test]
     fn low_hanging_dedup_key_basic() {
         assert_eq!(
@@ -616,6 +624,8 @@ mod tests {
     fn low_hanging_dedup_key_empty() {
         assert_eq!(low_hanging_dedup_key("", ""), ":");
     }
+
+    // --- credential_secretsdump_dedup_key ---
 
     #[test]
     fn credential_secretsdump_dedup_key_basic() {
@@ -638,6 +648,8 @@ mod tests {
     fn credential_secretsdump_dedup_key_empty() {
         assert_eq!(credential_secretsdump_dedup_key("", "", ""), "::");
     }
+
+    // --- resolve_host_domain_from_fqdn ---
 
     #[test]
     fn resolve_host_domain_from_fqdn_typical() {
@@ -672,6 +684,8 @@ mod tests {
     fn resolve_host_domain_from_fqdn_empty() {
         assert_eq!(resolve_host_domain_from_fqdn(""), "");
     }
+
+    // --- is_host_domain_related ---
 
     #[test]
     fn is_host_domain_related_same_domain() {

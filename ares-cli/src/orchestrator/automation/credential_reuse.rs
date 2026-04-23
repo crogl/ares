@@ -19,6 +19,13 @@ use crate::orchestrator::dispatcher::Dispatcher;
 const DEDUP_CROSS_REUSE: &str = "cross_reuse";
 
 /// Check if a username is a high-value reuse candidate.
+///
+/// Machine accounts (`HOST$`) are NEVER reuse candidates — their NT hash is
+/// derived from the computer's randomly-generated 240-byte password and is
+/// bound to that computer object in its source NTDS. The hash will not
+/// authenticate as another machine, in another domain, or in any trusted
+/// forest. Dispatching `secretsdump` with a foreign machine hash always
+/// returns STATUS_LOGON_FAILURE and just burns dispatcher budget.
 fn is_reuse_candidate(username: &str) -> bool {
     if username.ends_with('$') {
         return false;

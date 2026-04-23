@@ -769,6 +769,10 @@ fn new_custom_time_window() {
     assert_eq!(correlator.time_window.num_minutes(), 60);
 }
 
+// -----------------------------------------------------------------------
+// recommend_detection — exhaustive per-technique checks
+// -----------------------------------------------------------------------
+
 #[test]
 fn recommend_detection_t1046_mentions_scanning() {
     let activity = make_red_activity("T1046", "192.168.58.10", utc(12, 0));
@@ -817,6 +821,10 @@ fn recommend_detection_unknown_technique_returns_none() {
     assert!(RedBlueCorrelator::recommend_detection(&activity).is_none());
 }
 
+// -----------------------------------------------------------------------
+// determine_gap_reason — additional edge cases
+// -----------------------------------------------------------------------
+
 #[test]
 fn determine_gap_reason_empty_detections_list() {
     let activity = make_red_activity("T1046", "192.168.58.10", utc(12, 0));
@@ -837,6 +845,10 @@ fn determine_gap_reason_technique_matches_via_parent() {
     let reason = RedBlueCorrelator::determine_gap_reason(&activity, &detections);
     assert!(reason.contains("Alert exists but did not trigger"));
 }
+
+// -----------------------------------------------------------------------
+// correlate — additional edge cases
+// -----------------------------------------------------------------------
 
 #[test]
 fn correlate_false_positive_rate_zero_when_no_detections_in_window() {

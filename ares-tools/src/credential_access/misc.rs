@@ -573,6 +573,8 @@ mod tests {
     use crate::credentials;
     use serde_json::json;
 
+    // --- lsassy hash formatting ---
+
     #[test]
     fn lsassy_hash_without_colon_gets_prefix() {
         let hash = "aabbccdd";
@@ -622,6 +624,8 @@ mod tests {
         let args = json!({"target": "192.168.58.1", "username": "admin"});
         assert!(optional_str(&args, "method").is_none());
     }
+
+    // --- ldap_search_descriptions ---
 
     #[test]
     fn base_dn_computation_from_domain() {
@@ -689,6 +693,8 @@ mod tests {
         assert!(required_str(&args, "domain").is_ok());
     }
 
+    // --- netexec_creds helper ---
+
     #[test]
     fn netexec_creds_for_domain_admin_checker() {
         let cred_args =
@@ -719,6 +725,8 @@ mod tests {
         assert!(required_str(&args, "targets").is_err());
     }
 
+    // --- gpp_password_finder ---
+
     #[test]
     fn gpp_password_finder_all_required() {
         let args = json!({
@@ -732,6 +740,8 @@ mod tests {
         assert!(required_str(&args, "password").is_ok());
         assert!(required_str(&args, "domain").is_ok());
     }
+
+    // --- DEFAULT_SPRAY_USERNAMES ---
 
     #[test]
     fn default_spray_usernames_is_non_empty() {
@@ -748,6 +758,8 @@ mod tests {
         assert!(super::DEFAULT_SPRAY_USERNAMES.contains("sql_svc"));
         assert!(super::DEFAULT_SPRAY_USERNAMES.contains("svc_backup"));
     }
+
+    // --- password_spray ---
 
     #[test]
     fn password_spray_delay_seconds_parsing() {
@@ -788,6 +800,8 @@ mod tests {
         assert!(required_str(&args, "domain").is_err());
     }
 
+    // --- ntds_dit_extract ---
+
     #[test]
     fn ntds_dit_extract_auth_with_password() {
         let (auth_string, extra_args) = credentials::impacket_auth(
@@ -813,6 +827,8 @@ mod tests {
         assert_eq!(auth_string, "contoso.local/admin@192.168.58.1");
         assert_eq!(extra_args, vec!["-hashes", ":aabbccdd"]);
     }
+
+    // --- smbclient_spider ---
 
     #[test]
     fn smbclient_spider_optional_pattern() {
@@ -855,6 +871,8 @@ mod tests {
         );
     }
 
+    // --- check_credman_entries / check_autologon_registry ---
+
     #[test]
     fn credman_requires_all_fields() {
         let args = json!({
@@ -881,6 +899,8 @@ mod tests {
         assert_eq!(cred_args[5], "contoso.local");
     }
 
+    // --- username_as_password ---
+
     #[test]
     fn username_as_password_requires_target() {
         let args = json!({"domain": "contoso.local"});
@@ -902,6 +922,8 @@ mod tests {
         });
         assert_eq!(optional_str(&args, "users_file"), Some("/tmp/myusers.txt"));
     }
+
+    // --- mock executor tests ---
 
     use crate::executor::mock;
 

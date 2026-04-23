@@ -686,6 +686,8 @@ mod tests {
         assert_eq!(val, "/tmp/admin.ccache");
     }
 
+    // --- mock executor tests ---
+
     use super::*;
     use crate::executor::mock;
 

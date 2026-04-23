@@ -119,6 +119,8 @@ pub(crate) async fn create_hash_timeline_event(
 mod tests {
     use super::*;
 
+    // --- credential_techniques ---
+
     #[test]
     fn credential_techniques_admin() {
         let t = credential_techniques("nxc-smb", true);
@@ -169,6 +171,8 @@ mod tests {
         let t = credential_techniques("KERBEROAST", false);
         assert!(t.contains(&"T1558.003".to_string()));
     }
+
+    // --- hash_techniques ---
 
     #[test]
     fn hash_techniques_base() {
@@ -235,6 +239,8 @@ mod tests {
         let t = hash_techniques("aabbccdd", "ntlm", "manual");
         assert!(!t.contains(&"T1003.006".to_string()));
     }
+
+    // --- is_critical_hash ---
 
     #[test]
     fn critical_hash_krbtgt() {

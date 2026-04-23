@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use redis::aio::ConnectionLike;
 use redis::{Cmd, ErrorKind, Pipeline, RedisError, RedisResult, Value};
 
+// ---------------------------------------------------------------------------
+// Storage types
+// ---------------------------------------------------------------------------
+
 enum Stored {
     Str(Vec<u8>),
     Hash(HashMap<Vec<u8>, Vec<u8>>),
@@ -20,6 +24,10 @@ enum Stored {
 }
 
 type Data = HashMap<String, Stored>;
+
+// ---------------------------------------------------------------------------
+// MockRedisConnection
+// ---------------------------------------------------------------------------
 
 /// Minimal in-memory Redis mock that supports the command subset used by
 /// `ares-core::state` and `ares-cli::orchestrator::task_queue`.
@@ -96,6 +104,10 @@ impl MockRedisConnection {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ConnectionLike impl
+// ---------------------------------------------------------------------------
+
 impl ConnectionLike for MockRedisConnection {
     fn req_packed_command<'a>(&'a mut self, cmd: &'a Cmd) -> redis::RedisFuture<'a, Value> {
         let mut data = self.data.lock().unwrap();
@@ -125,6 +137,10 @@ impl ConnectionLike for MockRedisConnection {
         0
     }
 }
+
+// ---------------------------------------------------------------------------
+// Command implementations (free functions operating on Data)
+// ---------------------------------------------------------------------------
 
 fn key(args: &[Vec<u8>], idx: usize) -> String {
     String::from_utf8_lossy(args.get(idx).map(|v| v.as_slice()).unwrap_or_default()).into_owned()
@@ -522,6 +538,10 @@ fn cmd_scan(data: &Data, args: &[Vec<u8>]) -> RedisResult<Value> {
         Value::Array(keys),
     ]))
 }
+
+// ---------------------------------------------------------------------------
+// Minimal glob matching (supports only `*` wildcard segments)
+// ---------------------------------------------------------------------------
 
 fn glob_match(pattern: &str, input: &str) -> bool {
     let parts: Vec<&str> = pattern.split('*').collect();

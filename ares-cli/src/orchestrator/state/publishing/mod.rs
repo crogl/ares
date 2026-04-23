@@ -137,6 +137,8 @@ mod tests {
         }
     }
 
+    // --- sanitize_credential ---
+
     #[test]
     fn valid_credential_passes_through() {
         let cred = make_cred("alice", "P@ssw0rd!", "contoso.local");
@@ -268,6 +270,8 @@ mod tests {
         let cred = make_cred("alice", "ab", "contoso.local");
         assert!(sanitize_credential(cred, &HashMap::new()).is_none());
     }
+
+    // --- is_aws_hostname ---
 
     #[test]
     fn aws_hostname_detected() {

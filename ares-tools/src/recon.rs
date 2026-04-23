@@ -595,6 +595,8 @@ mod tests {
         assert_eq!(domain_to_base_dn("local"), "DC=local");
     }
 
+    // --- mock executor tests: exercise full CommandBuilder code paths ---
+
     use crate::executor::mock;
     use serde_json::json;
 

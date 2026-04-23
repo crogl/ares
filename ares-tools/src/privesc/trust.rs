@@ -126,6 +126,8 @@ mod tests {
     use crate::args::{optional_str, required_str};
     use serde_json::json;
 
+    // --- extract_trust_key ---
+
     #[test]
     fn extract_trust_key_missing_trusted_domain() {
         let args = json!({
@@ -161,6 +163,8 @@ mod tests {
         let just_dc_user = format!("{trusted_domain}$");
         assert_eq!(just_dc_user, "child.contoso.local$");
     }
+
+    // --- create_inter_realm_ticket ---
 
     #[test]
     fn create_inter_realm_ticket_missing_trust_key() {
@@ -238,6 +242,8 @@ mod tests {
         let username = optional_str(&args, "username").unwrap_or("Administrator");
         assert_eq!(username, "fakeuser");
     }
+
+    // --- get_sid ---
 
     #[test]
     fn get_sid_missing_domain() {
@@ -323,6 +329,8 @@ mod tests {
         assert_eq!(hash, Some("31d6cfe0d16ae931b73c59d7e0c089c0"));
     }
 
+    // --- dnstool ---
+
     #[test]
     fn dnstool_missing_record_name() {
         let args = json!({
@@ -391,6 +399,8 @@ mod tests {
         let user_spec = format!("{domain}\\{username}");
         assert_eq!(user_spec, "contoso.local\\admin");
     }
+
+    // --- mock executor tests ---
 
     use super::*;
     use crate::executor::mock;

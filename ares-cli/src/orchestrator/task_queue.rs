@@ -81,6 +81,10 @@ pub struct HeartbeatData {
     pub pod_name: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// TaskQueueCore — thin async wrapper around a redis connection.
+// ---------------------------------------------------------------------------
+
 /// Async Redis task queue implementing the Ares queue protocol.
 ///
 /// Generic over connection type to support both production (`ConnectionManager`)

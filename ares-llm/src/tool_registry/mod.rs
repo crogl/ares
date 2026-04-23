@@ -560,6 +560,10 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Blue team tool registry tests
+    // -----------------------------------------------------------------------
+
     #[cfg(feature = "blue")]
     mod blue_tests {
         use crate::tool_registry::blue::{

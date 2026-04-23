@@ -11,6 +11,10 @@ use super::lateral::{
 use super::names::{get_technique_name, pyramid_level_name};
 use ares_core::models::{Credential, Host, Share, SharedRedTeamState};
 
+// ---------------------------------------------------------------------------
+// names
+// ---------------------------------------------------------------------------
+
 #[test]
 fn get_technique_name_known() {
     assert_eq!(get_technique_name("T1046"), "Network Service Discovery");
@@ -45,6 +49,10 @@ fn pyramid_level_name_unknown() {
     assert_eq!(pyramid_level_name(7), "Unknown");
     assert_eq!(pyramid_level_name(255), "Unknown");
 }
+
+// ---------------------------------------------------------------------------
+// builders (router)
+// ---------------------------------------------------------------------------
 
 #[test]
 fn build_technique_detections_known_techniques() {
@@ -198,6 +206,10 @@ fn build_technique_detections_all_kerberos_techniques() {
         assert!(!detections[id.as_str()].detection_queries.is_empty());
     }
 }
+
+// ---------------------------------------------------------------------------
+// lateral.rs — direct builder tests
+// ---------------------------------------------------------------------------
 
 #[test]
 fn build_t1021_empty_state() {
@@ -397,6 +409,10 @@ fn build_t1046_populated_hosts() {
     let det = build_t1046(&state, &start, &end);
     assert_eq!(det.targets, vec!["192.168.58.5".to_string()]);
 }
+
+// ---------------------------------------------------------------------------
+// credential.rs — direct builder tests
+// ---------------------------------------------------------------------------
 
 #[test]
 fn build_t1003_empty_state() {
@@ -600,6 +616,10 @@ fn build_t1110_properties() {
     assert!(!det.detection_queries[0].expected_evidence.is_empty());
 }
 
+// ---------------------------------------------------------------------------
+// kerberos.rs — direct builder tests
+// ---------------------------------------------------------------------------
+
 #[test]
 fn build_t1558_properties() {
     let start = Utc::now() - chrono::Duration::hours(1);
@@ -636,6 +656,10 @@ fn build_t1558_001_properties() {
         .iter()
         .any(|e| e.to_lowercase().contains("krbtgt")));
 }
+
+// ---------------------------------------------------------------------------
+// time window plumbing
+// ---------------------------------------------------------------------------
 
 #[test]
 fn detection_query_time_window_is_set() {

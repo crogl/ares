@@ -157,6 +157,8 @@ mod tests {
     use crate::credentials;
     use serde_json::json;
 
+    // --- mssql_from_args required fields ---
+
     #[test]
     fn mssql_requires_target() {
         let args = json!({"username": "sa"});
@@ -187,6 +189,8 @@ mod tests {
         assert!(windows_auth);
     }
 
+    // --- mssql_base auth string via impacket_target ---
+
     #[test]
     fn mssql_auth_string_with_domain_and_password() {
         let auth_str =
@@ -206,11 +210,15 @@ mod tests {
         assert_eq!(auth_str, "CONTOSO/sa@192.168.58.1");
     }
 
+    // --- mssql_command ---
+
     #[test]
     fn mssql_command_requires_command() {
         let args = json!({"target": "192.168.58.1", "username": "sa"});
         assert!(required_str(&args, "command").is_err());
     }
+
+    // --- mssql_enable_xp_cmdshell ---
 
     #[test]
     fn enable_xp_cmdshell_impersonate_query_format() {
@@ -240,6 +248,8 @@ mod tests {
         assert!(!query.starts_with("EXECUTE AS LOGIN"));
     }
 
+    // --- mssql_impersonate ---
+
     #[test]
     fn impersonate_query_format() {
         let impersonate_user = "sa";
@@ -267,6 +277,8 @@ mod tests {
         });
         assert!(required_str(&args, "query").is_err());
     }
+
+    // --- mssql_exec_linked ---
 
     #[test]
     fn linked_server_query_format() {
@@ -296,6 +308,8 @@ mod tests {
         assert!(required_str(&args, "query").is_err());
     }
 
+    // --- mssql_linked_enable_xpcmdshell ---
+
     #[test]
     fn linked_enable_xpcmdshell_format() {
         let linked_server = "SQL02";
@@ -306,6 +320,8 @@ mod tests {
         assert!(full_query.contains("AT [SQL02]"));
         assert!(full_query.contains("xp_cmdshell"));
     }
+
+    // --- mssql_linked_xpcmdshell ---
 
     #[test]
     fn linked_xpcmdshell_format() {
@@ -325,6 +341,8 @@ mod tests {
         assert!(required_str(&args, "command").is_err());
     }
 
+    // --- mssql_ntlm_coerce ---
+
     #[test]
     fn ntlm_coerce_xp_dirtree_format() {
         let listener_ip = "192.168.58.5";
@@ -343,6 +361,8 @@ mod tests {
         });
         assert!(required_str(&args, "listener_ip").is_err());
     }
+
+    // --- mock executor tests ---
 
     use crate::executor::mock;
 
