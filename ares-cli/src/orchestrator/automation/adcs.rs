@@ -35,21 +35,14 @@ pub async fn auto_adcs_enumeration(
             break;
         }
 
-        // Find CertEnroll shares on unprocessed hosts + get a credential
+        // Find CertEnroll shares on unprocessed hosts + get a per-domain credential
         let work: Vec<(String, String, ares_core::models::Credential)> = {
             let state = dispatcher.state.read().await;
-            let cred = match state
-                .credentials
-                .iter()
-                .find(|c| {
-                    !state.is_delegation_account(&c.username)
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
-                })
-                .or_else(|| state.credentials.first())
-            {
-                Some(c) => c.clone(),
-                None => continue,
-            };
+
+            if state.credentials.is_empty() {
+                continue;
+            }
+
             state
                 .shares
                 .iter()
@@ -87,7 +80,31 @@ pub async fn auto_adcs_enumeration(
                             }
                         })
                         .or_else(|| state.domains.first().cloned())?;
-                    Some((s.host.clone(), domain, cred.clone()))
+
+                    // Select credential matching the ADCS host's domain.
+                    // This is critical for cross-domain ADCS (e.g., essos DC03
+                    // requires essos creds to enumerate templates properly).
+                    let cred = state
+                        .credentials
+                        .iter()
+                        .find(|c| {
+                            !c.password.is_empty()
+                                && c.domain.to_lowercase() == domain.to_lowercase()
+                                && !state.is_delegation_account(&c.username)
+                                && !state.is_credential_quarantined(&c.username, &c.domain)
+                        })
+                        .or_else(|| {
+                            // Fall back to any non-delegation, non-quarantined credential
+                            state.credentials.iter().find(|c| {
+                                !c.password.is_empty()
+                                    && !state.is_delegation_account(&c.username)
+                                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                            })
+                        })
+                        .or_else(|| state.credentials.first())
+                        .cloned()?;
+
+                    Some((s.host.clone(), domain, cred))
                 })
                 .collect()
         };

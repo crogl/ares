@@ -211,4 +211,90 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_DACL_ABUSE, "dacl_abuse");
     }
+
+    #[test]
+    fn acl_vuln_type_matching() {
+        let positives = [
+            "ForceChangePassword",
+            "GenericWrite",
+            "WriteDacl",
+            "WriteOwner",
+            "GenericAll",
+            "self_membership",
+            "write_membership",
+            "SomePrefix_forcechangepassword_suffix",
+        ];
+        for t in &positives {
+            let vtype = t.to_lowercase();
+            let is_acl_vuln = vtype.contains("forcechangepassword")
+                || vtype.contains("genericwrite")
+                || vtype.contains("writedacl")
+                || vtype.contains("writeowner")
+                || vtype.contains("genericall")
+                || vtype.contains("self_membership")
+                || vtype.contains("write_membership");
+            assert!(is_acl_vuln, "{t} should match as ACL vuln");
+        }
+    }
+
+    #[test]
+    fn non_acl_vuln_types_rejected() {
+        let negatives = [
+            "smb_signing_disabled",
+            "mssql_access",
+            "zerologon",
+            "esc1",
+            "kerberoast",
+        ];
+        for t in &negatives {
+            let vtype = t.to_lowercase();
+            let is_acl_vuln = vtype.contains("forcechangepassword")
+                || vtype.contains("genericwrite")
+                || vtype.contains("writedacl")
+                || vtype.contains("writeowner")
+                || vtype.contains("genericall")
+                || vtype.contains("self_membership")
+                || vtype.contains("write_membership");
+            assert!(!is_acl_vuln, "{t} should NOT match as ACL vuln");
+        }
+    }
+
+    #[test]
+    fn source_user_extraction_keys() {
+        // Verify the fallback chain for source user extraction
+        let details = serde_json::json!({
+            "source": "admin",
+            "source_user": "admin2",
+            "from": "admin3",
+        });
+        let source = details
+            .get("source")
+            .or_else(|| details.get("source_user"))
+            .or_else(|| details.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source, "admin");
+
+        // Fallback to source_user
+        let details2 = serde_json::json!({
+            "source_user": "admin2",
+        });
+        let source2 = details2
+            .get("source")
+            .or_else(|| details2.get("source_user"))
+            .or_else(|| details2.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source2, "admin2");
+
+        // No source returns empty
+        let details3 = serde_json::json!({});
+        let source3 = details3
+            .get("source")
+            .or_else(|| details3.get("source_user"))
+            .or_else(|| details3.get("from"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert_eq!(source3, "");
+    }
 }

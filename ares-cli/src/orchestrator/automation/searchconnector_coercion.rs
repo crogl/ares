@@ -167,4 +167,31 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_SEARCHCONNECTOR, "searchconnector");
     }
+
+    #[test]
+    fn writable_share_detection() {
+        let write_perms = ["WRITE", "READ/WRITE", "rw WRITE access"];
+        for p in &write_perms {
+            assert!(
+                p.to_uppercase().contains("WRITE"),
+                "{p} should be detected as writable"
+            );
+        }
+    }
+
+    #[test]
+    fn readonly_share_rejected() {
+        let perm = "READ";
+        assert!(!perm.to_uppercase().contains("WRITE"));
+    }
+
+    #[test]
+    fn domain_from_host_hostname() {
+        let hostname = "srv01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
 }

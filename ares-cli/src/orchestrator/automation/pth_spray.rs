@@ -176,4 +176,95 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_PTH_SPRAY, "pth_spray");
     }
+
+    #[test]
+    fn ntlm_hash_filter_valid() {
+        let hash_type = "NTLM";
+        let hash_value = "aad3b435b51404eeaad3b435b51404ee";
+        assert!(hash_type.to_lowercase().contains("ntlm"));
+        assert!(!hash_value.is_empty());
+        assert_eq!(hash_value.len(), 32);
+    }
+
+    #[test]
+    fn ntlm_hash_filter_rejects_short() {
+        let hash_value = "abc123";
+        assert_ne!(hash_value.len(), 32);
+    }
+
+    #[test]
+    fn ntlm_hash_filter_rejects_empty() {
+        let hash_value = "";
+        assert!(hash_value.is_empty());
+    }
+
+    #[test]
+    fn ntlm_hash_filter_rejects_non_ntlm() {
+        let hash_type = "aes256-cts-hmac-sha1-96";
+        assert!(!hash_type.to_lowercase().contains("ntlm"));
+    }
+
+    #[test]
+    fn smb_service_detection() {
+        let services = ["445/tcp microsoft-ds".to_string()];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(has_smb);
+    }
+
+    #[test]
+    fn no_smb_service() {
+        let services = ["80/tcp http".to_string()];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(!has_smb);
+    }
+
+    #[test]
+    fn domain_from_hash_preferred() {
+        let hash_domain = "contoso.local";
+        let hostname = "srv01.fabrikam.local";
+        let domain = if !hash_domain.is_empty() {
+            hash_domain.to_string()
+        } else {
+            hostname
+                .find('.')
+                .map(|i| hostname[i + 1..].to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(domain, "contoso.local");
+    }
+
+    #[test]
+    fn domain_fallback_to_hostname() {
+        let hash_domain = "";
+        let hostname = "srv01.fabrikam.local";
+        let domain = if !hash_domain.is_empty() {
+            hash_domain.to_string()
+        } else {
+            hostname
+                .find('.')
+                .map(|i| hostname[i + 1..].to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn dedup_key_uses_hash_prefix() {
+        let ip = "192.168.58.10";
+        let username = "Admin";
+        let hash_value = "aad3b435b51404eeaad3b435b51404ee";
+        let dedup_key = format!(
+            "pth:{}:{}:{}",
+            ip,
+            username.to_lowercase(),
+            &hash_value[..8]
+        );
+        assert_eq!(dedup_key, "pth:192.168.58.10:admin:aad3b435");
+    }
 }

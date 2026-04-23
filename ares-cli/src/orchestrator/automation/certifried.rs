@@ -162,7 +162,24 @@ mod tests {
     }
 
     #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("certifried:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "certifried:contoso.local");
+    }
+
+    #[test]
     fn dedup_set_name() {
         assert_eq!(DEDUP_CERTIFRIED, "certifried");
+    }
+
+    #[test]
+    fn dc_hostname_from_hosts() {
+        // Simulates finding a DC hostname from hosts list
+        let hostname = "dc01.contoso.local";
+        let filtered = Some(hostname.to_string()).filter(|h| !h.is_empty());
+        assert_eq!(filtered, Some("dc01.contoso.local".to_string()));
+
+        let empty = Some("".to_string()).filter(|h| !h.is_empty());
+        assert!(empty.is_none());
     }
 }

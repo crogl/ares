@@ -13,6 +13,7 @@
 //! all threading hacks since tokio tasks are truly concurrent.
 
 mod acl;
+mod acl_discovery;
 mod adcs;
 mod adcs_exploitation;
 mod bloodhound;
@@ -23,6 +24,7 @@ mod crack;
 mod credential_access;
 mod credential_expansion;
 mod credential_reuse;
+mod cross_forest_enum;
 mod dacl_abuse;
 mod delegation;
 mod dfs_coercion;
@@ -73,6 +75,7 @@ mod zerologon;
 
 // Re-export all public task functions at the same paths they had before the split.
 pub use acl::auto_acl_chain_follow;
+pub use acl_discovery::auto_acl_discovery;
 pub use adcs::auto_adcs_enumeration;
 pub use adcs_exploitation::auto_adcs_exploitation;
 pub use bloodhound::auto_bloodhound;
@@ -83,6 +86,7 @@ pub use crack::auto_crack_dispatch;
 pub use credential_access::auto_credential_access;
 pub use credential_expansion::auto_credential_expansion;
 pub use credential_reuse::auto_credential_reuse;
+pub use cross_forest_enum::auto_cross_forest_enum;
 pub use dacl_abuse::auto_dacl_abuse;
 pub use delegation::auto_delegation_enumeration;
 pub use dfs_coercion::auto_dfs_coercion;

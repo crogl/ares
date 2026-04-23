@@ -176,4 +176,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn non_admin_shares_pass() {
+        let user_shares = ["Users", "Public", "Data", "shared"];
+        for name in &user_shares {
+            let name_upper = name.to_uppercase();
+            assert!(
+                !matches!(
+                    name_upper.as_str(),
+                    "C$" | "ADMIN$" | "IPC$" | "PRINT$" | "SYSVOL" | "NETLOGON"
+                ),
+                "{name} should pass through"
+            );
+        }
+    }
+
+    #[test]
+    fn writable_permission_matching() {
+        let writable = ["WRITE", "READ/WRITE", "rw WRITE access"];
+        for p in &writable {
+            let perms = p.to_uppercase();
+            let is_writable = perms == "WRITE" || perms == "READ/WRITE" || perms.contains("WRITE");
+            assert!(is_writable, "{p} should be writable");
+        }
+    }
+
+    #[test]
+    fn readonly_permission_rejected() {
+        let readonly = ["READ", "NONE", "DENIED"];
+        for p in &readonly {
+            let perms = p.to_uppercase();
+            let is_writable = perms == "WRITE" || perms == "READ/WRITE" || perms.contains("WRITE");
+            assert!(!is_writable, "{p} should NOT be writable");
+        }
+    }
 }

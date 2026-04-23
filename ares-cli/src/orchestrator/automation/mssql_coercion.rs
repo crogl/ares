@@ -170,4 +170,31 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_MSSQL_COERCION, "mssql_coercion");
     }
+
+    #[test]
+    fn mssql_access_vuln_type_matching() {
+        assert_eq!("mssql_access".to_lowercase(), "mssql_access");
+        assert_ne!("smb_signing_disabled".to_lowercase(), "mssql_access");
+    }
+
+    #[test]
+    fn target_ip_from_vuln_details() {
+        let details = serde_json::json!({"target_ip": "192.168.58.22"});
+        let target = details
+            .get("target_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or("fallback");
+        assert_eq!(target, "192.168.58.22");
+    }
+
+    #[test]
+    fn target_ip_fallback_to_vuln_target() {
+        let details = serde_json::json!({});
+        let fallback = "192.168.58.10";
+        let target = details
+            .get("target_ip")
+            .and_then(|v| v.as_str())
+            .unwrap_or(fallback);
+        assert_eq!(target, "192.168.58.10");
+    }
 }

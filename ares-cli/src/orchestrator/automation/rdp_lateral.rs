@@ -201,4 +201,24 @@ mod tests {
         });
         assert!(!has_rdp);
     }
+
+    #[test]
+    fn domain_from_hostname() {
+        let hostname = "srv01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
+
+    #[test]
+    fn domain_from_bare_hostname() {
+        let hostname = "srv01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
 }

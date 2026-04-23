@@ -170,11 +170,88 @@ mod tests {
     }
 
     #[test]
-    fn cert_vuln_types() {
-        let types = ["certificate_obtained", "adcs_certificate"];
+    fn cert_vuln_types_accepted() {
+        let types = [
+            "certificate_obtained",
+            "adcs_certificate",
+            "CERTIFICATE_OBTAINED",
+        ];
         for t in &types {
             let lower = t.to_lowercase();
-            assert!(lower == "certificate_obtained" || lower == "adcs_certificate");
+            assert!(
+                lower == "certificate_obtained" || lower == "adcs_certificate",
+                "{t} should match"
+            );
         }
+    }
+
+    #[test]
+    fn non_cert_vuln_types_rejected() {
+        let non_cert = ["esc1", "smb_signing_disabled", "mssql_access"];
+        for t in &non_cert {
+            let lower = t.to_lowercase();
+            assert!(lower != "certificate_obtained" && lower != "adcs_certificate");
+        }
+    }
+
+    #[test]
+    fn pfx_path_fallback_chain() {
+        // Primary key
+        let details = serde_json::json!({"pfx_path": "/tmp/cert.pfx"});
+        let path = details
+            .get("pfx_path")
+            .or_else(|| details.get("certificate_path"))
+            .or_else(|| details.get("cert_file"))
+            .and_then(|v| v.as_str());
+        assert_eq!(path, Some("/tmp/cert.pfx"));
+
+        // Fallback to certificate_path
+        let details2 = serde_json::json!({"certificate_path": "/tmp/alt.pfx"});
+        let path2 = details2
+            .get("pfx_path")
+            .or_else(|| details2.get("certificate_path"))
+            .or_else(|| details2.get("cert_file"))
+            .and_then(|v| v.as_str());
+        assert_eq!(path2, Some("/tmp/alt.pfx"));
+
+        // Fallback to cert_file
+        let details3 = serde_json::json!({"cert_file": "/tmp/other.pfx"});
+        let path3 = details3
+            .get("pfx_path")
+            .or_else(|| details3.get("certificate_path"))
+            .or_else(|| details3.get("cert_file"))
+            .and_then(|v| v.as_str());
+        assert_eq!(path3, Some("/tmp/other.pfx"));
+
+        // No key returns None
+        let details4 = serde_json::json!({});
+        let path4 = details4
+            .get("pfx_path")
+            .or_else(|| details4.get("certificate_path"))
+            .or_else(|| details4.get("cert_file"))
+            .and_then(|v| v.as_str());
+        assert!(path4.is_none());
+    }
+
+    #[test]
+    fn target_user_fallback() {
+        let details = serde_json::json!({"target_user": "admin"});
+        let user = details
+            .get("target_user")
+            .or_else(|| details.get("upn"))
+            .or_else(|| details.get("account_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("administrator");
+        assert_eq!(user, "admin");
+
+        // Falls back to "administrator" when no key present
+        let details2 = serde_json::json!({});
+        let user2 = details2
+            .get("target_user")
+            .or_else(|| details2.get("upn"))
+            .or_else(|| details2.get("account_name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("administrator");
+        assert_eq!(user2, "administrator");
     }
 }

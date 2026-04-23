@@ -218,4 +218,76 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_WEBDAV_DETECTION, "webdav_detection");
     }
+
+    #[test]
+    fn webdav_service_detection_webdav() {
+        let services = ["80/tcp webdav".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(has_webdav);
+    }
+
+    #[test]
+    fn webdav_service_detection_iis() {
+        let services = ["80/tcp iis httpd".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(has_webdav);
+    }
+
+    #[test]
+    fn webdav_service_detection_http() {
+        let services = ["80/tcp http".to_string()];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(has_webdav);
+    }
+
+    #[test]
+    fn no_webdav_service() {
+        let services = [
+            "445/tcp microsoft-ds".to_string(),
+            "3389/tcp ms-wbt-server".to_string(),
+        ];
+        let has_webdav = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("webdav")
+                || sl.contains("webclient")
+                || sl.contains("iis")
+                || (sl.contains("80/") && sl.contains("http"))
+        });
+        assert!(!has_webdav);
+    }
+
+    #[test]
+    fn vuln_id_format() {
+        let ip = "192.168.58.22";
+        let vuln_id = format!("webdav_enabled_{}", ip.replace('.', "_"));
+        assert_eq!(vuln_id, "webdav_enabled_192_168_58_22");
+    }
+
+    #[test]
+    fn domain_from_hostname() {
+        let hostname = "web01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
 }

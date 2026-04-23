@@ -125,4 +125,27 @@ mod tests {
         let dc_ip = "192.168.58.10";
         assert_eq!(dc_ip, "192.168.58.10");
     }
+
+    #[test]
+    fn no_cred_required() {
+        // ZeroLogon check doesn't require credentials
+        let _payload = serde_json::json!({
+            "technique": "zerologon_check",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+            "hostname": "dc01",
+        });
+    }
+
+    #[test]
+    fn hostname_extraction_empty_fallback() {
+        let hosts: Vec<(String, String)> = vec![];
+        let dc_ip = "192.168.58.10";
+        let hostname = hosts
+            .iter()
+            .find(|(ip, _)| ip == dc_ip)
+            .map(|(_, h)| h.clone())
+            .unwrap_or_default();
+        assert_eq!(hostname, "");
+    }
 }

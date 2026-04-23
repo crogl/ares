@@ -163,4 +163,51 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_SMBCLIENT_ENUM, "smbclient_enum");
     }
+
+    #[test]
+    fn smb_service_detection() {
+        let services = [
+            "445/tcp microsoft-ds".to_string(),
+            "80/tcp http".to_string(),
+        ];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(has_smb);
+    }
+
+    #[test]
+    fn smb_service_detection_by_name() {
+        let services = ["microsoft-ds smb".to_string()];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(has_smb);
+    }
+
+    #[test]
+    fn no_smb_service() {
+        let services = [
+            "3389/tcp ms-wbt-server".to_string(),
+            "80/tcp http".to_string(),
+        ];
+        let has_smb = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("445") || sl.contains("smb") || sl.contains("cifs")
+        });
+        assert!(!has_smb);
+    }
+
+    #[test]
+    fn domain_from_hostname_preserves_case() {
+        // smbclient_enum uses to_string() not to_lowercase() for domain
+        let hostname = "srv01.CONTOSO.LOCAL";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_string())
+            .unwrap_or_default();
+        assert_eq!(domain, "CONTOSO.LOCAL");
+    }
 }

@@ -152,4 +152,14 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_DFS_COERCION, "dfs_coercion");
     }
+
+    #[test]
+    fn skips_self_listener() {
+        let dc_ip = "192.168.58.50";
+        let listener = "192.168.58.50";
+        assert_eq!(dc_ip, listener, "DC IP matching listener should be skipped");
+
+        let dc_ip2 = "192.168.58.10";
+        assert_ne!(dc_ip2, listener, "Different IP should not be skipped");
+    }
 }

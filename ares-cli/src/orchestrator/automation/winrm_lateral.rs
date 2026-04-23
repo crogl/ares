@@ -166,4 +166,60 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_WINRM_LATERAL, "winrm_lateral");
     }
+
+    #[test]
+    fn winrm_service_detection() {
+        let services = [
+            "5985/tcp microsoft-httpapi".to_string(),
+            "445/tcp microsoft-ds".to_string(),
+        ];
+        let has_winrm = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+        });
+        assert!(has_winrm);
+    }
+
+    #[test]
+    fn winrm_https_service_detection() {
+        let services = ["5986/tcp ssl/http".to_string()];
+        let has_winrm = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+        });
+        assert!(has_winrm);
+    }
+
+    #[test]
+    fn no_winrm_service() {
+        let services = [
+            "445/tcp microsoft-ds".to_string(),
+            "3389/tcp ms-wbt-server".to_string(),
+        ];
+        let has_winrm = services.iter().any(|s| {
+            let sl = s.to_lowercase();
+            sl.contains("5985") || sl.contains("5986") || sl.contains("winrm")
+        });
+        assert!(!has_winrm);
+    }
+
+    #[test]
+    fn domain_from_hostname() {
+        let hostname = "srv01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
+
+    #[test]
+    fn domain_from_bare_hostname() {
+        let hostname = "srv01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
 }

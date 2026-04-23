@@ -172,4 +172,38 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_KRBRELAYUP, "krbrelayup");
     }
+
+    #[test]
+    fn ldap_signing_vuln_types() {
+        let types = ["ldap_signing_disabled", "ldap_signing_not_required"];
+        for t in &types {
+            let vtype = t.to_lowercase();
+            assert!(
+                vtype == "ldap_signing_disabled" || vtype == "ldap_signing_not_required",
+                "{t} should match LDAP weak signing"
+            );
+        }
+    }
+
+    #[test]
+    fn non_ldap_vuln_types_rejected() {
+        let types = ["smb_signing_disabled", "mssql_access"];
+        for t in &types {
+            let vtype = t.to_lowercase();
+            assert!(
+                vtype != "ldap_signing_disabled" && vtype != "ldap_signing_not_required",
+                "{t} should NOT match LDAP weak signing"
+            );
+        }
+    }
+
+    #[test]
+    fn domain_from_hostname() {
+        let hostname = "srv01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
 }

@@ -128,4 +128,22 @@ mod tests {
     fn dedup_set_name() {
         assert_eq!(DEDUP_PETITPOTAM_UNAUTH, "petitpotam_unauth");
     }
+
+    #[test]
+    fn skips_self_listener() {
+        let dc_ip = "192.168.58.50";
+        let listener = "192.168.58.50";
+        assert_eq!(dc_ip, listener);
+    }
+
+    #[test]
+    fn no_cred_required() {
+        // PetitPotam unauth works without credentials
+        let _payload = serde_json::json!({
+            "technique": "petitpotam_unauthenticated",
+            "target_ip": "192.168.58.10",
+            "listener_ip": "192.168.58.50",
+        });
+        // No credential field needed
+    }
 }

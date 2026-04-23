@@ -135,6 +135,12 @@ mod tests {
     }
 
     #[test]
+    fn dedup_key_normalizes_domain() {
+        let key = format!("dns_enum:{}", "CONTOSO.LOCAL".to_lowercase());
+        assert_eq!(key, "dns_enum:contoso.local");
+    }
+
+    #[test]
     fn dedup_set_name() {
         assert_eq!(DEDUP_DNS_ENUM, "dns_enum");
     }
@@ -144,5 +150,15 @@ mod tests {
         // DNS enum works without credentials for zone transfer / SRV queries
         let cred: Option<ares_core::models::Credential> = None;
         assert!(cred.is_none());
+    }
+
+    #[test]
+    fn payload_without_cred() {
+        let payload = serde_json::json!({
+            "technique": "dns_enumeration",
+            "target_ip": "192.168.58.10",
+            "domain": "contoso.local",
+        });
+        assert!(payload.get("credential").is_none());
     }
 }

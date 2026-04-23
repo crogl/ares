@@ -169,4 +169,24 @@ mod tests {
         let ip = "192.168.58.22";
         assert_eq!(ip, "192.168.58.22");
     }
+
+    #[test]
+    fn domain_from_hostname() {
+        let hostname = "dc01.contoso.local";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "contoso.local");
+    }
+
+    #[test]
+    fn domain_from_bare_hostname() {
+        let hostname = "dc01";
+        let domain = hostname
+            .find('.')
+            .map(|i| hostname[i + 1..].to_lowercase())
+            .unwrap_or_default();
+        assert_eq!(domain, "");
+    }
 }

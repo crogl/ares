@@ -268,6 +268,7 @@ impl std::fmt::Display for RelayType {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
 
     #[test]
     fn relay_type_display() {
@@ -297,5 +298,56 @@ mod tests {
     #[test]
     fn dedup_set_name() {
         assert_eq!(DEDUP_SET, "ntlm_relay");
+    }
+
+    #[test]
+    fn find_coercion_source_prefers_unprocessed() {
+        let mut dcs = HashMap::new();
+        dcs.insert("contoso.local".into(), "192.168.58.10".into());
+        dcs.insert("fabrikam.local".into(), "192.168.58.20".into());
+
+        // First DC already processed, second not
+        let result = find_coercion_source(&dcs, |ip| ip == "192.168.58.10");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "192.168.58.20");
+    }
+
+    #[test]
+    fn find_coercion_source_falls_back_to_any() {
+        let mut dcs = HashMap::new();
+        dcs.insert("contoso.local".into(), "192.168.58.10".into());
+
+        // All processed, still returns one
+        let result = find_coercion_source(&dcs, |_| true);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "192.168.58.10");
+    }
+
+    #[test]
+    fn find_coercion_source_empty_map() {
+        let dcs = HashMap::new();
+        let result = find_coercion_source(&dcs, |_| false);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn esc8_vuln_type_matching() {
+        let types = ["esc8", "adcs_web_enrollment", "ESC8", "ADCS_WEB_ENROLLMENT"];
+        for t in &types {
+            let vtype = t.to_lowercase();
+            assert!(
+                vtype == "esc8" || vtype == "adcs_web_enrollment",
+                "{t} should match"
+            );
+        }
+    }
+
+    #[test]
+    fn smb_signing_vuln_type_matching() {
+        let vtype = "smb_signing_disabled".to_lowercase();
+        assert_eq!(vtype, "smb_signing_disabled");
+
+        let not_smb = "mssql_access".to_lowercase();
+        assert_ne!(not_smb, "smb_signing_disabled");
     }
 }

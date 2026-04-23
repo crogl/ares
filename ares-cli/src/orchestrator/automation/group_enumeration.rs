@@ -86,6 +86,22 @@ pub async fn auto_group_enumeration(
                     "password": item.credential.password,
                     "domain": item.credential.domain,
                 },
+                "filters": ["(objectCategory=group)"],
+                "attributes": [
+                    "sAMAccountName", "member", "memberOf", "managedBy",
+                    "groupType", "objectSid", "description", "cn"
+                ],
+                "enumerate_members": true,
+                "resolve_foreign_principals": true,
+                "instructions": concat!(
+                    "Enumerate ALL security groups in this domain via LDAP query ",
+                    "(objectCategory=group). For each group, resolve its members ",
+                    "recursively, including Foreign Security Principals (CN=ForeignSecurityPrincipals). ",
+                    "Report: group name, group type (Global/DomainLocal/Universal), ",
+                    "all members (including nested), managedBy, and any cross-domain memberships. ",
+                    "Use net group /domain or LDAP to enumerate. Also check Domain Local groups ",
+                    "for foreign members from trusted domains."
+                ),
             });
 
             let priority = dispatcher.effective_priority("group_enumeration");

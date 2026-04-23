@@ -80,6 +80,8 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_certifried);
     spawn_auto!(auto_dacl_abuse);
     spawn_auto!(auto_smbclient_enum);
+    spawn_auto!(auto_acl_discovery);
+    spawn_auto!(auto_cross_forest_enum);
 
     info!(count = handles.len(), "Automation tasks spawned");
     handles

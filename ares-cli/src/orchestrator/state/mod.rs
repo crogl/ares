@@ -71,6 +71,8 @@ pub const DEDUP_PTH_SPRAY: &str = "pth_spray";
 pub const DEDUP_CERTIFRIED: &str = "certifried";
 pub const DEDUP_DACL_ABUSE: &str = "dacl_abuse";
 pub const DEDUP_SMBCLIENT_ENUM: &str = "smbclient_enum";
+pub const DEDUP_ACL_DISCOVERY: &str = "acl_discovery";
+pub const DEDUP_CROSS_FOREST_ENUM: &str = "cross_forest_enum";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -134,4 +136,71 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_CERTIFRIED,
     DEDUP_DACL_ABUSE,
     DEDUP_SMBCLIENT_ENUM,
+    DEDUP_ACL_DISCOVERY,
+    DEDUP_CROSS_FOREST_ENUM,
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_dedup_sets_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for name in ALL_DEDUP_SETS {
+            assert!(seen.insert(*name), "Duplicate dedup set name: {name}");
+        }
+    }
+
+    #[test]
+    fn new_dedup_constants_in_all_dedup_sets() {
+        let new_constants = [
+            DEDUP_NTLM_RELAY,
+            DEDUP_NOPAC,
+            DEDUP_ZEROLOGON,
+            DEDUP_PRINTNIGHTMARE,
+            DEDUP_MSSQL_COERCION,
+            DEDUP_PASSWORD_POLICY,
+            DEDUP_GPP_SYSVOL,
+            DEDUP_NTLMV1_DOWNGRADE,
+            DEDUP_LDAP_SIGNING,
+            DEDUP_WEBDAV_DETECTION,
+            DEDUP_SPOOLER_CHECK,
+            DEDUP_MACHINE_ACCOUNT_QUOTA,
+            DEDUP_DFS_COERCION,
+            DEDUP_PETITPOTAM_UNAUTH,
+            DEDUP_WINRM_LATERAL,
+            DEDUP_GROUP_ENUMERATION,
+            DEDUP_LOCALUSER_SPRAY,
+            DEDUP_KRBRELAYUP,
+            DEDUP_SEARCHCONNECTOR,
+            DEDUP_LSASSY_DUMP,
+            DEDUP_RDP_LATERAL,
+            DEDUP_FOREIGN_GROUP_ENUM,
+            DEDUP_CERTIPY_AUTH,
+            DEDUP_SID_ENUMERATION,
+            DEDUP_DNS_ENUM,
+            DEDUP_DOMAIN_USER_ENUM,
+            DEDUP_PTH_SPRAY,
+            DEDUP_CERTIFRIED,
+            DEDUP_DACL_ABUSE,
+            DEDUP_SMBCLIENT_ENUM,
+        ];
+        for c in &new_constants {
+            assert!(
+                ALL_DEDUP_SETS.contains(c),
+                "Dedup constant '{c}' missing from ALL_DEDUP_SETS"
+            );
+        }
+    }
+
+    #[test]
+    fn dedup_set_count() {
+        // Ensure we know how many dedup sets exist (catches accidental omissions)
+        assert!(
+            ALL_DEDUP_SETS.len() >= 45,
+            "Expected at least 45 dedup sets, got {}",
+            ALL_DEDUP_SETS.len()
+        );
+    }
+}
