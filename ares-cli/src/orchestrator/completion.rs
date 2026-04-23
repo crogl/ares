@@ -303,6 +303,43 @@ pub async fn wait_for_completion(
                 }
             }
 
+            // Wait for active red team tasks and deferred queue to drain
+            // before signalling shutdown. Cap at 5 minutes to avoid hanging.
+            let red_deadline = tokio::time::Instant::now() + Duration::from_secs(300);
+            loop {
+                if *shutdown_rx.borrow() {
+                    info!("Completion monitor interrupted by shutdown while waiting for red team drain");
+                    break;
+                }
+
+                if tokio::time::Instant::now() >= red_deadline {
+                    warn!("Red team drain deadline reached (5m) — proceeding with shutdown");
+                    break;
+                }
+
+                let active_tasks = dispatcher.tracker.total().await;
+                let deferred_tasks = dispatcher.deferred.total_count().await;
+
+                if active_tasks == 0 && deferred_tasks == 0 {
+                    info!("All red team tasks drained");
+                    break;
+                }
+
+                info!(
+                    active_tasks,
+                    deferred_tasks, "Waiting for red team tasks to drain before shutdown..."
+                );
+
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            break;
+                        }
+                    }
+                }
+            }
+
             // Signal the main loop to stop via Redis so it breaks out of its
             // select! within the next 5-second poll cycle.
             {

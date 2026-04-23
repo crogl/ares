@@ -94,7 +94,8 @@ pub async fn auto_domain_user_enum(
         };
 
         for item in work {
-            let payload = json!({
+            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            let mut payload = json!({
                 "technique": "ldap_user_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -106,6 +107,9 @@ pub async fn auto_domain_user_enum(
                 "filters": ["(objectCategory=person)(objectClass=user)"],
                 "attributes": ["sAMAccountName", "description", "memberOf", "userAccountControl", "servicePrincipalName"],
             });
+            if cross_domain {
+                payload["bind_domain"] = json!(item.credential.domain);
+            }
 
             let priority = dispatcher.effective_priority("domain_user_enumeration");
             match dispatcher

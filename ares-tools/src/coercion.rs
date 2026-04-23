@@ -183,7 +183,7 @@ pub async fn ntlmrelayx_to_smb(args: &Value) -> Result<ToolOutput> {
 
     CommandBuilder::new("impacket-ntlmrelayx")
         .flag("-t", target_ip)
-        .arg_if(socks, "--socks")
+        .arg_if(socks, "-socks")
         .arg_if(interactive, "-i")
         .timeout_secs(120)
         .execute()

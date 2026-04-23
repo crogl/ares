@@ -145,7 +145,16 @@ async fn poll_discoveries(dispatcher: &Dispatcher) -> Result<()> {
             }
             "user" => {
                 if let Ok(user) = serde_json::from_value::<User>(data.clone()) {
-                    if ["kerberos_enum", "netexec_user_enum"].contains(&user.source.as_str()) {
+                    if [
+                        "kerberos_enum",
+                        "netexec_user_enum",
+                        "ldap_group_enumeration",
+                        "acl_discovery",
+                        "foreign_group_enumeration",
+                        "ldap_enumeration",
+                    ]
+                    .contains(&user.source.as_str())
+                    {
                         let _ = dispatcher.state.publish_user(&dispatcher.queue, user).await;
                     }
                 }

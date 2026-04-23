@@ -194,6 +194,23 @@ impl DeferredQueue {
         Ok(total_evicted)
     }
 
+    /// Total number of deferred tasks across all type ZSETs.
+    pub async fn total_count(&self) -> usize {
+        let pattern = format!("{}:{}:*", DEFERRED_QUEUE_PREFIX, self.config.operation_id);
+        let mut conn = self.queue_conn();
+        let keys: Vec<String> = scan_keys_async(&mut conn, &pattern).await;
+        let mut total = 0_usize;
+        for key in &keys {
+            let count: usize = redis::cmd("ZCARD")
+                .arg(key)
+                .query_async(&mut conn)
+                .await
+                .unwrap_or(0);
+            total += count;
+        }
+        total
+    }
+
     fn queue_conn(&self) -> redis::aio::ConnectionManager {
         // TaskQueue wraps a ConnectionManager which implements Clone cheaply
         // We access it through an internal method.

@@ -269,12 +269,19 @@ pub async fn run_bloodhound(args: &Value) -> Result<ToolOutput> {
 /// Run an LDAP search query against a target.
 ///
 /// Required args: `target`, `domain`
-/// Optional args: `username`, `password`, `base_dn`, `filter`, `attributes`
+/// Optional args: `username`, `password`, `bind_domain`, `base_dn`, `filter`, `attributes`
+///
+/// `domain` controls the base DN (the partition being queried).
+/// `bind_domain` (optional) overrides the domain used in the bind DN
+/// (`user@bind_domain`). Use this when authenticating with a credential
+/// from a different domain than the one being searched — e.g. querying
+/// a parent DC with a child-domain credential. Defaults to `domain`.
 pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let domain = required_str(args, "domain")?;
     let username = optional_str(args, "username");
     let password = optional_str(args, "password");
+    let bind_domain = optional_str(args, "bind_domain");
     let base_dn = optional_str(args, "base_dn");
     let filter = optional_str(args, "filter");
     let attributes = optional_str(args, "attributes");
@@ -292,7 +299,8 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
         .timeout_secs(120);
 
     if let (Some(u), Some(p)) = (username, password) {
-        let bind_dn = format!("{u}@{domain}");
+        let auth_domain = bind_domain.unwrap_or(domain);
+        let bind_dn = format!("{u}@{auth_domain}");
         cmd = cmd.flag("-D", bind_dn).flag("-w", p);
     }
 

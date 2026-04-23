@@ -84,7 +84,8 @@ pub async fn auto_group_enumeration(
         };
 
         for item in work {
-            let payload = json!({
+            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            let mut payload = json!({
                 "technique": "ldap_group_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -111,10 +112,18 @@ pub async fn auto_group_enumeration(
                     "Pay special attention to groups that grant elevated privileges: ",
                     "Domain Admins, Enterprise Admins, Administrators, Backup Operators, ",
                     "Server Operators, Account Operators, DnsAdmins, and any custom groups ",
-                    "with adminCount=1. Report all discovered users as discovered_users with ",
-                    "their group memberships in the memberOf field."
+                    "with adminCount=1.\n\n",
+                    "IMPORTANT: For each user found in any group, include them in the ",
+                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
+                    "\"source\": \"ldap_group_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}\n",
+                    "Also report any cross-domain group memberships as vulnerabilities with ",
+                    "vuln_type='foreign_group_membership'."
                 ),
             });
+            if cross_domain {
+                payload["bind_domain"] = json!(item.credential.domain);
+            }
 
             let priority = dispatcher.effective_priority("group_enumeration");
             match dispatcher

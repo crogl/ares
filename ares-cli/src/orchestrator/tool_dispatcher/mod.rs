@@ -80,6 +80,7 @@ const RECON_ROUTED_TOOLS: &[&str] = &[
     "smbclient_spider",
     "check_credman_entries",
     "check_autologon_registry",
+    "smb_login_check",
     "domain_admin_checker",
     "gmsa_dump_passwords",
 ];
@@ -98,6 +99,7 @@ const AUTH_BEARING_TOOLS: &[&str] = &[
     "smbclient_spider",
     "check_credman_entries",
     "check_autologon_registry",
+    "smb_login_check",
     "domain_admin_checker",
     "gmsa_dump_passwords",
     // impacket tools

@@ -107,7 +107,14 @@ pub(crate) fn parse_discoveries(payload: &Value) -> ParsedDiscoveries {
         }
     }
     // Users -- defense-in-depth: only accept entries with a parser-verified source.
-    const TRUSTED_USER_SOURCES: &[&str] = &["kerberos_enum", "netexec_user_enum"];
+    const TRUSTED_USER_SOURCES: &[&str] = &[
+        "kerberos_enum",
+        "netexec_user_enum",
+        "ldap_group_enumeration",
+        "acl_discovery",
+        "foreign_group_enumeration",
+        "ldap_enumeration",
+    ];
     if let Some(users) = payload.get("discovered_users").and_then(|v| v.as_array()) {
         for user_val in users {
             if let Ok(user) = serde_json::from_value::<User>(user_val.clone()) {

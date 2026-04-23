@@ -130,7 +130,12 @@ pub async fn auto_foreign_group_enum(
                     "(target_domain). These are critical for cross-forest attack paths. ",
                     "5) Register any discovered cross-domain memberships as vulnerabilities with ",
                     "vuln_type='foreign_group_membership', source=foreign_user, target=local_group, ",
-                    "domain=target_domain, source_domain=foreign_domain."
+                    "domain=target_domain, source_domain=foreign_domain.\n\n",
+                    "IMPORTANT: For each user discovered during FSP enumeration, include them in the ",
+                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
+                    "\"source\": \"foreign_group_enumeration\", \"memberOf\": [\"Group1\"]}\n",
+                    "Include ALL users found — both foreign principals and local group members."
                 ),
             });
 

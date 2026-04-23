@@ -124,7 +124,8 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
         };
 
         for item in work {
-            let payload = json!({
+            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            let mut payload = json!({
                 "technique": "ldap_acl_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -150,9 +151,16 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                     "  source_domain: the domain of the source principal\n",
                     "Focus on ACEs where the source is a user we have credentials for. ",
                     "For GenericAll/GenericWrite on Computer objects, also set target_type='Computer' ",
-                    "to enable RBCD exploitation. Check both inbound and outbound ACEs."
+                    "to enable RBCD exploitation. Check both inbound and outbound ACEs.\n\n",
+                    "IMPORTANT: Also include ALL users discovered during DACL enumeration in the ",
+                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
+                    "\"source\": \"acl_discovery\"}"
                 ),
             });
+            if cross_domain {
+                payload["bind_domain"] = json!(item.credential.domain);
+            }
 
             let priority = dispatcher.effective_priority("acl_discovery");
             match dispatcher

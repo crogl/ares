@@ -177,7 +177,7 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["credentials"] = Value::Array(creds);
             }
         }
-        "password_spray" => {
+        "password_spray" | "smb_login_check" => {
             let creds = parse_spray_success(output, params);
             if !creds.is_empty() {
                 discoveries["credentials"] = Value::Array(creds);

@@ -74,7 +74,8 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         };
 
         for item in work {
-            let payload = json!({
+            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            let mut payload = json!({
                 "technique": "ldap_signing_check",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -84,6 +85,9 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     "domain": item.credential.domain,
                 },
             });
+            if cross_domain {
+                payload["bind_domain"] = json!(item.credential.domain);
+            }
 
             let priority = dispatcher.effective_priority("ldap_signing");
             match dispatcher

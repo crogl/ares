@@ -50,7 +50,31 @@ pub async fn lsassy(args: &Value) -> Result<ToolOutput> {
     cmd.timeout_secs(120).execute().await
 }
 
-/// Check for admin access on targets via `netexec smb --admin-status`.
+/// Check a single credential against SMB on a target via `netexec smb`.
+///
+/// Returns standard netexec output — look for `[+]` (valid cred) and
+/// `(Pwn3d!)` (local admin).
+pub async fn smb_login_check(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let username = required_str(args, "username")?;
+    let password = required_str(args, "password")?;
+    let domain = required_str(args, "domain")?;
+
+    let cred_args = credentials::netexec_creds(Some(username), Some(password), None, Some(domain));
+
+    CommandBuilder::new("netexec")
+        .arg("smb")
+        .arg(target)
+        .args(cred_args)
+        .timeout_secs(60)
+        .execute()
+        .await
+}
+
+/// Check for admin access on targets via `netexec smb`.
+///
+/// netexec automatically reports `(Pwn3d!)` in its output when the
+/// credential has local admin access — no extra flag needed.
 pub async fn domain_admin_checker(args: &Value) -> Result<ToolOutput> {
     let targets = required_str(args, "targets")?;
     let username = optional_str(args, "username");
@@ -64,7 +88,6 @@ pub async fn domain_admin_checker(args: &Value) -> Result<ToolOutput> {
         .arg("smb")
         .arg(targets)
         .args(cred_args)
-        .arg("--admin-status")
         .timeout_secs(120)
         .execute()
         .await
@@ -140,11 +163,17 @@ pub async fn laps_dump(args: &Value) -> Result<ToolOutput> {
 }
 
 /// Search for user descriptions containing credentials via `ldapsearch`.
+///
+/// `domain` controls the base DN (the partition being searched).
+/// `bind_domain` (optional) overrides the domain in the bind DN
+/// (`user@bind_domain`). Use when the credential belongs to a different
+/// domain than the one being queried. Defaults to `domain`.
 pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
     let password = required_str(args, "password")?;
     let domain = required_str(args, "domain")?;
+    let bind_domain = optional_str(args, "bind_domain");
     let base_dn = optional_str(args, "base_dn");
 
     // Build base DN from domain if not explicitly provided.
@@ -157,7 +186,8 @@ pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
             .join(","),
     };
 
-    let bind_dn = format!("{username}@{domain}");
+    let auth_domain = bind_domain.unwrap_or(domain);
+    let bind_dn = format!("{username}@{auth_domain}");
     let ldap_uri = format!("ldap://{target}");
 
     CommandBuilder::new("ldapsearch")
@@ -953,6 +983,16 @@ mod tests {
             "domain": "contoso.local", "method": "comsvcs"
         });
         assert!(super::lsassy(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn smb_login_check_executes() {
+        mock::push(mock::success());
+        let args = json!({
+            "target": "192.168.58.10", "username": "localuser",
+            "password": "localuser", "domain": "contoso.local"
+        });
+        assert!(super::smb_login_check(&args).await.is_ok());
     }
 
     #[tokio::test]

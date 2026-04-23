@@ -225,6 +225,7 @@ pub async fn xfreerdp(args: &Value) -> Result<ToolOutput> {
 
     cmd.arg("/cert-ignore")
         .arg("+auth-only")
+        .env("HOME", "/root")
         .timeout_secs(30)
         .execute()
         .await
