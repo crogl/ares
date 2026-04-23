@@ -321,6 +321,8 @@ fn fast_weights() -> HashMap<String, i32> {
         ("domain_user_enumeration", 2),
         ("pth_spray", 4),
         ("certifried", 4),
+        ("dacl_abuse", 2),
+        ("smbclient_enum", 4),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -389,6 +391,8 @@ fn comprehensive_weights() -> HashMap<String, i32> {
         ("domain_user_enumeration", 3),
         ("pth_spray", 3),
         ("certifried", 3),
+        ("dacl_abuse", 3),
+        ("smbclient_enum", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -457,6 +461,8 @@ fn stealth_weights() -> HashMap<String, i32> {
         ("domain_user_enumeration", 2),
         ("pth_spray", 5),
         ("certifried", 3),
+        ("dacl_abuse", 2),
+        ("smbclient_enum", 3),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))
@@ -745,6 +751,8 @@ mod tests {
             "domain_user_enumeration",
             "pth_spray",
             "certifried",
+            "dacl_abuse",
+            "smbclient_enum",
         ];
         for preset in [
             StrategyPreset::Fast,

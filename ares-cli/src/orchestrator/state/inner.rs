@@ -359,6 +359,8 @@ mod tests {
             DEDUP_DOMAIN_USER_ENUM,
             DEDUP_PTH_SPRAY,
             DEDUP_CERTIFRIED,
+            DEDUP_DACL_ABUSE,
+            DEDUP_SMBCLIENT_ENUM,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {
