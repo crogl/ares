@@ -422,10 +422,12 @@ fn print_attack_path(timeline_events: &[serde_json::Value]) {
             .and_then(|v| v.as_str())
             .unwrap_or("unknown event");
 
+        let already_critical = description.starts_with("CRITICAL:");
         let desc_lower = description.to_lowercase();
-        let is_critical = desc_lower.contains("krbtgt")
-            || (desc_lower.contains("administrator") && desc_lower.contains("hash"))
-            || desc_lower.contains("domain admin");
+        let is_critical = !already_critical
+            && (desc_lower.contains("krbtgt")
+                || (desc_lower.contains("administrator") && desc_lower.contains("hash"))
+                || desc_lower.contains("domain admin"));
         let prefix = if is_critical { "CRITICAL: " } else { "" };
 
         let mitre = extract_mitre_from_event(event);
