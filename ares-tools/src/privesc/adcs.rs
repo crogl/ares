@@ -9,27 +9,33 @@ use crate::ToolOutput;
 
 /// Enumerate ADCS certificate templates and CAs using Certipy.
 ///
-/// Required args: `username`, `domain`, `password`, `dc_ip`
-/// Optional args: `vulnerable`
+/// Required args: `username`, `domain`, `dc_ip`
+/// Optional args: `password`, `hashes`, `vulnerable`
 pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let vulnerable = optional_bool(args, "vulnerable").unwrap_or(false);
+    let hashes = optional_str(args, "hashes");
 
     let user_at_domain = format!("{username}@{domain}");
 
-    CommandBuilder::new("certipy")
+    let mut cmd = CommandBuilder::new("certipy")
         .arg("find")
-        .flag("-u", user_at_domain)
-        .flag("-p", password)
+        .flag("-u", &user_at_domain)
         .flag("-dc-ip", dc_ip)
         .arg("-text")
         .arg_if(vulnerable, "-vulnerable")
-        .timeout_secs(120)
-        .execute()
-        .await
+        .timeout_secs(120);
+
+    if let Some(h) = hashes {
+        cmd = cmd.flag("-hashes", h);
+    } else {
+        let password = required_str(args, "password")?;
+        cmd = cmd.flag("-p", password);
+    }
+
+    cmd.execute().await
 }
 
 /// Request a certificate from an ADCS CA using Certipy.

@@ -40,7 +40,7 @@ pub async fn auto_bloodhound(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                 .iter()
                 .filter(|d| !state.is_processed(DEDUP_BLOODHOUND_DOMAINS, d))
                 .filter_map(|domain| {
-                    let dc_ip = state.domain_controllers.get(domain).cloned()?;
+                    let dc_ip = state.resolve_dc_ip(domain)?;
                     // Select best credential for this specific domain
                     let cred = find_domain_credential(
                         domain,

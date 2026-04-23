@@ -325,16 +325,26 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
 /// Execute an rpcclient command against a target.
 ///
 /// Required args: `target`, `command`
-/// Optional args: `username`, `password`, `domain`, `null_session`
+/// Optional args: `username`, `password`, `domain`, `null_session`, `hash`
 pub async fn rpcclient_command(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let command = required_str(args, "command")?;
     let null_session = optional_bool(args, "null_session").unwrap_or(false);
+    let hash = optional_str(args, "hash");
 
     let mut cmd = CommandBuilder::new("rpcclient").timeout_secs(120);
 
     if null_session {
         cmd = cmd.args(["-U", "", "-N"]);
+    } else if let Some(ntlm_hash) = hash {
+        // Pass-the-hash: use --pw-nt-hash and supply the NTLM hash as the password
+        let domain = optional_str(args, "domain");
+        let username = optional_str(args, "username").unwrap_or("Administrator");
+        let user_spec = match domain {
+            Some(d) => format!("{d}/{username}%{ntlm_hash}"),
+            None => format!("{username}%{ntlm_hash}"),
+        };
+        cmd = cmd.flag("-U", user_spec).arg("--pw-nt-hash");
     } else {
         let domain = optional_str(args, "domain");
         let username = optional_str(args, "username").unwrap_or("");

@@ -29,7 +29,7 @@ fn collect_dfs_coercion_work(state: &StateInner, listener: &str) -> Vec<DfsWork>
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         if dc_ip.as_str() == listener {
             continue;
         }

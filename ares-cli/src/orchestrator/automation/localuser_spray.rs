@@ -23,7 +23,7 @@ use crate::orchestrator::state::*;
 fn collect_localuser_spray_work(state: &StateInner) -> Vec<LocaluserWork> {
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("localuser:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_LOCALUSER_SPRAY, &dedup_key) {
             continue;

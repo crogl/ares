@@ -319,7 +319,11 @@ pub async fn auto_credential_expansion(
             // This is the fastest path from hash → krbtgt → DA.
             {
                 let state = dispatcher.state.read().await;
-                let dc_ips: Vec<String> = state.domain_controllers.values().cloned().collect();
+                let dc_ips: Vec<String> = state
+                    .all_domains_with_dcs()
+                    .into_iter()
+                    .map(|(_, ip)| ip)
+                    .collect();
                 drop(state);
 
                 if !dispatcher.is_technique_allowed("secretsdump") {

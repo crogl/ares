@@ -29,7 +29,7 @@ fn collect_sid_enum_work(state: &StateInner) -> Vec<SidEnumWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         // Skip if we already have the SID for this domain
         if state.domain_sids.contains_key(domain) {
             continue;

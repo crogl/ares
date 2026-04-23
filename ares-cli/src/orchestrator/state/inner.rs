@@ -71,6 +71,10 @@ pub struct StateInner {
 
     // Completion flag (set externally to signal operation should wrap up)
     pub completed: bool,
+
+    /// Timestamp when all forests were first detected as dominated.
+    /// Used by the completion monitor to enforce a post-exploitation grace period.
+    pub all_forests_dominated_at: Option<tokio::time::Instant>,
 }
 
 impl StateInner {
@@ -109,6 +113,7 @@ impl StateInner {
             completed_tasks: HashMap::new(),
             quarantined_credentials: HashMap::new(),
             completed: false,
+            all_forests_dominated_at: None,
         }
     }
 
@@ -147,6 +152,148 @@ impl StateInner {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
         self.quarantined_credentials.insert(key, expiry);
+    }
+
+    /// Resolve the DC IP for a domain.
+    ///
+    /// Checks `domain_controllers` first, then falls back to scanning the hosts
+    /// list for a DC whose FQDN suffix matches the domain. This is more robust
+    /// than relying solely on `domain_controllers`, which can have stale or
+    /// missing entries due to startup seed timing issues in multi-domain
+    /// environments.
+    pub fn resolve_dc_ip(&self, domain: &str) -> Option<String> {
+        let domain_lower = domain.to_lowercase();
+        // Tier 1: explicit DC map (case-insensitive)
+        if let Some(ip) = self.domain_controllers.get(&domain_lower).or_else(|| {
+            self.domain_controllers
+                .iter()
+                .find(|(k, _)| k.to_lowercase() == domain_lower)
+                .map(|(_, v)| v)
+        }) {
+            return Some(ip.clone());
+        }
+        // Tier 2: scan hosts for a DC matching this domain by FQDN suffix
+        for host in &self.hosts {
+            if !(host.is_dc || host.detect_dc()) {
+                continue;
+            }
+            if host.hostname.is_empty() {
+                continue;
+            }
+            let parts: Vec<&str> = host.hostname.split('.').collect();
+            if parts.len() >= 3 {
+                let host_domain = parts[1..].join(".").to_lowercase();
+                if host_domain == domain_lower {
+                    return Some(host.ip.clone());
+                }
+            }
+        }
+        None
+    }
+
+    /// Return all unique domains that have a resolvable DC.
+    ///
+    /// Merges domains from `domain_controllers`, `domains`, and `trusted_domains`
+    /// then filters to those where `resolve_dc_ip()` succeeds. Returns
+    /// `(domain, dc_ip)` pairs.
+    pub fn all_domains_with_dcs(&self) -> Vec<(String, String)> {
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
+
+        // Gather all known domain names (lowercased for dedup)
+        let mut all_domains: Vec<String> = Vec::new();
+        for d in self.domain_controllers.keys() {
+            all_domains.push(d.to_lowercase());
+        }
+        for d in &self.domains {
+            all_domains.push(d.to_lowercase());
+        }
+        for d in self.trusted_domains.keys() {
+            all_domains.push(d.to_lowercase());
+        }
+
+        for domain in all_domains {
+            if seen.contains(&domain) {
+                continue;
+            }
+            seen.insert(domain.clone());
+            if let Some(ip) = self.resolve_dc_ip(&domain) {
+                result.push((domain, ip));
+            }
+        }
+
+        result
+    }
+
+    /// Find a cleartext credential from a trusted domain that can authenticate
+    /// to `target_domain` via AD trust (child→parent or cross-forest).
+    ///
+    /// Used as a fallback when no same-domain cleartext credential exists.
+    /// Child-domain creds authenticate to parent DCs via the parent-child trust;
+    /// cross-forest creds authenticate via bidirectional forest trusts.
+    pub fn find_trust_credential(
+        &self,
+        target_domain: &str,
+    ) -> Option<ares_core::models::Credential> {
+        let target = target_domain.to_lowercase();
+
+        // Priority 1: child-domain cred → parent-domain (most reliable)
+        if let Some(c) = self.credentials.iter().find(|c| {
+            !c.password.is_empty()
+                && !self.is_credential_quarantined(&c.username, &c.domain)
+                && c.domain.to_lowercase().ends_with(&format!(".{target}"))
+        }) {
+            return Some(c.clone());
+        }
+
+        // Priority 2: cross-forest trusted domain cred (bidirectional trust)
+        // Check if any credential's domain has a trust with the target domain.
+        for cred in &self.credentials {
+            if cred.password.is_empty()
+                || self.is_credential_quarantined(&cred.username, &cred.domain)
+            {
+                continue;
+            }
+            let cred_dom = cred.domain.to_lowercase();
+            if cred_dom == target {
+                continue; // same domain, not a trust fallback
+            }
+            // Check: does the cred's forest root trust the target's forest root?
+            // The target might trust the cred's domain (or its forest root).
+            let cred_forest = self.forest_root_of(&cred_dom);
+            let target_forest = self.forest_root_of(&target);
+            if cred_forest != target_forest {
+                // Check if there's a trust between these forests
+                if self.trusted_domains.contains_key(&target_forest)
+                    || self.trusted_domains.contains_key(&cred_forest)
+                {
+                    return Some(cred.clone());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get the forest root for a domain.
+    /// If the domain is a child (e.g. `north.sevenkingdoms.local`), the forest
+    /// root is the parent (e.g. `sevenkingdoms.local`). Otherwise returns self.
+    fn forest_root_of(&self, domain: &str) -> String {
+        let d = domain.to_lowercase();
+        // Check if this domain is a child of any known domain
+        for known in self.domains.iter() {
+            let k = known.to_lowercase();
+            if d != k && d.ends_with(&format!(".{k}")) {
+                return k;
+            }
+        }
+        for known in self.domain_controllers.keys() {
+            let k = known.to_lowercase();
+            if d != k && d.ends_with(&format!(".{k}")) {
+                return k;
+            }
+        }
+        d
     }
 
     /// Check if a dedup key exists in the named set.

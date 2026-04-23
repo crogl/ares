@@ -37,8 +37,8 @@ fn collect_foreign_group_work(state: &StateInner) -> Vec<ForeignGroupWork> {
             continue;
         }
 
-        let dc_ip = match state.domain_controllers.get(domain) {
-            Some(ip) => ip.clone(),
+        let dc_ip = match state.resolve_dc_ip(domain) {
+            Some(ip) => ip,
             None => continue,
         };
 

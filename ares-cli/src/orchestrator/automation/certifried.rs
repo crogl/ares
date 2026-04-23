@@ -34,7 +34,7 @@ fn collect_certifried_work(state: &StateInner) -> Vec<CertifriedWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("certifried:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_CERTIFRIED, &dedup_key) {
             continue;

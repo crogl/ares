@@ -429,24 +429,44 @@ impl Dispatcher {
     }
 
     /// Submit a CERTIPY find task for ADCS enumeration.
+    ///
+    /// `ntlm_hash` and `hash_username` enable pass-the-hash authentication when
+    /// no cleartext credential is available for the target domain.
     pub async fn request_certipy_find(
         &self,
         target_ip: &str,
         domain: &str,
         credential: &ares_core::models::Credential,
+        ntlm_hash: Option<&str>,
+        hash_username: Option<&str>,
     ) -> Result<Option<String>> {
-        let payload = json!({
+        // When PTH hash is available, use the hash user's identity for the target domain
+        let (cred_user, cred_pass, cred_domain) = if let Some(_hash) = ntlm_hash {
+            let user = hash_username.unwrap_or(&credential.username);
+            (user.to_string(), String::new(), domain.to_string())
+        } else {
+            (
+                credential.username.clone(),
+                credential.password.clone(),
+                credential.domain.clone(),
+            )
+        };
+
+        let mut payload = json!({
             "technique": "certipy_find",
             "target_ip": target_ip,
             "domain": domain,
             "credential": {
-                "username": credential.username,
-                "password": credential.password,
-                "domain": credential.domain,
+                "username": cred_user,
+                "password": cred_pass,
+                "domain": cred_domain,
             },
             "instructions": concat!(
-                "Run certipy find to enumerate ALL certificate templates and CA configurations. ",
-                "Use: certipy find -u 'user@domain' -p 'pass' -dc-ip <target_ip> -vulnerable\n\n",
+                "Run the certipy_find tool to enumerate ALL certificate templates and CAs.\n\n",
+                "AUTHENTICATION: If password is empty and an NTLM hash is provided, use the ",
+                "certipy_find tool with the 'hashes' parameter (format ':nthash'). Do NOT pass ",
+                "an empty password.\n\n",
+                "If a password IS provided, use certipy_find with 'password' parameter.\n\n",
                 "For each vulnerable template found, register a vulnerability with:\n",
                 "  vuln_type: the ESC type (e.g. 'esc1', 'esc2', 'esc3', 'esc4', 'esc6', 'esc8')\n",
                 "  target: the certificate template name\n",
@@ -454,16 +474,22 @@ impl Dispatcher {
                 "  domain: the domain\n",
                 "  details: include template_name, ca_name, enrollee_supplies_subject, ",
                 "client_authentication, any_purpose, enrollment_rights, and which users/groups can enroll\n\n",
-                "Also check:\n",
-                "- ESC1: Enrollee Supplies Subject + Client Authentication + low-priv enrollment\n",
-                "- ESC4: Vulnerable template ACL (GenericAll/WriteDacl/WriteOwner on template)\n",
-                "- ESC6: EDITF_ATTRIBUTESUBJECTALTNAME2 flag on CA\n",
-                "- ESC8: Web Enrollment enabled (HTTP endpoint for NTLM relay)\n",
-                "- ESC7: ManageCA or ManageCertificates permissions\n",
-                "If certipy find fails, try: certipy find -u 'user@domain' -p 'pass' -dc-ip <target_ip> -stdout"
+                "Check for: ESC1 (Enrollee Supplies Subject + Client Auth), ESC2 (Any Purpose EKU), ",
+                "ESC3 (enrollment agent), ESC4 (template ACL abuse), ESC6 (EDITF flag), ",
+                "ESC7 (ManageCA), ESC8 (Web Enrollment HTTP relay).\n",
+                "If certipy_find fails, try with -stdout flag."
             ),
         });
-        self.throttled_submit("recon", "recon", payload, 4).await
+        // Attach hash for PTH authentication
+        if let Some(hash) = ntlm_hash {
+            payload["ntlm_hash"] = json!(hash);
+            if let Some(user) = hash_username {
+                payload["hash_username"] = json!(user);
+            }
+        }
+        // task_type "recon" → recon prompt template (supports instructions/ntlm_hash)
+        // target_role "privesc" → privesc tools (certipy_find is only in privesc)
+        self.throttled_submit("recon", "privesc", payload, 4).await
     }
 
     /// Refresh the operation lock TTL. Called periodically.

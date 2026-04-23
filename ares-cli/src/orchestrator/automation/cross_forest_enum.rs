@@ -52,7 +52,7 @@ fn collect_cross_forest_work(state: &StateInner) -> Vec<CrossForestWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let domain_lower = domain.to_lowercase();
 
         // Count how many users we know in this domain.

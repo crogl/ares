@@ -150,14 +150,14 @@ pub async fn auto_credential_access(
                         if state.is_processed(DEDUP_CRACK_REQUESTS, &dedup) {
                             return None;
                         }
-                        // Exact domain match first
-                        if let Some(dc_ip) = state.domain_controllers.get(&cred_domain).cloned() {
+                        // Exact domain match first (using robust DC resolution)
+                        if let Some(dc_ip) = state.resolve_dc_ip(&cred_domain) {
                             return Some((dedup, dc_ip, cred_domain, cred.clone()));
                         }
                         // Fallback: check child domains (e.g. cred has "contoso.local"
                         // but user is actually in "child.contoso.local")
                         let suffix = format!(".{cred_domain}");
-                        for (domain, dc_ip) in &state.domain_controllers {
+                        for (domain, dc_ip) in &state.all_domains_with_dcs() {
                             if domain.ends_with(&suffix) {
                                 debug!(
                                     cred_domain = %cred_domain,

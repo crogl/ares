@@ -526,6 +526,55 @@ fn extract_cracked_no_false_positive_on_raw_asrep_hash() {
     );
 }
 
+/// rpcclient queryuser output puts User Name and Description on separate lines.
+/// The block-aware parser should extract the password from the Description field.
+#[test]
+fn extract_rpcclient_queryuser_description_password() {
+    let output = "\
+\tUser Name   :\tsamwell.tarly\n\
+\tFull Name   :\t\n\
+\tHome Drive  :\t\n\
+\tDir Drive   :\t\n\
+\tProfile Path:\t\n\
+\tLogon Script:\t\n\
+\tDescription :\tSamwell Tarly (Password : Heartsbane)\n\
+\tWorkstations:\t\n\
+\tComment     :\t\n\
+\tRemote Dial :\n";
+    let creds = extract_plaintext_passwords(output, "north.contoso.local");
+    assert_eq!(
+        creds.len(),
+        1,
+        "Should extract credential from rpcclient queryuser block"
+    );
+    assert_eq!(creds[0].username, "samwell.tarly");
+    assert_eq!(creds[0].password, "Heartsbane");
+    assert_eq!(creds[0].domain, "north.contoso.local");
+    assert_eq!(creds[0].source, "description_field");
+}
+
+/// Multiple rpcclient queryuser blocks — only users WITH passwords should produce creds.
+#[test]
+fn extract_rpcclient_queryuser_multiple_users() {
+    let output = "\
+\tUser Name   :\tjohn.snow\n\
+\tDescription :\tJohn Snow\n\
+\n\
+\tUser Name   :\tsamwell.tarly\n\
+\tDescription :\tSamwell Tarly (Password : Heartsbane)\n\
+\n\
+\tUser Name   :\tarya.stark\n\
+\tDescription :\tArya Stark\n";
+    let creds = extract_plaintext_passwords(output, "north.contoso.local");
+    assert_eq!(
+        creds.len(),
+        1,
+        "Only samwell.tarly has a password in description"
+    );
+    assert_eq!(creds[0].username, "samwell.tarly");
+    assert_eq!(creds[0].password, "Heartsbane");
+}
+
 #[test]
 fn valid_credential_rejects_hash_body_password() {
     // Long hex+$ strings should be rejected as hash fragments

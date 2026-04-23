@@ -29,7 +29,7 @@ fn collect_user_enum_work(state: &StateInner) -> Vec<UserEnumWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("user_enum:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_DOMAIN_USER_ENUM, &dedup_key) {
             continue;

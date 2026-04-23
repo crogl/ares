@@ -34,6 +34,24 @@ pub(crate) fn generate_recon_prompt(
         ctx.insert("techniques", &techniques);
     }
 
+    // Single technique (e.g. certipy_find, ldap_group_enumeration)
+    if let Some(technique) = payload["technique"].as_str() {
+        ctx.insert("technique", technique);
+    }
+
+    // Task-specific instructions (e.g. certipy commands, LDAP queries)
+    if let Some(instructions) = payload["instructions"].as_str() {
+        ctx.insert("instructions", instructions);
+    }
+
+    // NTLM hash for pass-the-hash authentication
+    if let Some(ntlm_hash) = payload["ntlm_hash"].as_str() {
+        ctx.insert("ntlm_hash", ntlm_hash);
+    }
+    if let Some(hash_username) = payload["hash_username"].as_str() {
+        ctx.insert("hash_username", hash_username);
+    }
+
     insert_state_context(&mut ctx, state, "recon", payload["target_ip"].as_str());
 
     render_template_with_context(TASK_RECON, &ctx)

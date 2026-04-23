@@ -95,7 +95,7 @@ pub async fn auto_credential_reuse(
             let state = dispatcher.state.read().await;
 
             // Need at least 2 known DCs (implies multiple domains)
-            if state.domain_controllers.len() < 2 {
+            if state.all_domains_with_dcs().len() < 2 {
                 continue;
             }
 
@@ -113,7 +113,7 @@ pub async fn auto_credential_reuse(
             for hash in &reuse_candidates {
                 let hash_domain = hash.domain.to_lowercase();
 
-                for (dc_domain, dc_ip) in &state.domain_controllers {
+                for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
                     let target_domain = dc_domain.to_lowercase();
 
                     // Skip same domain and parent/child domains (handled by secretsdump.rs)

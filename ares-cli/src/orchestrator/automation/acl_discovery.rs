@@ -41,38 +41,83 @@ const DANGEROUS_ACE_TYPES: &[&str] = &[
 /// Pure logic extracted from `auto_acl_discovery` so it can be unit-tested
 /// without needing a `Dispatcher` or async runtime.
 fn collect_acl_discovery_work(state: &StateInner) -> Vec<AclDiscoveryWork> {
-    if state.credentials.is_empty() {
+    if state.credentials.is_empty() && state.hashes.is_empty() {
         return Vec::new();
     }
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
-        let dedup_key = format!("acl_disc:{}", domain.to_lowercase());
-        if state.is_processed(DEDUP_ACL_DISCOVERY, &dedup_key) {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
+        // Use separate dedup keys for cred vs hash attempts so a failed
+        // password-based attempt (e.g., mislabeled credential domain)
+        // doesn't permanently block the hash-based path.
+        let dedup_key_cred = format!("acl_disc:{}:cred", domain.to_lowercase());
+        let dedup_key_hash = format!("acl_disc:{}:hash", domain.to_lowercase());
+        let dedup_key_trust = format!("acl_disc:{}:trust", domain.to_lowercase());
+
+        // Prefer same-domain cleartext cred, then fall back to trust-compatible
+        // cred (child→parent or cross-forest). Trust-based attempts use a
+        // separate dedup key so they don't block hash-based fallback.
+        let (cred, using_trust_cred) = if !state.is_processed(DEDUP_ACL_DISCOVERY, &dedup_key_cred)
+        {
+            let c = state
+                .credentials
+                .iter()
+                .find(|c| {
+                    !c.password.is_empty()
+                        && c.domain.to_lowercase() == domain.to_lowercase()
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                })
+                .cloned();
+            (c, false)
+        } else {
+            (None, false)
+        };
+        let (cred, using_trust_cred) =
+            if cred.is_none() && !state.is_processed(DEDUP_ACL_DISCOVERY, &dedup_key_trust) {
+                match state.find_trust_credential(domain) {
+                    Some(c) => (Some(c), true),
+                    None => (None, using_trust_cred),
+                }
+            } else {
+                (cred, using_trust_cred)
+            };
+
+        // Look for NTLM hash (PTH) — fires independently of cred attempt
+        let (ntlm_hash, ntlm_hash_username) =
+            if cred.is_none() && !state.is_processed(DEDUP_ACL_DISCOVERY, &dedup_key_hash) {
+                state
+                    .hashes
+                    .iter()
+                    .find(|h| {
+                        h.hash_type.to_lowercase() == "ntlm"
+                            && h.domain.to_lowercase() == domain.to_lowercase()
+                            && h.username.to_lowercase() == "administrator"
+                    })
+                    .or_else(|| {
+                        state.hashes.iter().find(|h| {
+                            h.hash_type.to_lowercase() == "ntlm"
+                                && h.domain.to_lowercase() == domain.to_lowercase()
+                                && !state.is_delegation_account(&h.username)
+                        })
+                    })
+                    .map(|h| (Some(h.hash_value.clone()), Some(h.username.clone())))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
+
+        // Need at least a credential or an NTLM hash
+        if cred.is_none() && ntlm_hash.is_none() {
             continue;
         }
 
-        // Prefer same-domain credential, fall back to any available.
-        let cred = state
-            .credentials
-            .iter()
-            .find(|c| {
-                !c.password.is_empty()
-                    && c.domain.to_lowercase() == domain.to_lowercase()
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
-            })
-            .or_else(|| {
-                state.credentials.iter().find(|c| {
-                    !c.password.is_empty()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
-                })
-            })
-            .cloned();
-
-        let cred = match cred {
-            Some(c) => c,
-            None => continue,
+        let dedup_key = if ntlm_hash.is_some() {
+            dedup_key_hash
+        } else if using_trust_cred {
+            dedup_key_trust
+        } else {
+            dedup_key_cred
         };
 
         // Collect known users in this domain to check ACEs against.
@@ -87,8 +132,20 @@ fn collect_acl_discovery_work(state: &StateInner) -> Vec<AclDiscoveryWork> {
             dedup_key,
             domain: domain.clone(),
             dc_ip: dc_ip.clone(),
-            credential: cred,
+            credential: cred.unwrap_or_else(|| ares_core::models::Credential {
+                id: String::new(),
+                username: ntlm_hash_username.clone().unwrap_or_default(),
+                password: String::new(),
+                domain: domain.clone(),
+                source: "hash_fallback".into(),
+                is_admin: false,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+            }),
             known_users: domain_users,
+            ntlm_hash,
+            ntlm_hash_username,
         });
     }
 
@@ -99,11 +156,11 @@ fn collect_acl_discovery_work(state: &StateInner) -> Vec<AclDiscoveryWork> {
 /// Only runs after BloodHound collection has been dispatched (to avoid
 /// duplicating effort).
 pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
-    let mut interval = tokio::time::interval(Duration::from_secs(60));
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Wait for initial recon + BloodHound to run first.
-    tokio::time::sleep(Duration::from_secs(90)).await;
+    // Wait for initial recon to populate domain controllers.
+    tokio::time::sleep(Duration::from_secs(45)).await;
 
     loop {
         tokio::select! {
@@ -124,42 +181,66 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
         };
 
         for item in work {
-            let cross_domain = item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            // When PTH hash is available, use the hash user's identity for the target domain
+            let (cred_user, cred_pass, cred_domain) = if item.ntlm_hash.is_some() {
+                (
+                    item.ntlm_hash_username
+                        .clone()
+                        .unwrap_or_else(|| item.credential.username.clone()),
+                    String::new(),
+                    item.domain.clone(),
+                )
+            } else {
+                (
+                    item.credential.username.clone(),
+                    item.credential.password.clone(),
+                    item.credential.domain.clone(),
+                )
+            };
+            let cross_domain = cred_domain.to_lowercase() != item.domain.to_lowercase();
             let mut payload = json!({
                 "technique": "ldap_acl_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
                 "credential": {
-                    "username": item.credential.username,
-                    "password": item.credential.password,
-                    "domain": item.credential.domain,
+                    "username": cred_user,
+                    "password": cred_pass,
+                    "domain": cred_domain,
                 },
                 "ace_types": DANGEROUS_ACE_TYPES,
                 "known_users": item.known_users,
                 "instructions": concat!(
-                    "Enumerate ACL attack paths in this domain using dacledit.py or ",
-                    "bloodyAD to query DACLs on user/group/computer objects. ",
+                    "Enumerate ACL attack paths in this domain.\n\n",
+                    "AUTHENTICATION: If the password field is EMPTY and an NTLM hash is provided, ",
+                    "you MUST use pass-the-hash. Do NOT attempt LDAP simple bind with empty password.\n",
+                    "  - Use ldap_search with the hash if it accepts one, OR\n",
+                    "  - Use rpcclient_command with the hash parameter to query DACLs via RPC.\n\n",
+                    "If a password IS provided, use ldap_search with filter ",
+                    "'(objectCategory=*)' and request the nTSecurityDescriptor attribute.\n\n",
                     "For each dangerous ACE found (GenericAll, WriteDacl, ForceChangePassword, ",
                     "GenericWrite, WriteOwner, Self-Membership on users/groups), register it as ",
                     "a vulnerability with EXACTLY these fields:\n",
                     "  vuln_type: lowercase ACE type (e.g. 'forcechangepassword', 'genericall', ",
                     "'genericwrite', 'writedacl', 'writeowner', 'self_membership')\n",
                     "  source: the user/group that HAS the permission (attacker)\n",
-                    "  target: the user/group/computer that is the TARGET of the permission (victim)\n",
-                    "  target_type: 'User', 'Group', or 'Computer' (object class of target)\n",
+                    "  target: the user/group/computer that is the TARGET (victim)\n",
+                    "  target_type: 'User', 'Group', or 'Computer'\n",
                     "  domain: the domain where this ACE exists\n",
                     "  source_domain: the domain of the source principal\n",
-                    "Focus on ACEs where the source is a user we have credentials for. ",
-                    "For GenericAll/GenericWrite on Computer objects, also set target_type='Computer' ",
-                    "to enable RBCD exploitation. Check both inbound and outbound ACEs.\n\n",
-                    "IMPORTANT: Also include ALL users discovered during DACL enumeration in the ",
-                    "discovered_users array with EXACTLY this JSON format:\n",
+                    "Focus on ACEs where the source is a user we have credentials for.\n\n",
+                    "IMPORTANT: Include ALL users discovered in the discovered_users array:\n",
                     "  {\"username\": \"samaccountname\", \"domain\": \"domain.local\", ",
                     "\"source\": \"acl_discovery\"}"
                 ),
             });
             if cross_domain {
                 payload["bind_domain"] = json!(item.credential.domain);
+            }
+            if let Some(ref hash) = item.ntlm_hash {
+                payload["ntlm_hash"] = json!(hash);
+            }
+            if let Some(ref user) = item.ntlm_hash_username {
+                payload["hash_username"] = json!(user);
             }
 
             let priority = dispatcher.effective_priority("acl_discovery");
@@ -202,6 +283,8 @@ struct AclDiscoveryWork {
     dc_ip: String,
     credential: ares_core::models::Credential,
     known_users: Vec<String>,
+    ntlm_hash: Option<String>,
+    ntlm_hash_username: Option<String>,
 }
 
 #[cfg(test)]
@@ -226,8 +309,10 @@ mod tests {
 
     #[test]
     fn dedup_key_format() {
-        let key = format!("acl_disc:{}", "contoso.local");
-        assert_eq!(key, "acl_disc:contoso.local");
+        let key_cred = format!("acl_disc:{}:cred", "contoso.local");
+        let key_hash = format!("acl_disc:{}:hash", "contoso.local");
+        assert_eq!(key_cred, "acl_disc:contoso.local:cred");
+        assert_eq!(key_hash, "acl_disc:contoso.local:hash");
     }
 
     #[test]
@@ -339,11 +424,13 @@ mod tests {
             attack_step: 0,
         };
         let work = AclDiscoveryWork {
-            dedup_key: "acl_disc:contoso.local".into(),
+            dedup_key: "acl_disc:contoso.local:cred".into(),
             domain: "contoso.local".into(),
             dc_ip: "192.168.58.10".into(),
             credential: cred,
             known_users: vec!["admin".into(), "jdoe".into()],
+            ntlm_hash: None,
+            ntlm_hash_username: None,
         };
         assert_eq!(work.known_users.len(), 2);
         assert_eq!(work.domain, "contoso.local");
@@ -391,7 +478,7 @@ mod tests {
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "contoso.local");
         assert_eq!(work[0].dc_ip, "192.168.58.10");
-        assert_eq!(work[0].dedup_key, "acl_disc:contoso.local");
+        assert_eq!(work[0].dedup_key, "acl_disc:contoso.local:cred");
         assert_eq!(work[0].credential.username, "admin");
         assert_eq!(work[0].credential.domain, "contoso.local");
         assert!(work[0].known_users.contains(&"admin".to_string()));
@@ -428,7 +515,8 @@ mod tests {
         state
             .credentials
             .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local".into());
+        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:cred".into());
+        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:hash".into());
         let work = collect_acl_discovery_work(&state);
         assert!(work.is_empty());
     }
@@ -448,7 +536,8 @@ mod tests {
         state
             .credentials
             .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
-        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local".into());
+        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:cred".into());
+        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:hash".into());
         let work = collect_acl_discovery_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "fabrikam.local");
@@ -474,19 +563,17 @@ mod tests {
     }
 
     #[test]
-    fn collect_falls_back_to_cross_domain_credential() {
+    fn collect_cross_domain_cred_skipped_without_hash() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
             .insert("contoso.local".into(), "192.168.58.10".into());
-        // Only a fabrikam credential available for contoso DC
+        // Only a fabrikam credential available for contoso DC — should NOT fall back
         state
             .credentials
             .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
         let work = collect_acl_discovery_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].credential.username, "crossuser");
-        assert_eq!(work[0].credential.domain, "fabrikam.local");
+        assert_eq!(work.len(), 0, "cross-domain cred should not produce work");
     }
 
     #[test]
@@ -554,7 +641,7 @@ mod tests {
             .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
         let work = collect_acl_discovery_work(&state);
         assert_eq!(work.len(), 1);
-        assert_eq!(work[0].dedup_key, "acl_disc:contoso.local");
+        assert_eq!(work[0].dedup_key, "acl_disc:contoso.local:cred");
     }
 
     #[test]
@@ -588,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_quarantined_same_domain_falls_back_to_cross_domain() {
+    fn collect_quarantined_same_domain_skipped_without_hash() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
@@ -600,9 +687,13 @@ mod tests {
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
         state.quarantine_credential("baduser", "contoso.local");
+        // No same-domain cred (quarantined) and no hash → skip
         let work = collect_acl_discovery_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].credential.username, "gooduser");
+        assert_eq!(
+            work.len(),
+            0,
+            "quarantined same-domain cred should not fall back to cross-domain"
+        );
     }
 
     #[test]

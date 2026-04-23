@@ -25,7 +25,7 @@ use crate::orchestrator::state::*;
 fn collect_dns_enum_work(state: &StateInner) -> Vec<DnsEnumWork> {
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("dns_enum:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_DNS_ENUM, &dedup_key) {
             continue;

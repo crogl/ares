@@ -144,11 +144,43 @@ pub(crate) async fn dispatch_initial_recon(
         let payload = serde_json::json!({
             "target_ip": ip,
             "domain": domain,
+            "technique": "user_enumeration",
             "techniques": ["user_enumeration"],
             "null_session": true,
+            "instructions": concat!(
+                "Enumerate domain users via UNAUTHENTICATED methods. This is a bootstrap task ",
+                "— we have NO credentials yet. Try these techniques in order:\n\n",
+                "1. Anonymous LDAP bind to enumerate users and their descriptions:\n",
+                "   ldapsearch -x -H ldap://<target_ip> -b 'DC=<domain parts>' ",
+                "'(objectClass=user)' sAMAccountName description userPrincipalName\n\n",
+                "2. RPC null session user enumeration:\n",
+                "   rpcclient -U '' -N <target_ip> -c 'enumdomusers'\n",
+                "   Then for each user: rpcclient -U '' -N <target_ip> -c 'queryuser <rid>'\n\n",
+                "3. Impacket lookupsid.py with anonymous:\n",
+                "   lookupsid.py anonymous@<target_ip> -no-pass -domain-sids\n\n",
+                "4. Impacket GetADUsers.py with anonymous:\n",
+                "   GetADUsers.py -all -dc-ip <target_ip> <domain>/ 2>/dev/null\n\n",
+                "5. enum4linux-ng for comprehensive SMB/RPC enumeration:\n",
+                "   enum4linux-ng -A <target_ip>\n\n",
+                "CRITICAL: Look for passwords in user DESCRIPTION fields! In many AD environments, ",
+                "admins store passwords in the description attribute. For each user found, report ",
+                "the description field content. If a description looks like a password (short string, ",
+                "special chars, etc.), report it as a discovered credential:\n",
+                "  {\"username\": \"samaccountname\", \"password\": \"<description>\", ",
+                "\"domain\": \"<domain from the user's AD domain, NOT the local machine domain>\", \"source\": \"desc_enumeration\"}\n\n",
+                "IMPORTANT: The 'domain' field for credentials and users MUST be the AD domain the user ",
+                "belongs to (look at userPrincipalName suffix, or the domain reported by LDAP/RPC), NOT ",
+                "the local machine name or workgroup. If the target is a DC for 'north.sevenkingdoms.local', ",
+                "users belong to 'north.sevenkingdoms.local'. Use the 'domain' field from this task's payload ",
+                "as the default domain unless evidence shows otherwise.\n\n",
+                "Also report ALL discovered users in the discovered_users array:\n",
+                "  {\"username\": \"samaccountname\", \"domain\": \"<AD domain>\", ",
+                "\"source\": \"user_enumeration\"}\n\n",
+                "If the target is not a DC (no LDAP/Kerberos), just report that and complete."
+            ),
         });
         match dispatcher
-            .throttled_submit("recon", "recon", payload, 5)
+            .throttled_submit("recon", "recon", payload, 1)
             .await
         {
             Ok(Some(task_id)) => {

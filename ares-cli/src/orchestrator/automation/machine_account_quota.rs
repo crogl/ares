@@ -26,7 +26,7 @@ fn collect_maq_work(state: &StateInner) -> Vec<MaqWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("maq:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_MACHINE_ACCOUNT_QUOTA, &dedup_key) {
             continue;

@@ -25,7 +25,7 @@ fn collect_nopac_work(state: &StateInner) -> Vec<NopacWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         // Skip domains we already dominate -- noPac is pointless if we have krbtgt
         if state.dominated_domains.contains(&domain.to_lowercase()) {
             continue;

@@ -11,8 +11,9 @@ use super::domain::normalize_domain;
 /// Enforces AD trust-scope rules:
 /// - Same domain: always valid
 /// - Parent → child: parent-domain creds can authenticate to child domain LDAP
-/// - Child → parent: blocked (child creds cannot auth to parent LDAP)
-/// - Cross-forest: blocked for direct LDAP authentication
+/// - Child → parent: valid (NTLM/Kerberos auth traverses parent-child trust)
+/// - Cross-forest bidirectional: valid (NTLM auth traverses forest trust)
+/// - Cross-forest one-way inbound only: blocked
 pub fn is_valid_credential_for_domain(
     cred_domain: &str,
     target_domain: &str,
@@ -32,15 +33,24 @@ pub fn is_valid_credential_for_domain(
         return true;
     }
 
-    // Child → parent: blocked
+    // Child → parent: valid — NTLM/Kerberos authentication traverses the
+    // parent-child trust bidirectionally. The target DC forwards the auth
+    // request to the child domain DC via the trust's secure channel.
     // e.g. cred=north.contoso.local, target=contoso.local
     if cred_lower.ends_with(&format!(".{target_lower}")) {
-        return false;
+        return true;
     }
 
-    // Cross-forest: block if either side is a known trust
-    if trusted_domains.contains_key(&target_lower) || trusted_domains.contains_key(&cred_lower) {
-        return false;
+    // Cross-forest: allow if bidirectional trust exists
+    if let Some(trust) = trusted_domains.get(&target_lower) {
+        if trust.direction == "bidirectional" || trust.direction == "outbound" {
+            return true;
+        }
+    }
+    if let Some(trust) = trusted_domains.get(&cred_lower) {
+        if trust.direction == "bidirectional" || trust.direction == "inbound" {
+            return true;
+        }
     }
 
     // Unknown relationship: block by default (cross-domain LDAP without trust info is risky)
@@ -188,9 +198,9 @@ mod tests {
     }
 
     #[test]
-    fn child_to_parent_blocked() {
+    fn child_to_parent_valid() {
         let trusts = HashMap::new();
-        assert!(!is_valid_credential_for_domain(
+        assert!(is_valid_credential_for_domain(
             "north.contoso.local",
             "contoso.local",
             &trusts
@@ -198,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_forest_blocked() {
+    fn cross_forest_bidirectional_valid() {
         let mut trusts = HashMap::new();
         trusts.insert(
             "fabrikam.local".to_string(),
@@ -210,6 +220,17 @@ mod tests {
                 sid_filtering: true,
             },
         );
+        assert!(is_valid_credential_for_domain(
+            "contoso.local",
+            "fabrikam.local",
+            &trusts
+        ));
+    }
+
+    #[test]
+    fn cross_forest_no_trust_blocked() {
+        let trusts = HashMap::new();
+        // No trust info at all → blocked
         assert!(!is_valid_credential_for_domain(
             "contoso.local",
             "fabrikam.local",
@@ -228,11 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn child_cred_blocked_for_parent_domain() {
+    fn child_cred_valid_for_parent_domain() {
         let trusts = HashMap::new();
         let creds = vec![make_cred("admin", "north.contoso.local", "P@ss1")];
         let map = HashMap::new();
         let found = find_domain_credential("contoso.local", &creds, &map, &trusts);
-        assert!(found.is_none());
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().domain, "north.contoso.local");
     }
 }

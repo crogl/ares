@@ -84,7 +84,7 @@ pub async fn auto_local_admin_secretsdump(
 
             let mut items = Vec::new();
             for cred in &creds {
-                for (dc_domain, dc_ip) in state.domain_controllers.iter() {
+                for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
                     if is_valid_secretsdump_target(dc_domain, &cred.domain) {
                         let dedup = secretsdump_dedup_key(dc_ip, &cred.domain, &cred.username);
                         if !state.is_processed(DEDUP_SECRETSDUMP, &dedup) {
@@ -135,7 +135,7 @@ pub async fn auto_local_admin_secretsdump(
             for dominated in &state.dominated_domains {
                 let dom = dominated.to_lowercase();
                 // Find parent domain DCs: domains where the child ends with ".{parent}"
-                for (dc_domain, dc_ip) in state.domain_controllers.iter() {
+                for (dc_domain, dc_ip) in state.all_domains_with_dcs().iter() {
                     if is_child_of(&dom, dc_domain) {
                         // Find Administrator NTLM hash from the dominated child domain
                         if let Some(hash) = state.hashes.iter().find(|h| {

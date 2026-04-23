@@ -206,10 +206,42 @@ pub async fn wait_for_completion(
                     None // Continue — waiting for golden ticket
                 }
             } else {
-                // Default: continue until all forests are dominated
+                // Default: continue until all forests are dominated,
+                // then allow a post-exploitation grace period for group/ACL/ADCS
+                // enumeration to complete.
                 let remaining = undominated_forests(state).await;
                 if remaining.is_empty() {
-                    Some("all forests dominated")
+                    // Grace period: continue for 180s after all forests dominated
+                    // to allow post-exploitation automation (group enum, ACL
+                    // discovery, ADCS enumeration) to fire and complete.
+                    // 180s needed because: automations check on 20-60s intervals,
+                    // domain hashes may arrive late, and LLM tasks need time to
+                    // complete LDAP queries.
+                    let inner = state.read().await;
+                    let all_dominated_at = inner.all_forests_dominated_at;
+                    drop(inner);
+                    if let Some(dominated_at) = all_dominated_at {
+                        let grace = Duration::from_secs(180);
+                        let since = dominated_at.elapsed();
+                        if since >= grace {
+                            Some("all forests dominated (post-exploitation complete)")
+                        } else {
+                            debug!(
+                                remaining_secs = (grace - since).as_secs(),
+                                "All forests dominated — post-exploitation grace period"
+                            );
+                            None // Still in grace period
+                        }
+                    } else {
+                        // First time we see all forests dominated — record the timestamp
+                        let mut inner = state.write().await;
+                        inner.all_forests_dominated_at = Some(tokio::time::Instant::now());
+                        drop(inner);
+                        info!(
+                            "All forests dominated — starting 90s post-exploitation grace period"
+                        );
+                        None
+                    }
                 } else {
                     debug!(
                         undominated = ?remaining,

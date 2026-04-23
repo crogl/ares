@@ -22,7 +22,7 @@ fn collect_ldap_signing_work(state: &StateInner) -> Vec<LdapSigningWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("ldap_sign:{}", dc_ip);
         if state.is_processed(DEDUP_LDAP_SIGNING, &dedup_key) {
             continue;

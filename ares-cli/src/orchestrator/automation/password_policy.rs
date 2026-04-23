@@ -23,7 +23,7 @@ fn collect_password_policy_work(state: &StateInner) -> Vec<PasswordPolicyWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("policy:{}", domain.to_lowercase());
         if state.is_processed(DEDUP_PASSWORD_POLICY, &dedup_key) {
             continue;

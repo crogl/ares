@@ -136,15 +136,16 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "rpcclient_command".into(),
-            description: "Execute an rpcclient command against a target.".into(),
+            description: "Execute an rpcclient command against a target. Supports pass-the-hash via the 'hash' parameter.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target": {"type": "string"},
-                    "command": {"type": "string", "description": "rpcclient command (e.g. 'enumdomusers')"},
+                    "command": {"type": "string", "description": "rpcclient command (e.g. 'enumdomusers', 'enumdomgroups', 'querygroupmem <rid>')"},
                     "username": {"type": "string"},
                     "password": {"type": "string"},
-                    "domain": {"type": "string"}
+                    "domain": {"type": "string"},
+                    "hash": {"type": "string", "description": "NTLM hash for pass-the-hash authentication (use instead of password)"}
                 },
                 "required": ["target", "command"]
             }),

@@ -31,13 +31,17 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Domain controller IP address"
                     },
+                    "hashes": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (format: 'lmhash:nthash' or just ':nthash'). Use instead of password."
+                    },
                     "vulnerable": {
                         "type": "boolean",
                         "description": "Only show vulnerable templates. Defaults to true.",
                         "default": true
                     }
                 },
-                "required": ["domain", "username", "password", "dc_ip"]
+                "required": ["domain", "username", "dc_ip"]
             }),
         },
         ToolDefinition {

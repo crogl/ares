@@ -6,12 +6,26 @@
 {% if credential_username %}**Credential:** {{ credential_username }}@{{ credential_domain }}{% if credential_password %} / Password: {{ credential_password }}{% endif %}
 {% endif -%}
 
+{% if technique -%}
+**Technique:** {{ technique }}
+{% endif -%}
 {% if techniques -%}
 **Requested Techniques:**
 {% for t in techniques -%}
 - {{ t }}
 {% endfor -%}
-{% else -%}
+{% endif -%}
+{% if ntlm_hash -%}
+**NTLM Hash (for pass-the-hash):** {{ ntlm_hash }}{% if hash_username %} (user: {{ hash_username }}){% endif %}
+{% endif -%}
+
+{% if instructions -%}
+## Instructions
+
+**IMPORTANT: Follow these instructions exactly. Do NOT perform generic scanning — execute only the specific technique described below.**
+
+{{ instructions }}
+{% elif not techniques -%}
 Perform a comprehensive reconnaissance scan of the target.
 {% endif -%}
 

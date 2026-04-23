@@ -22,7 +22,7 @@ fn collect_ntlmv1_work(state: &StateInner) -> Vec<NtlmV1Work> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.domain_controllers {
+    for (domain, dc_ip) in &state.all_domains_with_dcs() {
         let dedup_key = format!("ntlmv1:{}", dc_ip);
         if state.is_processed(DEDUP_NTLMV1_DOWNGRADE, &dedup_key) {
             continue;
