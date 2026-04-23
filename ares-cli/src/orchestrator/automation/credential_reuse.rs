@@ -36,6 +36,7 @@ fn is_reuse_candidate(username: &str) -> bool {
         || u.contains("svc")
         || u.contains("admin")
         || u.contains("sql")
+        || username == username.to_uppercase() // Machine accounts
 }
 
 /// Check if two domains should be skipped for cross-domain reuse (same or parent/child).
