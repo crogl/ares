@@ -337,12 +337,20 @@ pub async fn rpcclient_command(args: &Value) -> Result<ToolOutput> {
     if null_session {
         cmd = cmd.args(["-U", "", "-N"]);
     } else if let Some(ntlm_hash) = hash {
-        // Pass-the-hash: use --pw-nt-hash and supply the NTLM hash as the password
+        // Pass-the-hash: use --pw-nt-hash and supply the NTLM hash as the password.
+        // rpcclient --pw-nt-hash expects only the NT hash (32 hex chars), not LM:NT.
+        // If the hash is in LM:NT format (e.g. "aad3b435...:2e993405..."), extract
+        // just the NT part (after the colon).
+        let nt_hash = if ntlm_hash.contains(':') {
+            ntlm_hash.rsplit(':').next().unwrap_or(ntlm_hash)
+        } else {
+            ntlm_hash
+        };
         let domain = optional_str(args, "domain");
         let username = optional_str(args, "username").unwrap_or("Administrator");
         let user_spec = match domain {
-            Some(d) => format!("{d}/{username}%{ntlm_hash}"),
-            None => format!("{username}%{ntlm_hash}"),
+            Some(d) => format!("{d}/{username}%{nt_hash}"),
+            None => format!("{username}%{nt_hash}"),
         };
         cmd = cmd.flag("-U", user_spec).arg("--pw-nt-hash");
     } else {

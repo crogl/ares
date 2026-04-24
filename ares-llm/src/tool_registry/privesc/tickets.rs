@@ -140,6 +140,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Username to embed in the ticket. Defaults to Administrator.",
                         "default": "Administrator"
                     },
+                    "extra_sid": {
+                        "type": "string",
+                        "description": "Extra SID to embed (e.g. '<target_sid>-519' for Enterprise Admins). Use for child-to-parent escalation within the same forest. OMIT for cross-forest trusts — SID filtering blocks RIDs < 1000."
+                    },
                     "duration": {
                         "type": "integer",
                         "description": "Ticket duration in days. Defaults to 3650.",

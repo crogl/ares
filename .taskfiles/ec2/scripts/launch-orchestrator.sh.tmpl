@@ -25,6 +25,7 @@ if [ -n "$_blue_model" ] && [ "$_blue_model" = "${_blue_model#__}" ]; then
 fi
 export ARES_DEPLOYMENT='__ARES_DEPLOYMENT__'
 export ARES_CONFIG=/etc/ares/config.yaml
+export ARES_MAX_CONCURRENT_TASKS=16
 _otel_endpoint='__OTEL_TRACES_ENDPOINT__'
 if [ -n "$_otel_endpoint" ] && [ "$_otel_endpoint" = "${_otel_endpoint#__}" ]; then
   export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="$_otel_endpoint"

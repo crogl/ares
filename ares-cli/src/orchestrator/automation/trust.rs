@@ -347,13 +347,22 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     // Dispatch child-to-parent exploit task.  The LLM prompt
                     // offers raiseChild (automated) and manual ExtraSid golden
                     // ticket creation as alternatives.
+                    // `dc_ip` is the child DC (for trust key extraction).
+                    // `target` should be the parent DC (for secretsdump after forging ticket).
+                    let parent_dc_ip = {
+                        let s = dispatcher.state.read().await;
+                        s.domain_controllers
+                            .get(&parent_domain.to_lowercase())
+                            .cloned()
+                            .unwrap_or_else(|| dc_ip.clone())
+                    };
                     let mut payload = json!({
                         "technique": "create_inter_realm_ticket",
                         "vuln_type": "child_to_parent",
                         "domain": child_domain,
                         "trusted_domain": parent_domain,
                         "target_domain": parent_domain,
-                        "target": &dc_ip,
+                        "target": &parent_dc_ip,
                         "dc_ip": dc_ip,
                         "vuln_id": &vuln_id,
                     });

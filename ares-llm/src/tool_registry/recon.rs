@@ -117,18 +117,22 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "ldap_search".into(),
-            description: "Execute an LDAP search query against a domain controller.".into(),
+            description: "Execute an LDAP search query against a domain controller. When authenticating with credentials from a different domain (e.g. child domain cred against parent DC), set bind_domain to the credential's domain.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "target": {"type": "string", "description": "DC IP or hostname"},
-                    "domain": {"type": "string"},
+                    "domain": {"type": "string", "description": "Target domain (used for LDAP base DN)"},
                     "username": {"type": "string"},
                     "password": {"type": "string"},
                     "filter": {"type": "string", "description": "LDAP filter (e.g. '(objectClass=user)')"},
                     "attributes": {
                         "type": "string",
                         "description": "Comma-separated attributes to retrieve"
+                    },
+                    "bind_domain": {
+                        "type": "string",
+                        "description": "Domain for LDAP bind DN (user@bind_domain). Use when credential domain differs from target domain (e.g. child-domain cred authenticating to parent DC). If omitted, uses 'domain'."
                     }
                 },
                 "required": ["target", "domain", "filter"]

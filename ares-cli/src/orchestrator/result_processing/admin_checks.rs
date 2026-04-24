@@ -236,6 +236,16 @@ pub(crate) async fn detect_and_upgrade_admin_credentials(text: &str, dispatcher:
                 pwned_host = ?pwned_ip,
                 "Credential upgraded to admin -- dispatching priority secretsdump"
             );
+            // Mark the host as owned so automations (lsassy_dump, etc.) can fire
+            if let Some(ref ip) = pwned_ip {
+                if let Err(e) = dispatcher
+                    .state
+                    .mark_host_owned(&dispatcher.queue, ip)
+                    .await
+                {
+                    warn!(err = %e, ip = %ip, "Failed to mark host as owned");
+                }
+            }
             create_admin_upgrade_timeline_event(dispatcher, &username, &domain).await;
             let work: Vec<(String, ares_core::models::Credential)> = {
                 let state = dispatcher.state.read().await;

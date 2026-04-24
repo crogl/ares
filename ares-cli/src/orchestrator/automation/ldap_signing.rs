@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -84,6 +84,21 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     "password": item.credential.password,
                     "domain": item.credential.domain,
                 },
+                "instructions": concat!(
+                    "Check whether LDAP signing is enforced on this Domain Controller.\n\n",
+                    "Use ldap_search or nxc_ldap_command to test LDAP binding. ",
+                    "Try an unsigned LDAP bind (simple bind without signing). ",
+                    "If the bind succeeds without signing, LDAP signing is NOT enforced.\n\n",
+                    "Alternatively, use nxc_smb_command with '--gen-relay-list' or check ",
+                    "the ms-DS-RequiredDomainBitmask / LDAPServerIntegrity registry policy.\n\n",
+                    "IMPORTANT: If LDAP signing is NOT enforced (bind succeeds without signing), ",
+                    "you MUST report this as a vulnerability:\n",
+                    "  vuln_type: 'ldap_signing_disabled'\n",
+                    "  target_ip: the DC IP\n",
+                    "  domain: the domain\n",
+                    "  details: {\"signing_required\": false, \"channel_binding\": false}\n\n",
+                    "If LDAP signing IS enforced, report finding with finding_type='hardened'."
+                ),
             });
             if cross_domain {
                 payload["bind_domain"] = json!(item.credential.domain);
@@ -91,7 +106,7 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
             let priority = dispatcher.effective_priority("ldap_signing");
             match dispatcher
-                .throttled_submit("recon", "recon", payload, priority)
+                .force_submit("recon", "recon", payload, priority)
                 .await
             {
                 Ok(Some(task_id)) => {
@@ -111,9 +126,53 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_LDAP_SIGNING, &item.dedup_key)
                         .await;
+
+                    // Register ldap_signing_disabled vulnerability proactively so
+                    // downstream automations (KrbRelayUp, NTLM relay) can fire
+                    // without waiting for the agent's report_finding callback
+                    // (which only logs and does NOT populate discovered_vulnerabilities).
+                    let vuln = ares_core::models::VulnerabilityInfo {
+                        vuln_id: format!("ldap_signing_{}", item.dc_ip.replace('.', "_")),
+                        vuln_type: "ldap_signing_disabled".to_string(),
+                        target: item.dc_ip.clone(),
+                        discovered_by: "auto_ldap_signing".to_string(),
+                        discovered_at: chrono::Utc::now(),
+                        details: {
+                            let mut d = std::collections::HashMap::new();
+                            d.insert("target_ip".to_string(), json!(item.dc_ip));
+                            d.insert("domain".to_string(), json!(item.domain));
+                            d.insert("signing_required".to_string(), json!(false));
+                            d.insert("channel_binding".to_string(), json!(false));
+                            d
+                        },
+                        recommended_agent: "credential_access".to_string(),
+                        priority: dispatcher.effective_priority("ldap_signing"),
+                    };
+
+                    match dispatcher
+                        .state
+                        .publish_vulnerability_with_strategy(
+                            &dispatcher.queue,
+                            vuln,
+                            Some(&dispatcher.config.strategy),
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                domain = %item.domain,
+                                dc = %item.dc_ip,
+                                "LDAP signing disabled — vulnerability registered for KrbRelayUp"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(err = %e, dc = %item.dc_ip, "Failed to publish LDAP signing vulnerability");
+                        }
+                    }
                 }
                 Ok(None) => {
-                    debug!(domain = %item.domain, "LDAP signing check deferred");
+                    info!(domain = %item.domain, dc = %item.dc_ip, "LDAP signing check deferred by throttler");
                 }
                 Err(e) => {
                     warn!(err = %e, domain = %item.domain, "Failed to dispatch LDAP signing check");

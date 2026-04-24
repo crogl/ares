@@ -129,7 +129,7 @@ impl Throttler {
 
         if llm_count >= max_tasks {
             let role_count = self.tracker.count_for_role(target_role).await;
-            let min_per_role = 1_usize; // matches get_min_slots_per_role default
+            let min_per_role = self.config.max_tasks_per_role;
             if role_count < min_per_role {
                 info!(
                     llm_count,

@@ -215,6 +215,10 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                     "you MUST use pass-the-hash. Do NOT attempt LDAP simple bind with empty password.\n",
                     "  - Use ldap_search with the hash if it accepts one, OR\n",
                     "  - Use rpcclient_command with the hash parameter to query DACLs via RPC.\n\n",
+                    "CROSS-DOMAIN AUTH: If the credential domain differs from the target domain, ",
+                    "you MUST pass bind_domain=<credential_domain> to ldap_search. ",
+                    "Check the 'bind_domain' field in the task payload — if present, always pass it ",
+                    "to ldap_search so the LDAP bind uses user@bind_domain.\n\n",
                     "If a password IS provided, use ldap_search with filter ",
                     "'(objectCategory=*)' and request the nTSecurityDescriptor attribute.\n\n",
                     "For each dangerous ACE found (GenericAll, WriteDacl, ForceChangePassword, ",
@@ -538,6 +542,7 @@ mod tests {
             .push(make_credential("svcacct", "Svc!Pass1", "fabrikam.local")); // pragma: allowlist secret
         state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:cred".into());
         state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:hash".into());
+        state.mark_processed(DEDUP_ACL_DISCOVERY, "acl_disc:contoso.local:trust".into());
         let work = collect_acl_discovery_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].domain, "fabrikam.local");

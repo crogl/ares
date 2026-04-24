@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -98,13 +98,27 @@ pub async fn auto_lsassy_dump(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
         }
 
         if !dispatcher.is_technique_allowed("lsassy_dump") {
+            info!("lsassy_dump technique not allowed — skipping");
             continue;
         }
 
         let work = {
             let state = dispatcher.state.read().await;
+            let owned_count = state.hosts.iter().filter(|h| h.owned).count();
+            let cred_count = state.credentials.len();
+            if owned_count > 0 || cred_count > 0 {
+                info!(
+                    owned_hosts = owned_count,
+                    credentials = cred_count,
+                    "lsassy_dump tick: checking for work"
+                );
+            }
             collect_lsassy_work(&state)
         };
+
+        if !work.is_empty() {
+            info!(count = work.len(), "lsassy_dump work items collected");
+        }
 
         for item in work {
             let payload = json!({
@@ -121,7 +135,7 @@ pub async fn auto_lsassy_dump(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
 
             let priority = dispatcher.effective_priority("lsassy_dump");
             match dispatcher
-                .throttled_submit("credential_access", "credential_access", payload, priority)
+                .force_submit("credential_access", "credential_access", payload, priority)
                 .await
             {
                 Ok(Some(task_id)) => {
@@ -142,7 +156,7 @@ pub async fn auto_lsassy_dump(dispatcher: Arc<Dispatcher>, mut shutdown: watch::
                         .await;
                 }
                 Ok(None) => {
-                    debug!(host = %item.host_ip, "LSASS dump deferred");
+                    info!(host = %item.host_ip, "LSASS dump deferred by throttler");
                 }
                 Err(e) => {
                     warn!(err = %e, host = %item.host_ip, "Failed to dispatch LSASS dump");

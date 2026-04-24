@@ -351,6 +351,51 @@ impl SharedState {
 
         Ok(())
     }
+
+    /// Mark a host as owned (admin access confirmed).
+    ///
+    /// This persists the owned flag to both in-memory state and Redis so
+    /// that automations like `auto_lsassy_dump` and `credential_expansion`
+    /// can react to host ownership changes.
+    pub async fn mark_host_owned(
+        &self,
+        queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
+        ip: &str,
+    ) -> Result<()> {
+        let (host_json, op_id) = {
+            let mut state = self.inner.write().await;
+            let host = state.hosts.iter_mut().find(|h| h.ip == ip);
+            if let Some(h) = host {
+                if h.owned {
+                    return Ok(()); // already owned
+                }
+                h.owned = true;
+                tracing::info!(ip = %ip, hostname = %h.hostname, "Host marked as owned");
+                let json = serde_json::to_string(h).unwrap_or_default();
+                (json, state.operation_id.clone())
+            } else {
+                return Ok(());
+            }
+        };
+
+        // Persist to Redis
+        let host_key = format!("{}:{}:{}", state::KEY_PREFIX, op_id, state::KEY_HOSTS);
+        let mut conn = queue.connection();
+        let entries: Vec<String> = redis::AsyncCommands::lrange(&mut conn, &host_key, 0, -1)
+            .await
+            .unwrap_or_default();
+        for (idx, entry) in entries.iter().enumerate() {
+            if let Ok(existing) = serde_json::from_str::<Host>(entry) {
+                if existing.ip == ip {
+                    let _: Result<(), _> =
+                        redis::AsyncCommands::lset(&mut conn, &host_key, idx as isize, &host_json)
+                            .await;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]

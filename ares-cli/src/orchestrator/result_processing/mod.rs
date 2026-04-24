@@ -53,7 +53,7 @@ pub async fn process_completed_task(
     let result = &completed.result;
 
     // Extract task-level metadata from pending_tasks before complete_task removes it.
-    let (cred_key, task_domain) = {
+    let (cred_key, task_domain, task_target_ip) = {
         let state = dispatcher.state.read().await;
         let task = state.pending_tasks.get(task_id.as_str());
         let ck = task
@@ -64,7 +64,11 @@ pub async fn process_completed_task(
             .and_then(|t| t.params.get("domain"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        (ck, td)
+        let tip = task
+            .and_then(|t| t.params.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        (ck, td, tip)
     };
 
     {
@@ -118,9 +122,24 @@ pub async fn process_completed_task(
         let default_domain = if let Some(ref td) = task_domain {
             td.clone()
         } else {
-            get_default_domain(dispatcher).await
+            // Resolve domain from the task's target IP (e.g. secretsdump against a
+            // specific DC). Falls back to state.domains.first() only as last resort.
+            resolve_domain_from_ip(dispatcher, task_target_ip.as_deref()).await
         };
         extract_from_raw_text(payload, dispatcher, &default_domain).await;
+    }
+
+    // Mark host as owned when a credential_access task succeeds and we have the target IP.
+    // This triggers downstream automations (lsassy_dump, credential_expansion).
+    if result.success {
+        if let Some(ref ip) = task_target_ip {
+            if task_id.starts_with("credential_access_") {
+                let _ = dispatcher
+                    .state
+                    .mark_host_owned(&dispatcher.queue, ip)
+                    .await;
+            }
+        }
     }
 
     // Domain SID extraction: scan raw text for S-1-5-21-... patterns (from secretsdump).
@@ -192,9 +211,31 @@ pub async fn process_completed_task(
     let _ = dispatcher.notify_state_update().await;
 }
 
-/// Get the default domain from state (first domain, or empty string).
-async fn get_default_domain(dispatcher: &Arc<Dispatcher>) -> String {
+/// Resolve the domain for hash/credential attribution from the task's target IP.
+///
+/// Priority:
+///   1. Match target_ip to a known host's domain (hostname suffix → domain)
+///   2. Match target_ip to a domain controller entry
+///   3. Fall back to state.domains.first()
+async fn resolve_domain_from_ip(dispatcher: &Arc<Dispatcher>, target_ip: Option<&str>) -> String {
     let state = dispatcher.state.read().await;
+    if let Some(ip) = target_ip {
+        // Check domain_controllers map first — most reliable
+        for (domain, dc_ip) in &state.domain_controllers {
+            if dc_ip == ip {
+                return domain.clone();
+            }
+        }
+        // Derive domain from FQDN hostname (e.g. winterfell.north.sevenkingdoms.local
+        // → north.sevenkingdoms.local)
+        for host in &state.hosts {
+            if host.ip == ip {
+                if let Some(dot) = host.hostname.find('.') {
+                    return host.hostname[dot + 1..].to_string();
+                }
+            }
+        }
+    }
     state.domains.first().cloned().unwrap_or_default()
 }
 

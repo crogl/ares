@@ -29,7 +29,18 @@ fn collect_group_enum_work(state: &StateInner) -> Vec<GroupEnumWork> {
 
     let mut items = Vec::new();
 
-    for (domain, dc_ip) in &state.all_domains_with_dcs() {
+    let all_dcs = state.all_domains_with_dcs();
+    if all_dcs.is_empty() {
+        return Vec::new();
+    }
+    debug!(
+        domains = ?all_dcs.iter().map(|(d,_)| d.as_str()).collect::<Vec<_>>(),
+        trusted = ?state.trusted_domains.keys().collect::<Vec<_>>(),
+        creds = state.credentials.len(),
+        hashes = state.hashes.len(),
+        "Group enum state check"
+    );
+    for (domain, dc_ip) in &all_dcs {
         // Use separate dedup keys for cred vs hash attempts so a failed
         // password-based attempt (e.g., mislabeled credential domain)
         // doesn't permanently block the hash-based path.
@@ -87,6 +98,13 @@ fn collect_group_enum_work(state: &StateInner) -> Vec<GroupEnumWork> {
 
         // Need at least a credential or an NTLM hash
         if cred.is_none() && ntlm_hash.is_none() {
+            debug!(
+                domain = %domain,
+                cred_dedup = state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_cred),
+                trust_dedup = state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_trust),
+                hash_dedup = state.is_processed(DEDUP_GROUP_ENUMERATION, &dedup_key_hash),
+                "Group enum: no credential/hash found for domain"
+            );
             continue;
         }
 
@@ -148,6 +166,13 @@ pub async fn auto_group_enumeration(
             collect_group_enum_work(&state)
         };
 
+        if !work.is_empty() {
+            info!(
+                count = work.len(),
+                domains = ?work.iter().map(|w| w.domain.as_str()).collect::<Vec<_>>(),
+                "Group enumeration work items collected"
+            );
+        }
         for item in work {
             // When PTH hash is available, use the hash user's identity for the target domain
             // instead of a cross-domain credential that will fail LDAP simple bind.
@@ -187,12 +212,17 @@ pub async fn auto_group_enumeration(
                     "Enumerate ALL security groups in this domain.\n\n",
                     "AUTHENTICATION: If the password field is EMPTY and an NTLM hash is provided, ",
                     "you MUST use pass-the-hash. Do NOT attempt LDAP simple bind with empty password.\n",
-                    "  - Use the rpcclient_command tool: rpcclient_command(target=dc_ip, username=user, ",
-                    "domain=domain, command='enumdomgroups') — then for each group RID: ",
-                    "'querygroupmem <rid>' and 'queryuser <rid>' to resolve members.\n",
-                    "  - Or use ldap_search with the hash if supported.\n\n",
+                    "  Use rpcclient_command with the hash parameter: rpcclient_command(target=dc_ip, ",
+                    "username=user, domain=domain, hash=<ntlm_hash>, command='enumdomgroups') — ",
+                    "then for each group RID: 'querygroupmem <rid>' and 'queryuser <rid>' to resolve members.\n",
+                    "  IMPORTANT: Pass the hash via the 'hash' parameter, NOT as the password.\n\n",
                     "If a password IS provided, use ldap_search with filter (objectCategory=group) ",
                     "to enumerate groups, members, and Foreign Security Principals.\n\n",
+                    "CROSS-DOMAIN AUTH: If the credential domain differs from the target domain ",
+                    "(e.g. credential from child.domain.local querying parent domain.local), ",
+                    "you MUST pass bind_domain=<credential_domain> to ldap_search. ",
+                    "Check the 'bind_domain' field in the task payload — if present, always pass it ",
+                    "to ldap_search so the LDAP bind uses user@bind_domain while querying the target domain.\n\n",
                     "For EACH group found, report it as a vulnerability:\n",
                     "  vuln_type: 'group_enumerated'\n",
                     "  target: the group sAMAccountName\n",
@@ -223,7 +253,7 @@ pub async fn auto_group_enumeration(
 
             let priority = dispatcher.effective_priority("group_enumeration");
             match dispatcher
-                .throttled_submit("recon", "recon", payload, priority)
+                .force_submit("recon", "recon", payload, priority)
                 .await
             {
                 Ok(Some(task_id)) => {
@@ -245,7 +275,7 @@ pub async fn auto_group_enumeration(
                         .await;
                 }
                 Ok(None) => {
-                    debug!(domain = %item.domain, "Group enumeration deferred");
+                    info!(domain = %item.domain, dc = %item.dc_ip, "Group enumeration deferred by throttler");
                 }
                 Err(e) => {
                     warn!(err = %e, domain = %item.domain, "Failed to dispatch group enumeration");
@@ -543,6 +573,26 @@ mod tests {
         let work = collect_group_enum_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "localadmin");
+    }
+
+    #[test]
+    fn collect_child_cred_falls_back_for_parent_domain() {
+        let mut state = StateInner::new("test-op".into());
+        state
+            .domain_controllers
+            .insert("contoso.local".into(), "192.168.58.10".into());
+        // Child-domain cred should work for parent-domain via trust
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "north.contoso.local")); // pragma: allowlist secret
+        let work = collect_group_enum_work(&state);
+        assert_eq!(
+            work.len(),
+            1,
+            "child-domain cred should fall back for parent"
+        );
+        assert_eq!(work[0].dedup_key, "group_enum:contoso.local:trust");
+        assert_eq!(work[0].credential.domain, "north.contoso.local");
     }
 
     #[tokio::test]

@@ -248,6 +248,9 @@ impl StateInner {
 
         // Priority 2: cross-forest trusted domain cred (bidirectional trust)
         // Check if any credential's domain has a trust with the target domain.
+        // Also falls back to discovered-domain heuristic: if both domains have
+        // known DCs in the same operation, they are likely in a trust relationship.
+        // LDAP bind will simply fail if there is no actual trust.
         for cred in &self.credentials {
             if cred.password.is_empty()
                 || self.is_credential_quarantined(&cred.username, &cred.domain)
@@ -258,15 +261,26 @@ impl StateInner {
             if cred_dom == target {
                 continue; // same domain, not a trust fallback
             }
-            // Check: does the cred's forest root trust the target's forest root?
-            // The target might trust the cred's domain (or its forest root).
             let cred_forest = self.forest_root_of(&cred_dom);
             let target_forest = self.forest_root_of(&target);
             if cred_forest != target_forest {
-                // Check if there's a trust between these forests
+                // Explicit trust relationship known
                 if self.trusted_domains.contains_key(&target_forest)
                     || self.trusted_domains.contains_key(&cred_forest)
                 {
+                    return Some(cred.clone());
+                }
+                // Heuristic: both forests have DCs in this engagement — likely
+                // trust-related. LDAP bind will fail harmlessly if not.
+                let target_has_dc = self.domain_controllers.keys().any(|d| {
+                    let d = d.to_lowercase();
+                    d == target_forest || self.forest_root_of(&d) == target_forest
+                });
+                let cred_has_dc = self.domain_controllers.keys().any(|d| {
+                    let d = d.to_lowercase();
+                    d == cred_forest || self.forest_root_of(&d) == cred_forest
+                });
+                if target_has_dc && cred_has_dc {
                     return Some(cred.clone());
                 }
             }

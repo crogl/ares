@@ -30,6 +30,12 @@ pub(crate) fn insert_credential_context(ctx: &mut Context, payload: &Value) {
             );
         }
     }
+    // Surface bind_domain so templates can instruct the LLM to use it
+    if let Some(bd) = payload.get("bind_domain").and_then(|v| v.as_str()) {
+        if !bd.is_empty() {
+            ctx.insert("bind_domain", bd);
+        }
+    }
 }
 
 /// Insert formatted state context into a Tera context.

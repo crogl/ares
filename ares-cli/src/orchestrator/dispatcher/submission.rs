@@ -92,6 +92,21 @@ impl Dispatcher {
         }
     }
 
+    /// Submit bypassing the throttle soft/hard cap.  Used by automations
+    /// whose tasks are small (single LDAP query) and must not be blocked by
+    /// long-running initial recon.  Still routes through `do_submit` which
+    /// respects the per-role semaphore.
+    pub async fn force_submit(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<Option<String>> {
+        self.do_submit(task_type, target_role, payload, priority)
+            .await
+    }
+
     /// Direct submit (bypasses throttle). Returns task_id.
     ///
     /// Routes the task to the Rust LLM agent loop. Prefers `target_role`

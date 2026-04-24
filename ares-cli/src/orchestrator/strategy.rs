@@ -308,7 +308,7 @@ fn fast_weights() -> HashMap<String, i32> {
         ("dfs_coercion", 5),
         ("petitpotam_unauth", 4),
         ("winrm_lateral", 5),
-        ("group_enumeration", 3),
+        ("group_enumeration", 2),
         ("localuser_spray", 4),
         ("krbrelayup", 5),
         ("searchconnector_coercion", 5),
@@ -324,7 +324,7 @@ fn fast_weights() -> HashMap<String, i32> {
         ("dacl_abuse", 2),
         ("smbclient_enum", 4),
         ("cross_forest_enum", 3),
-        ("acl_discovery", 3),
+        ("acl_discovery", 2),
     ]
     .into_iter()
     .map(|(k, v)| (k.to_string(), v))

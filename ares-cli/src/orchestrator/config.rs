@@ -181,7 +181,7 @@ impl OrchestratorConfig {
             .ok()
             .or_else(|| detect_local_ip(target_ips.first().map(|s| s.as_str())));
 
-        let max_concurrent_tasks = parse_env("ARES_MAX_CONCURRENT_TASKS", 8);
+        let max_concurrent_tasks = parse_env("ARES_MAX_CONCURRENT_TASKS", 12);
         let heartbeat_interval_secs = parse_env("ARES_HEARTBEAT_INTERVAL_SECS", 30);
         let heartbeat_timeout_secs = parse_env("ARES_HEARTBEAT_TIMEOUT_SECS", 120);
         let result_poll_interval_ms = parse_env("ARES_RESULT_POLL_INTERVAL_MS", 500);
@@ -338,7 +338,7 @@ mod tests {
         std::env::set_var("ARES_OPERATION_ID", "test-op-1");
         let c = OrchestratorConfig::from_env().unwrap();
         assert_eq!(c.operation_id, "test-op-1");
-        assert_eq!(c.max_concurrent_tasks, 8);
+        assert_eq!(c.max_concurrent_tasks, 12);
         assert_eq!(c.heartbeat_interval, Duration::from_secs(30));
         assert!(c.target_ips.is_empty());
         assert!(c.initial_credential.is_none());
