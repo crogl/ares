@@ -374,7 +374,23 @@ impl SharedState {
                 let json = serde_json::to_string(h).unwrap_or_default();
                 (json, state.operation_id.clone())
             } else {
-                return Ok(());
+                // Host not yet in state — create a minimal entry so downstream
+                // automations (lsassy_dump, credential_expansion) can fire.
+                // This happens when secretsdump succeeds before host discovery.
+                let new_host = Host {
+                    ip: ip.to_string(),
+                    hostname: ip.to_string(), // will be enriched by later discovery
+                    os: String::new(),
+                    roles: Vec::new(),
+                    services: Vec::new(),
+                    is_dc: state.domain_controllers.values().any(|dc| dc == ip),
+                    owned: true,
+                };
+                tracing::info!(ip = %ip, "Host not in state — creating owned entry");
+                let json = serde_json::to_string(&new_host).unwrap_or_default();
+                let op_id = state.operation_id.clone();
+                state.hosts.push(new_host);
+                (json, op_id)
             }
         };
 
@@ -384,15 +400,22 @@ impl SharedState {
         let entries: Vec<String> = redis::AsyncCommands::lrange(&mut conn, &host_key, 0, -1)
             .await
             .unwrap_or_default();
+        let mut found = false;
         for (idx, entry) in entries.iter().enumerate() {
             if let Ok(existing) = serde_json::from_str::<Host>(entry) {
                 if existing.ip == ip {
                     let _: Result<(), _> =
                         redis::AsyncCommands::lset(&mut conn, &host_key, idx as isize, &host_json)
                             .await;
+                    found = true;
                     break;
                 }
             }
+        }
+        if !found {
+            // New host entry — append to Redis list
+            let _: Result<(), _> =
+                redis::AsyncCommands::rpush(&mut conn, &host_key, &host_json).await;
         }
         Ok(())
     }

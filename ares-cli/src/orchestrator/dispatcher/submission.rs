@@ -223,6 +223,13 @@ impl Dispatcher {
         if let Some(ref key) = cred_key {
             task_params.insert("credential_key".to_string(), serde_json::json!(key));
         }
+        // Propagate task metadata so process_completed_task can access them
+        // (mark_host_owned needs target_ip, domain attribution needs domain).
+        for key in &["target_ip", "domain"] {
+            if let Some(val) = payload.get(*key) {
+                task_params.insert(key.to_string(), val.clone());
+            }
+        }
         let task_info = ares_core::models::TaskInfo {
             task_id: task_id.clone(),
             task_type: task_type.to_string(),
