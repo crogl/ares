@@ -110,6 +110,51 @@ pub async fn auto_ntlmv1_downgrade(
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_NTLMV1_DOWNGRADE, &item.dedup_key)
                         .await;
+
+                    // Register ntlmv1_downgrade vulnerability proactively so it
+                    // appears in reports without waiting for the agent's
+                    // report_finding callback (which only logs).
+                    let vuln = ares_core::models::VulnerabilityInfo {
+                        vuln_id: format!("ntlmv1_{}", item.dc_ip.replace('.', "_")),
+                        vuln_type: "ntlmv1_downgrade".to_string(),
+                        target: item.dc_ip.clone(),
+                        discovered_by: "auto_ntlmv1_downgrade".to_string(),
+                        discovered_at: chrono::Utc::now(),
+                        details: {
+                            let mut d = std::collections::HashMap::new();
+                            d.insert("target_ip".to_string(), json!(item.dc_ip));
+                            d.insert("domain".to_string(), json!(item.domain));
+                            d.insert(
+                                "description".to_string(),
+                                json!("DC allows NTLMv1 authentication (LmCompatibilityLevel < 3). NTLMv1 hashes are trivially crackable."),
+                            );
+                            d
+                        },
+                        recommended_agent: "credential_access".to_string(),
+                        priority: dispatcher.effective_priority("ntlmv1_downgrade"),
+                    };
+
+                    match dispatcher
+                        .state
+                        .publish_vulnerability_with_strategy(
+                            &dispatcher.queue,
+                            vuln,
+                            Some(&dispatcher.config.strategy),
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                domain = %item.domain,
+                                dc = %item.dc_ip,
+                                "NTLMv1 downgrade — vulnerability registered"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(err = %e, dc = %item.dc_ip, "Failed to publish NTLMv1 downgrade vulnerability");
+                        }
+                    }
                 }
                 Ok(None) => {
                     debug!(domain = %item.domain, "NTLMv1 downgrade check deferred");

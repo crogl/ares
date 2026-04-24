@@ -57,10 +57,15 @@ fn handle_report_finding_callback() {
     };
     let result = handle_builtin_callback(&call).unwrap();
     match result {
-        CallbackResult::Continue(msg) => {
-            assert!(msg.contains("smb_signing_disabled"));
+        CallbackResult::Finding {
+            response,
+            discovery,
+        } => {
+            assert!(response.contains("smb_signing_disabled"));
+            let vulns = discovery["vulnerabilities"].as_array().unwrap();
+            assert_eq!(vulns[0]["vuln_type"], "smb_signing_disabled");
         }
-        _ => panic!("Expected Continue"),
+        _ => panic!("Expected Finding"),
     }
 }
 

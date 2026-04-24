@@ -244,6 +244,81 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 discoveries["credentials"] = Value::Array(creds);
             }
         }
+        "password_policy" => {
+            // Extract password policy details as a vulnerability/info finding.
+            // netexec smb --pass-pol output includes lockout threshold, min length, etc.
+            let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+            let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            if !output.is_empty() && !domain.is_empty() {
+                // Parse lockout threshold from the output
+                let lockout_threshold = output
+                    .lines()
+                    .find(|l| l.to_lowercase().contains("account lockout threshold"))
+                    .and_then(|l| l.split(':').next_back().map(|s| s.trim().to_string()));
+                let min_length = output
+                    .lines()
+                    .find(|l| l.to_lowercase().contains("minimum password length"))
+                    .and_then(|l| l.split(':').next_back().map(|s| s.trim().to_string()));
+                let mut details = serde_json::Map::new();
+                details.insert("domain".into(), json!(domain));
+                details.insert("target_ip".into(), json!(target));
+                if let Some(ref lt) = lockout_threshold {
+                    details.insert("lockout_threshold".into(), json!(lt));
+                }
+                if let Some(ref ml) = min_length {
+                    details.insert("min_password_length".into(), json!(ml));
+                }
+                details.insert(
+                    "description".into(),
+                    json!(format!("Password policy enumerated for {domain}")),
+                );
+                discoveries["vulnerabilities"] = json!([{
+                    "vuln_id": format!("password_policy_{}", domain.replace('.', "_")),
+                    "vuln_type": "password_policy",
+                    "target": target,
+                    "details": details,
+                }]);
+            }
+        }
+        "evil_winrm" => {
+            // Detect successful WinRM connection from evil-winrm output.
+            // A successful connection typically shows "Evil-WinRM shell" or
+            // output from executed commands (e.g., "whoami" returning a username).
+            let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            if output.contains("Evil-WinRM")
+                || output.contains("\\")  // whoami output like DOMAIN\user
+                || output.contains("PS >")
+            {
+                discoveries["vulnerabilities"] = json!([{
+                    "vuln_id": format!("winrm_access_{}", target.replace('.', "_")),
+                    "vuln_type": "winrm_access",
+                    "target": target,
+                    "details": {
+                        "description": format!("WinRM access confirmed on {target}"),
+                        "target_ip": target,
+                    },
+                }]);
+            }
+        }
+        "xfreerdp" => {
+            // Detect successful RDP authentication from xfreerdp output.
+            let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
+            // xfreerdp success: shows "Authentication only" or specific success patterns
+            let success = output.contains("Authentication only, exit status 0")
+                || (output.contains("connected to") && !output.contains("ERRCONNECT"))
+                || output.contains("FREERDP_CB_SESSION_STARTED");
+            if success {
+                discoveries["vulnerabilities"] = json!([{
+                    "vuln_id": format!("rdp_access_{}", target.replace('.', "_")),
+                    "vuln_type": "rdp_access",
+                    "target": target,
+                    "details": {
+                        "description": format!("RDP access confirmed on {target}"),
+                        "target_ip": target,
+                    },
+                }]);
+            }
+        }
         _ => {}
     }
 

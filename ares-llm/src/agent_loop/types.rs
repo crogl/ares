@@ -40,6 +40,12 @@ pub enum CallbackResult {
     RequestAssistance { issue: String, context: String },
     /// Callback processed, continue the loop with this response.
     Continue(String),
+    /// Finding reported — continue the loop and inject a structured discovery
+    /// (vulnerability) into the discoveries collection so it reaches reports.
+    Finding {
+        response: String,
+        discovery: serde_json::Value,
+    },
 }
 
 /// Trait for providing custom callback handlers to the agent loop.

@@ -573,6 +573,13 @@ pub async fn run_agent_loop(
                                 }
                                 messages.push(tr);
                             }
+                            Ok(CallbackResult::Finding {
+                                response,
+                                discovery,
+                            }) => {
+                                all_discoveries.push(discovery);
+                                messages.push(ChatMessage::tool_result(&call_id, &response));
+                            }
                             Err(e) => {
                                 let tr = ChatMessage::tool_result(
                                     &call_id,
@@ -647,6 +654,13 @@ pub async fn run_agent_loop(
                             }
                             messages.push(tr);
                         }
+                        Ok(CallbackResult::Finding {
+                            response,
+                            discovery,
+                        }) => {
+                            all_discoveries.push(discovery);
+                            messages.push(ChatMessage::tool_result(&call.id, &response));
+                        }
                         Err(e) => {
                             let tr =
                                 ChatMessage::tool_result(&call.id, format!("Callback error: {e}"));
@@ -718,6 +732,13 @@ pub async fn run_agent_loop(
                             session_log.record_message(steps, &tr);
                         }
                         messages.push(tr);
+                    }
+                    Ok(CallbackResult::Finding {
+                        response,
+                        discovery,
+                    }) => {
+                        all_discoveries.push(discovery);
+                        messages.push(ChatMessage::tool_result(&call.id, &response));
                     }
                     Err(e) => {
                         let tr = ChatMessage::tool_result(&call.id, format!("Callback error: {e}"));

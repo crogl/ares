@@ -119,6 +119,52 @@ pub async fn auto_spooler_check(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_SPOOLER_CHECK, &item.dedup_key)
                         .await;
+
+                    // Register spooler_enabled vulnerability proactively so it
+                    // appears in reports. The agent's report_finding callback
+                    // only logs — this ensures the finding is durable.
+                    let vuln = ares_core::models::VulnerabilityInfo {
+                        vuln_id: format!("spooler_{}", item.target_ip.replace('.', "_")),
+                        vuln_type: "spooler_enabled".to_string(),
+                        target: item.target_ip.clone(),
+                        discovered_by: "auto_spooler_check".to_string(),
+                        discovered_at: chrono::Utc::now(),
+                        details: {
+                            let mut d = std::collections::HashMap::new();
+                            d.insert("target_ip".to_string(), json!(item.target_ip));
+                            d.insert("hostname".to_string(), json!(item.hostname));
+                            d.insert("domain".to_string(), json!(item.domain));
+                            d.insert(
+                                "description".to_string(),
+                                json!("Print Spooler service (MS-RPRN) is running. Enables PrinterBug coercion and is a prerequisite for PrintNightmare (CVE-2021-1675)."),
+                            );
+                            d
+                        },
+                        recommended_agent: "privesc".to_string(),
+                        priority: dispatcher.effective_priority("spooler_check"),
+                    };
+
+                    match dispatcher
+                        .state
+                        .publish_vulnerability_with_strategy(
+                            &dispatcher.queue,
+                            vuln,
+                            Some(&dispatcher.config.strategy),
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            info!(
+                                target = %item.target_ip,
+                                hostname = %item.hostname,
+                                "Print Spooler enabled — vulnerability registered"
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            warn!(err = %e, target = %item.target_ip, "Failed to publish spooler vulnerability");
+                        }
+                    }
                 }
                 Ok(None) => {
                     debug!(target = %item.target_ip, "Spooler check deferred");

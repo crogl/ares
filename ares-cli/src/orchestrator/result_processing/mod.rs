@@ -162,29 +162,52 @@ pub async fn process_completed_task(
         }
     }
 
-    if result.success {
-        if let Some(vuln_id) = completed
-            .task_id
-            .starts_with("exploit_")
-            .then(|| {
-                result
-                    .result
-                    .as_ref()
-                    .and_then(|r| r.get("vuln_id"))
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string())
-            })
-            .flatten()
+    // Handle exploit task outcomes — create timeline events for both success and failure
+    if completed.task_id.starts_with("exploit_") {
+        if let Some(vuln_id) = result
+            .result
+            .as_ref()
+            .and_then(|r| r.get("vuln_id"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
         {
-            info!(vuln_id = %vuln_id, task_id = %task_id, "Marking vulnerability as exploited");
-            if let Err(e) = dispatcher
-                .state
-                .mark_exploited(&dispatcher.queue, &vuln_id)
-                .await
-            {
-                warn!(err = %e, vuln_id = %vuln_id, "Failed to mark vulnerability exploited");
+            if result.success {
+                info!(vuln_id = %vuln_id, task_id = %task_id, "Marking vulnerability as exploited");
+                if let Err(e) = dispatcher
+                    .state
+                    .mark_exploited(&dispatcher.queue, &vuln_id)
+                    .await
+                {
+                    warn!(err = %e, vuln_id = %vuln_id, "Failed to mark vulnerability exploited");
+                }
+                create_exploitation_timeline_event(dispatcher, &vuln_id, task_id).await;
+            } else {
+                // Record failed exploit attempts as timeline events so they appear
+                // in reports (e.g. noPac patched, PrintNightmare patched, Certifried
+                // tool missing). This closes the "dispatched but no report evidence" gap.
+                let err_msg = result.error.as_deref().unwrap_or("unknown error");
+                let event_id = format!(
+                    "evt-exploit-fail-{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..8]
+                );
+                let event = serde_json::json!({
+                    "id": event_id,
+                    "timestamp": chrono::Utc::now().to_rfc3339(),
+                    "source": "exploit_failed",
+                    "description": format!("Exploit attempted but failed: {vuln_id} — {err_msg}"),
+                    "mitre_techniques": ["T1210"],
+                });
+                let _ = dispatcher
+                    .state
+                    .persist_timeline_event(&dispatcher.queue, &event, &["T1210".to_string()])
+                    .await;
+                info!(
+                    vuln_id = %vuln_id,
+                    task_id = %task_id,
+                    err = err_msg,
+                    "Exploit failure recorded as timeline event"
+                );
             }
-            create_exploitation_timeline_event(dispatcher, &vuln_id, task_id).await;
         }
     }
 
