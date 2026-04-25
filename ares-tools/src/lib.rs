@@ -83,6 +83,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "adidnsdump" => recon::adidnsdump(arguments).await,
         "save_users_to_file" => recon::save_users_to_file(arguments).await,
         "smbclient_kerberos_shares" => recon::smbclient_kerberos_shares(arguments).await,
+        "ldap_acl_enumeration" => recon::ldap_acl_enumeration(arguments).await,
 
         // ── Credential Access ───────────────────────────────────────
         "kerberoast" => credential_access::kerberoast(arguments).await,
@@ -145,6 +146,9 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_shadow" => privesc::certipy_shadow(arguments).await,
         "certipy_template_esc4" => privesc::certipy_template_esc4(arguments).await,
         "certipy_esc4_full_chain" => privesc::certipy_esc4_full_chain(arguments).await,
+        "certipy_ca" => privesc::certipy_ca(arguments).await,
+        "certipy_retrieve" => privesc::certipy_retrieve(arguments).await,
+        "certipy_esc7_full_chain" => privesc::certipy_esc7_full_chain(arguments).await,
         "find_delegation" => privesc::find_delegation(arguments).await,
         "s4u_attack" => privesc::s4u_attack(arguments).await,
         "generate_golden_ticket" => privesc::generate_golden_ticket(arguments).await,

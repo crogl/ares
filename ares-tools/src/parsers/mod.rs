@@ -10,6 +10,7 @@ mod credential_tools;
 mod delegation;
 mod mssql;
 mod nmap;
+mod ntsd;
 mod secrets;
 mod smb;
 mod spider;
@@ -27,6 +28,7 @@ pub use credential_tools::{
 pub use delegation::{extract_delegation_account, parse_delegation};
 pub use mssql::{parse_mssql_impersonation, parse_mssql_linked_servers};
 pub use nmap::{flush_nmap_host, parse_nmap_output};
+pub use ntsd::parse_acl_enumeration;
 pub use secrets::{parse_asrep_roast, parse_kerberoast, parse_secretsdump};
 pub use smb::{parse_netexec_smb, parse_smb_signing};
 pub use spider::parse_spider_credentials;
@@ -242,6 +244,12 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             let creds = parse_spider_credentials(output, params);
             if !creds.is_empty() {
                 discoveries["credentials"] = Value::Array(creds);
+            }
+        }
+        "ldap_acl_enumeration" => {
+            let vulns = parse_acl_enumeration(output, params);
+            if !vulns.is_empty() {
+                discoveries["vulnerabilities"] = Value::Array(vulns);
             }
         }
         "password_policy" => {

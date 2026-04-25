@@ -9,11 +9,22 @@ const ESC_TYPES: &[&str] = &[
 ];
 
 pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
-    let target_ip = params
-        .get("target")
-        .or_else(|| params.get("target_ip"))
+    // ca_host_ip is the ADCS CA server IP (where certs are enrolled).
+    // target/target_ip is the DC IP used for LDAP queries.
+    // For vuln target, prefer ca_host_ip so exploitation targets the CA, not the DC.
+    let ca_host_ip = params
+        .get("ca_host_ip")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let target_ip = if !ca_host_ip.is_empty() {
+        ca_host_ip
+    } else {
+        params
+            .get("target")
+            .or_else(|| params.get("target_ip"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+    };
 
     let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -29,18 +40,24 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
     // Strategy 2: Look for "ESCn :" patterns (certipy find -vulnerable output)
     // These appear as "ESC1 : 'DOMAIN\\Group' can enroll..."
     for esc_type in ESC_TYPES {
+        let esc_upper = esc_type.to_uppercase();
         let found = if has_vuln_header {
-            // Standard certipy output with vulnerability section
-            output_lower.contains(esc_type)
+            // Use word-boundary-aware matching to avoid false positives
+            // (e.g. "esc1" matching inside "esc13" or "esc15").
+            // Certipy outputs "ESCn :" or "ESCn:" patterns.
+            output.contains(&format!("{esc_upper} :"))
+                || output.contains(&format!("{esc_upper}:"))
+                || output.contains(&format!("{esc_upper} "))
+                || esc_word_boundary_match(&output_lower, esc_type)
         } else {
             // Also detect ESC patterns without the header — certipy sometimes
             // outputs vulnerability info inline with template details.
             // Look for "ESCn" followed by ":" or "vulnerability" on the same or
             // nearby lines.
-            let esc_upper = esc_type.to_uppercase();
             output.contains(&format!("{esc_upper} :"))
                 || output.contains(&format!("{esc_upper}:"))
-                || (output_lower.contains(esc_type) && output_lower.contains("vulnerab"))
+                || (esc_word_boundary_match(&output_lower, esc_type)
+                    && output_lower.contains("vulnerab"))
         };
 
         if found {
@@ -59,6 +76,9 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
             if let Some(ref tmpl) = template_name {
                 details["template_name"] = json!(tmpl);
             }
+            if !ca_host_ip.is_empty() {
+                details["ca_host"] = json!(ca_host_ip);
+            }
 
             vulns.push(json!({
                 "vuln_id": format!("adcs_{}_{}", esc_type, target_ip),
@@ -73,6 +93,23 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
     }
 
     vulns
+}
+
+/// Check if `esc_type` (e.g. "esc1") appears as a whole word in `text`.
+/// Prevents "esc1" from matching inside "esc13" or "esc15".
+fn esc_word_boundary_match(text: &str, esc_type: &str) -> bool {
+    let mut start = 0;
+    while let Some(pos) = text[start..].find(esc_type) {
+        let abs_pos = start + pos;
+        let end_pos = abs_pos + esc_type.len();
+        // Check that the character after the match is not a digit
+        let after_ok = end_pos >= text.len() || !text.as_bytes()[end_pos].is_ascii_digit();
+        if after_ok {
+            return true;
+        }
+        start = abs_pos + 1;
+    }
+    false
 }
 
 /// Extract CA name from certipy output.
@@ -337,5 +374,49 @@ mod tests {
         let vulns = parse_certipy_find(output, &params);
         assert_eq!(vulns.len(), 1);
         assert_eq!(vulns[0]["vuln_type"], "adcs_esc8");
+    }
+
+    #[test]
+    fn parse_certipy_esc13_does_not_false_positive_esc1() {
+        // ESC13 should not trigger false positive for ESC1
+        let output = "[!] Vulnerabilities\nESC13 : Issuance Policy linked to group";
+        let params = json!({"target": "192.168.58.10"});
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_type"], "adcs_esc13");
+    }
+
+    #[test]
+    fn parse_certipy_ca_host_ip_used_as_target() {
+        let output = "[!] Vulnerabilities\nESC1 : enrollee supplies subject";
+        let params = json!({
+            "target_ip": "192.168.58.10",  // DC IP
+            "ca_host_ip": "192.168.58.50", // CA IP
+            "domain": "contoso.local"
+        });
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        // Should use ca_host_ip, not target_ip
+        assert_eq!(vulns[0]["target"], "192.168.58.50");
+        assert_eq!(vulns[0]["vuln_id"], "adcs_esc1_192.168.58.50");
+        assert_eq!(vulns[0]["details"]["ca_host"], "192.168.58.50");
+    }
+
+    #[test]
+    fn esc_word_boundary_match_basic() {
+        assert!(super::esc_word_boundary_match("esc1 : vulnerable", "esc1"));
+        assert!(super::esc_word_boundary_match("esc1:", "esc1"));
+        assert!(!super::esc_word_boundary_match(
+            "esc13 : vulnerable",
+            "esc1"
+        ));
+        assert!(!super::esc_word_boundary_match(
+            "esc15 : vulnerable",
+            "esc1"
+        ));
+        assert!(super::esc_word_boundary_match(
+            "esc13 : vulnerable",
+            "esc13"
+        ));
     }
 }

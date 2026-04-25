@@ -1,0 +1,759 @@
+//! nTSecurityDescriptor binary parser.
+//!
+//! Parses Windows SECURITY_DESCRIPTOR binary data (self-relative format) from
+//! LDAP nTSecurityDescriptor attribute values to extract DACL ACE entries.
+//! Identifies dangerous ACEs (GenericAll, WriteDacl, ForceChangePassword, etc.)
+//! and returns them as structured vulnerability discoveries.
+
+use serde_json::{json, Value};
+
+// ── Well-known SID prefixes ────────────────────────────────────────────────
+
+/// Map well-known SIDs to friendly names.
+fn well_known_sid(sid: &str) -> Option<&'static str> {
+    match sid {
+        "S-1-0-0" => Some("Nobody"),
+        "S-1-1-0" => Some("Everyone"),
+        "S-1-5-7" => Some("ANONYMOUS LOGON"),
+        "S-1-5-10" => Some("SELF"),
+        "S-1-5-11" => Some("Authenticated Users"),
+        "S-1-5-18" => Some("SYSTEM"),
+        "S-1-5-32-544" => Some("BUILTIN\\Administrators"),
+        "S-1-5-32-545" => Some("BUILTIN\\Users"),
+        _ => None,
+    }
+}
+
+// ── Access mask flags ──────────────────────────────────────────────────────
+
+const GENERIC_ALL: u32 = 0x10000000;
+const GENERIC_WRITE: u32 = 0x40000000;
+const ADS_RIGHT_DS_CONTROL_ACCESS: u32 = 0x00000100;
+const ADS_RIGHT_DS_WRITE_PROP: u32 = 0x00000020;
+const ADS_RIGHT_DS_SELF: u32 = 0x00000008;
+const WRITE_DACL: u32 = 0x00040000;
+const WRITE_OWNER: u32 = 0x00080000;
+const FULL_CONTROL: u32 = 0x000F01FF;
+
+// ── Object type GUIDs for extended rights ──────────────────────────────────
+
+/// User-Force-Change-Password (Reset Password extended right)
+const GUID_FORCE_CHANGE_PASSWORD: &str = "00299570-246d-11d0-a768-00aa006e0529";
+/// Self-Membership (validated write to group member attribute)
+const GUID_SELF_MEMBERSHIP: &str = "bf9679c0-0de6-11d0-a285-00aa003049e2";
+/// Write-Member (write to member attribute on group)
+const GUID_WRITE_MEMBER: &str = "bf9679a8-0de6-11d0-a285-00aa003049e2";
+/// All Extended Rights
+#[allow(dead_code)]
+const GUID_ALL_EXTENDED_RIGHTS: &str = "00000000-0000-0000-0000-000000000000";
+
+// ── Binary parsing helpers ─────────────────────────────────────────────────
+
+fn read_u8(data: &[u8], offset: usize) -> Option<u8> {
+    data.get(offset).copied()
+}
+
+fn read_u16_le(data: &[u8], offset: usize) -> Option<u16> {
+    if offset + 2 > data.len() {
+        return None;
+    }
+    Some(u16::from_le_bytes([data[offset], data[offset + 1]]))
+}
+
+fn read_u32_le(data: &[u8], offset: usize) -> Option<u32> {
+    if offset + 4 > data.len() {
+        return None;
+    }
+    Some(u32::from_le_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ]))
+}
+
+/// Parse a SID from binary data at the given offset.
+/// Returns (sid_string, bytes_consumed).
+fn parse_sid(data: &[u8], offset: usize) -> Option<(String, usize)> {
+    let revision = read_u8(data, offset)?;
+    let sub_authority_count = read_u8(data, offset + 1)? as usize;
+
+    if offset + 8 + sub_authority_count * 4 > data.len() {
+        return None;
+    }
+
+    // IdentifierAuthority is 6 bytes big-endian
+    let auth_bytes = &data[offset + 2..offset + 8];
+    let authority = if auth_bytes[0] == 0 && auth_bytes[1] == 0 {
+        // Fits in a u32 — use the last 4 bytes
+        u32::from_be_bytes([auth_bytes[2], auth_bytes[3], auth_bytes[4], auth_bytes[5]]) as u64
+    } else {
+        // Full 48-bit authority
+        ((auth_bytes[0] as u64) << 40)
+            | ((auth_bytes[1] as u64) << 32)
+            | ((auth_bytes[2] as u64) << 24)
+            | ((auth_bytes[3] as u64) << 16)
+            | ((auth_bytes[4] as u64) << 8)
+            | (auth_bytes[5] as u64)
+    };
+
+    let mut sid = format!("S-{revision}-{authority}");
+    for i in 0..sub_authority_count {
+        let sub_auth = read_u32_le(data, offset + 8 + i * 4)?;
+        sid.push_str(&format!("-{sub_auth}"));
+    }
+
+    let consumed = 8 + sub_authority_count * 4;
+    Some((sid, consumed))
+}
+
+/// Parse a GUID from 16 bytes in mixed-endian format (as stored in AD).
+fn parse_guid(data: &[u8], offset: usize) -> Option<String> {
+    if offset + 16 > data.len() {
+        return None;
+    }
+    let d1 = read_u32_le(data, offset)?;
+    let d2 = read_u16_le(data, offset + 4)?;
+    let d3 = read_u16_le(data, offset + 6)?;
+    let d4 = &data[offset + 8..offset + 16];
+    Some(format!(
+        "{:08x}-{:04x}-{:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        d1, d2, d3, d4[0], d4[1], d4[2], d4[3], d4[4], d4[5], d4[6], d4[7]
+    ))
+}
+
+// ── ACE types ──────────────────────────────────────────────────────────────
+
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0x00;
+const ACCESS_ALLOWED_OBJECT_ACE_TYPE: u8 = 0x05;
+
+/// A parsed ACE with the information we care about.
+#[derive(Debug)]
+struct ParsedAce {
+    trustee_sid: String,
+    access_mask: u32,
+    object_type_guid: Option<String>,
+}
+
+/// Classify an ACE into a vulnerability type name, if it's dangerous.
+fn classify_ace(ace: &ParsedAce) -> Vec<&'static str> {
+    let mask = ace.access_mask;
+    let mut types = Vec::new();
+
+    // GenericAll — full control
+    if mask & GENERIC_ALL != 0 || mask == FULL_CONTROL {
+        types.push("genericall");
+        return types; // GenericAll subsumes everything
+    }
+
+    // GenericWrite
+    if mask & GENERIC_WRITE != 0 {
+        types.push("genericwrite");
+    }
+
+    // WriteDacl
+    if mask & WRITE_DACL != 0 {
+        types.push("writedacl");
+    }
+
+    // WriteOwner
+    if mask & WRITE_OWNER != 0 {
+        types.push("writeowner");
+    }
+
+    // Object-type specific rights
+    if let Some(ref guid) = ace.object_type_guid {
+        let guid_lower = guid.to_lowercase();
+        if guid_lower == GUID_FORCE_CHANGE_PASSWORD && (mask & ADS_RIGHT_DS_CONTROL_ACCESS != 0) {
+            types.push("forcechangepassword");
+        }
+        if guid_lower == GUID_SELF_MEMBERSHIP && (mask & ADS_RIGHT_DS_SELF != 0) {
+            types.push("self_membership");
+        }
+        if guid_lower == GUID_WRITE_MEMBER && (mask & ADS_RIGHT_DS_WRITE_PROP != 0) {
+            types.push("write_membership");
+        }
+    }
+
+    // AllExtendedRights (no object type restriction or null GUID)
+    if mask & ADS_RIGHT_DS_CONTROL_ACCESS != 0 && ace.object_type_guid.is_none() {
+        types.push("allextendedrights");
+    }
+
+    // WriteProperty with no specific object type
+    if mask & ADS_RIGHT_DS_WRITE_PROP != 0 {
+        if let Some(ref guid) = ace.object_type_guid {
+            if guid.to_lowercase() != GUID_WRITE_MEMBER {
+                types.push("writeproperty");
+            }
+        } else {
+            types.push("writeproperty");
+        }
+    }
+
+    types
+}
+
+/// Parse a single ACE from binary data.
+/// Returns (ParsedAce, total_ace_size).
+fn parse_ace(data: &[u8], offset: usize) -> Option<(ParsedAce, usize)> {
+    let ace_type = read_u8(data, offset)?;
+    let _ace_flags = read_u8(data, offset + 1)?;
+    let ace_size = read_u16_le(data, offset + 2)? as usize;
+
+    if offset + ace_size > data.len() || ace_size < 8 {
+        return None;
+    }
+
+    match ace_type {
+        ACCESS_ALLOWED_ACE_TYPE => {
+            let access_mask = read_u32_le(data, offset + 4)?;
+            let (sid, _) = parse_sid(data, offset + 8)?;
+            Some((
+                ParsedAce {
+                    trustee_sid: sid,
+                    access_mask,
+                    object_type_guid: None,
+                },
+                ace_size,
+            ))
+        }
+        ACCESS_ALLOWED_OBJECT_ACE_TYPE => {
+            let access_mask = read_u32_le(data, offset + 4)?;
+            let flags = read_u32_le(data, offset + 8)?;
+
+            let mut guid_offset = offset + 12;
+            let object_type_guid = if flags & 0x01 != 0 {
+                let guid = parse_guid(data, guid_offset)?;
+                guid_offset += 16;
+                Some(guid)
+            } else {
+                None
+            };
+
+            // Skip InheritedObjectType if present
+            if flags & 0x02 != 0 {
+                guid_offset += 16;
+            }
+
+            let (sid, _) = parse_sid(data, guid_offset)?;
+            Some((
+                ParsedAce {
+                    trustee_sid: sid,
+                    access_mask,
+                    object_type_guid,
+                },
+                ace_size,
+            ))
+        }
+        _ => {
+            // Skip unknown ACE types
+            Some((
+                ParsedAce {
+                    trustee_sid: String::new(),
+                    access_mask: 0,
+                    object_type_guid: None,
+                },
+                ace_size,
+            ))
+        }
+    }
+}
+
+/// Parse a SECURITY_DESCRIPTOR in self-relative format and extract DACL ACEs.
+///
+/// Returns a list of (trustee_sid, vuln_type) pairs for dangerous ACEs.
+pub fn parse_security_descriptor(data: &[u8]) -> Vec<(String, String)> {
+    if data.len() < 20 {
+        return Vec::new();
+    }
+
+    let _revision = read_u8(data, 0);
+    let _sbz1 = read_u8(data, 1);
+    let control = read_u16_le(data, 2).unwrap_or(0);
+
+    // Check SE_DACL_PRESENT (bit 2)
+    if control & 0x0004 == 0 {
+        return Vec::new();
+    }
+
+    // SE_SELF_RELATIVE check (bit 15) — we only handle self-relative
+    if control & 0x8000 == 0 {
+        return Vec::new();
+    }
+
+    let dacl_offset = read_u32_le(data, 16).unwrap_or(0) as usize;
+    if dacl_offset == 0 || dacl_offset >= data.len() {
+        return Vec::new();
+    }
+
+    // DACL header: Revision(1) + Sbz1(1) + AclSize(2) + AceCount(2) + Sbz2(2)
+    if dacl_offset + 8 > data.len() {
+        return Vec::new();
+    }
+
+    let ace_count = read_u16_le(data, dacl_offset + 4).unwrap_or(0) as usize;
+
+    let mut results = Vec::new();
+    let mut ace_offset = dacl_offset + 8; // skip ACL header
+
+    for _ in 0..ace_count {
+        if ace_offset >= data.len() {
+            break;
+        }
+        match parse_ace(data, ace_offset) {
+            Some((ace, size)) => {
+                if !ace.trustee_sid.is_empty() {
+                    for vuln_type in classify_ace(&ace) {
+                        results.push((ace.trustee_sid.clone(), vuln_type.to_string()));
+                    }
+                }
+                ace_offset += size;
+            }
+            None => break,
+        }
+    }
+
+    results
+}
+
+/// Parse ldapsearch output containing base64-encoded nTSecurityDescriptor values.
+///
+/// Expects output in ldapsearch format:
+/// ```text
+/// dn: CN=someuser,DC=contoso,DC=local
+/// sAMAccountName: someuser
+/// nTSecurityDescriptor:: <base64>
+/// ```
+///
+/// Returns vulnerability discoveries as JSON values.
+pub fn parse_acl_enumeration(output: &str, params: &Value) -> Vec<Value> {
+    use std::collections::HashMap;
+
+    let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+    let target_ip = params
+        .get("target")
+        .or_else(|| params.get("target_ip"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+
+    // Build a SID → sAMAccountName map from the output itself
+    let mut sid_to_name: HashMap<String, String> = HashMap::new();
+    let mut vulns = Vec::new();
+
+    // First pass: collect all objects with their sAMAccountName and objectSid
+    struct LdapObject {
+        sam_account_name: String,
+        object_class: String, // user, group, computer
+        ntsd_base64: String,
+        object_sid: String,
+    }
+
+    let mut objects: Vec<LdapObject> = Vec::new();
+    let mut current = LdapObject {
+        sam_account_name: String::new(),
+        object_class: String::new(),
+        ntsd_base64: String::new(),
+        object_sid: String::new(),
+    };
+    let mut in_ntsd = false;
+    let mut ntsd_buf = String::new();
+
+    for line in output.lines() {
+        let line = line.trim_end();
+
+        if line.starts_with("dn: ") || (line.is_empty() && !current.sam_account_name.is_empty()) {
+            // Flush current
+            if in_ntsd {
+                current.ntsd_base64 = ntsd_buf.clone();
+                in_ntsd = false;
+                ntsd_buf.clear();
+            }
+            if !current.sam_account_name.is_empty() {
+                objects.push(current);
+            }
+            current = LdapObject {
+                sam_account_name: String::new(),
+                object_class: String::new(),
+                ntsd_base64: String::new(),
+                object_sid: String::new(),
+            };
+            continue;
+        }
+
+        // Handle base64 continuation lines (start with space)
+        if in_ntsd {
+            if line.starts_with(' ') {
+                ntsd_buf.push_str(line.trim());
+                continue;
+            } else {
+                current.ntsd_base64 = ntsd_buf.clone();
+                in_ntsd = false;
+                ntsd_buf.clear();
+            }
+        }
+
+        if let Some(val) = line.strip_prefix("sAMAccountName: ") {
+            current.sam_account_name = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("objectClass: ") {
+            let val = val.trim().to_lowercase();
+            // Keep the most specific class
+            if val == "user" || val == "computer" || val == "group" {
+                current.object_class = val;
+            }
+        } else if let Some(val) = line.strip_prefix("objectSid:: ") {
+            // Base64-encoded SID
+            if let Ok(bytes) = base64_decode(val.trim()) {
+                if let Some((sid, _)) = parse_sid(&bytes, 0) {
+                    current.object_sid = sid;
+                }
+            }
+        } else if let Some(val) = line.strip_prefix("objectSid: ") {
+            // String SID
+            current.object_sid = val.trim().to_string();
+        } else if let Some(val) = line.strip_prefix("nTSecurityDescriptor:: ") {
+            ntsd_buf = val.trim().to_string();
+            in_ntsd = true;
+        } else if let Some(val) = line.strip_prefix("nTSecurityDescriptor: ") {
+            // Non-base64 (shouldn't happen but handle it)
+            current.ntsd_base64 = val.trim().to_string();
+        }
+    }
+    // Flush last object
+    if in_ntsd {
+        current.ntsd_base64 = ntsd_buf;
+    }
+    if !current.sam_account_name.is_empty() {
+        objects.push(current);
+    }
+
+    // Build SID map
+    for obj in &objects {
+        if !obj.object_sid.is_empty() && !obj.sam_account_name.is_empty() {
+            sid_to_name.insert(obj.object_sid.clone(), obj.sam_account_name.clone());
+        }
+    }
+
+    // Second pass: parse each nTSecurityDescriptor and extract dangerous ACEs
+    for obj in &objects {
+        if obj.ntsd_base64.is_empty() {
+            continue;
+        }
+
+        let sd_bytes = match base64_decode(&obj.ntsd_base64) {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+
+        let aces = parse_security_descriptor(&sd_bytes);
+        for (trustee_sid, vuln_type) in &aces {
+            // Resolve trustee SID to name
+            let source_name = sid_to_name
+                .get(trustee_sid)
+                .map(|s| s.as_str())
+                .or_else(|| well_known_sid(trustee_sid))
+                .unwrap_or(trustee_sid);
+
+            // Skip well-known system SIDs and high-privilege groups that aren't
+            // actionable (you'd already need DA to abuse them).
+            let source_lower = source_name.to_lowercase();
+            if matches!(
+                source_name,
+                "SYSTEM"
+                    | "BUILTIN\\Administrators"
+                    | "BUILTIN\\Users"
+                    | "SELF"
+                    | "Nobody"
+                    | "ANONYMOUS LOGON"
+            ) || source_lower == "administrators"
+                || source_lower == "domain admins"
+                || source_lower == "enterprise admins"
+                || source_lower == "key admins"
+                || source_lower == "enterprise key admins"
+                || source_lower == "account operators"
+                || source_lower == "domain controllers"
+                || source_lower == "enterprise domain controllers"
+            {
+                continue;
+            }
+
+            // Skip if source == target (self-permissions)
+            if source_name.eq_ignore_ascii_case(&obj.sam_account_name) {
+                continue;
+            }
+
+            let target_type = match obj.object_class.as_str() {
+                "user" => "User",
+                "group" => "Group",
+                "computer" => "Computer",
+                _ => "Unknown",
+            };
+
+            let vuln_id = format!(
+                "acl_{}_{}_{}",
+                vuln_type,
+                source_name.to_lowercase().replace(' ', "_"),
+                obj.sam_account_name.to_lowercase().replace('$', "")
+            );
+
+            vulns.push(json!({
+                "vuln_id": vuln_id,
+                "vuln_type": vuln_type,
+                "source": source_name,
+                "target": obj.sam_account_name,
+                "target_type": target_type,
+                "target_ip": target_ip,
+                "domain": domain,
+                "source_domain": domain,
+                "details": {
+                    "trustee_sid": trustee_sid,
+                    "source": source_name,
+                    "target": obj.sam_account_name,
+                    "target_type": target_type,
+                    "domain": domain,
+                    "source_domain": domain,
+                    "description": format!(
+                        "{} has {} on {} ({})",
+                        source_name, vuln_type, obj.sam_account_name, target_type
+                    ),
+                },
+            }));
+        }
+    }
+
+    vulns
+}
+
+/// Simple base64 decoder (no external dependency).
+fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
+    // Strip whitespace
+    let clean: String = input.chars().filter(|c| !c.is_whitespace()).collect();
+    if clean.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut output = Vec::with_capacity(clean.len() * 3 / 4);
+    let mut buf: u32 = 0;
+    let mut bits: u32 = 0;
+
+    for ch in clean.chars() {
+        let val = match ch {
+            'A'..='Z' => ch as u32 - 'A' as u32,
+            'a'..='z' => ch as u32 - 'a' as u32 + 26,
+            '0'..='9' => ch as u32 - '0' as u32 + 52,
+            '+' => 62,
+            '/' => 63,
+            '=' => continue, // padding
+            _ => return Err("invalid base64 character"),
+        };
+        buf = (buf << 6) | val;
+        bits += 6;
+        if bits >= 8 {
+            bits -= 8;
+            output.push((buf >> bits) as u8);
+            buf &= (1 << bits) - 1;
+        }
+    }
+
+    Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_sid_wellknown() {
+        // S-1-5-18 (SYSTEM): revision=1, subauth_count=1, authority=5, subauth=18
+        let bytes = [
+            0x01, // revision
+            0x01, // sub authority count
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // authority = 5
+            0x12, 0x00, 0x00, 0x00, // sub authority = 18
+        ];
+        let (sid, consumed) = parse_sid(&bytes, 0).unwrap();
+        assert_eq!(sid, "S-1-5-18");
+        assert_eq!(consumed, 12);
+    }
+
+    #[test]
+    fn parse_sid_domain_user() {
+        // S-1-5-21-xxx-xxx-xxx-1001
+        let bytes = [
+            0x01, // revision
+            0x04, // sub authority count = 4
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x05, // authority = 5
+            0x15, 0x00, 0x00, 0x00, // 21
+            0x01, 0x00, 0x00, 0x00, // 1
+            0x02, 0x00, 0x00, 0x00, // 2
+            0xE9, 0x03, 0x00, 0x00, // 1001
+        ];
+        let (sid, _) = parse_sid(&bytes, 0).unwrap();
+        assert_eq!(sid, "S-1-5-21-1-2-1001");
+    }
+
+    #[test]
+    fn parse_guid_format() {
+        // A known GUID: 00299570-246d-11d0-a768-00aa006e0529
+        let bytes = [
+            0x70, 0x95, 0x29, 0x00, // d1 = 0x00299570 LE
+            0x6d, 0x24, // d2 = 0x246d LE
+            0xd0, 0x11, // d3 = 0x11d0 LE
+            0xa7, 0x68, 0x00, 0xaa, 0x00, 0x6e, 0x05, 0x29, // d4
+        ];
+        let guid = parse_guid(&bytes, 0).unwrap();
+        assert_eq!(guid, "00299570-246d-11d0-a768-00aa006e0529");
+    }
+
+    #[test]
+    fn base64_decode_simple() {
+        let decoded = base64_decode("AQAAAA==").unwrap();
+        assert_eq!(decoded, vec![0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn base64_decode_empty() {
+        let decoded = base64_decode("").unwrap();
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn classify_generic_all() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: GENERIC_ALL,
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert_eq!(types, vec!["genericall"]);
+    }
+
+    #[test]
+    fn classify_full_control() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: FULL_CONTROL,
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert_eq!(types, vec!["genericall"]);
+    }
+
+    #[test]
+    fn classify_write_dacl() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: WRITE_DACL,
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert!(types.contains(&"writedacl"));
+    }
+
+    #[test]
+    fn classify_write_owner() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: WRITE_OWNER,
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert!(types.contains(&"writeowner"));
+    }
+
+    #[test]
+    fn classify_force_change_password() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: ADS_RIGHT_DS_CONTROL_ACCESS,
+            object_type_guid: Some(GUID_FORCE_CHANGE_PASSWORD.into()),
+        };
+        let types = classify_ace(&ace);
+        assert!(types.contains(&"forcechangepassword"));
+    }
+
+    #[test]
+    fn classify_self_membership() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: ADS_RIGHT_DS_SELF,
+            object_type_guid: Some(GUID_SELF_MEMBERSHIP.into()),
+        };
+        let types = classify_ace(&ace);
+        assert!(types.contains(&"self_membership"));
+    }
+
+    #[test]
+    fn classify_generic_write() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: GENERIC_WRITE,
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert!(types.contains(&"genericwrite"));
+    }
+
+    #[test]
+    fn classify_no_dangerous_perms() {
+        let ace = ParsedAce {
+            trustee_sid: "S-1-5-21-1-2-1001".into(),
+            access_mask: 0x00000001, // just read
+            object_type_guid: None,
+        };
+        let types = classify_ace(&ace);
+        assert!(types.is_empty());
+    }
+
+    #[test]
+    fn parse_security_descriptor_too_short() {
+        let result = parse_security_descriptor(&[0x01, 0x00]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn well_known_sids() {
+        assert_eq!(well_known_sid("S-1-5-18"), Some("SYSTEM"));
+        assert_eq!(well_known_sid("S-1-1-0"), Some("Everyone"));
+        assert_eq!(
+            well_known_sid("S-1-5-32-544"),
+            Some("BUILTIN\\Administrators")
+        );
+        assert_eq!(well_known_sid("S-1-5-21-custom"), None);
+    }
+
+    #[test]
+    fn parse_acl_enumeration_empty() {
+        let vulns = parse_acl_enumeration("", &serde_json::json!({"domain": "contoso.local"}));
+        assert!(vulns.is_empty());
+    }
+
+    #[test]
+    fn parse_security_descriptor_minimal_valid() {
+        // Construct a minimal self-relative SD with DACL present, 0 ACEs
+        let mut sd = [0u8; 24];
+        sd[0] = 1; // revision
+                   // control: SE_DACL_PRESENT (0x0004) | SE_SELF_RELATIVE (0x8000)
+        sd[2] = 0x04;
+        sd[3] = 0x80;
+        // DACL offset at byte 16 (LE u32)
+        sd[16] = 20; // DACL starts at offset 20
+                     // DACL header at offset 20: revision=2, sbz=0, size=8, ace_count=0
+        sd[20] = 2; // ACL revision
+        sd[22] = 8; // ACL size (just header)
+        sd[24..].iter().for_each(|_| {}); // pad isn't needed, we have exact size
+
+        // Actually need 28 bytes total (20 for SD header + 8 for DACL header)
+        let mut sd = vec![0u8; 28];
+        sd[0] = 1;
+        sd[2] = 0x04;
+        sd[3] = 0x80;
+        sd[16] = 20;
+        sd[20] = 2;
+        sd[22] = 8;
+        // ace_count at offset 24 = 0
+
+        let result = parse_security_descriptor(&sd);
+        assert!(result.is_empty());
+    }
+}

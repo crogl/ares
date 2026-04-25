@@ -738,6 +738,7 @@ tasks:
       BLUE_ENABLED: '{{.BLUE_ENABLED | default "0"}}'
       BLUE_LLM_MODEL: '{{.BLUE_LLM_MODEL | default ""}}'
       EC2_DEPLOYMENT: '{{.EC2_DEPLOYMENT | default "alpha-operator-range"}}'
+      STRATEGY: '{{.STRATEGY | default "comprehensive"}}'
       RESOLVED_TARGETS:
         sh: |
           TARGET="{{.TARGET}}"
@@ -867,7 +868,7 @@ tasks:
           # Build JSON payload for ARES_OPERATION_ID
           TARGET_IPS_JSON=$(echo "{{.RESOLVED_TARGETS}}" | tr ',' '\n' | sed 's/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
 
-          ORCH_PAYLOAD="{\"operation_id\":\"{{.OPERATION_ID_COMPUTED}}\",\"target_domain\":\"{{.DOMAIN}}\",\"target_ips\":${TARGET_IPS_JSON},\"model\":\"{{.MODEL}}\"}"
+          ORCH_PAYLOAD="{\"operation_id\":\"{{.OPERATION_ID_COMPUTED}}\",\"target_domain\":\"{{.DOMAIN}}\",\"target_ips\":${TARGET_IPS_JSON},\"model\":\"{{.MODEL}}\",\"strategy\":\"{{.STRATEGY}}\"}"
 
           # Build orchestrator launch script from template
           ORCH_SCRIPT=$(mktemp)

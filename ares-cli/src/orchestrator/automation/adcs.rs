@@ -99,30 +99,34 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             };
 
             // Look for NTLM hash (PTH) — fires independently of cred attempt
-            let (ntlm_hash, ntlm_hash_username) =
-                if cred.is_none() && !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash) {
-                    // Look for Administrator NTLM hash for this domain
-                    state
-                        .hashes
-                        .iter()
-                        .find(|h| {
+            let (ntlm_hash, ntlm_hash_username) = if cred.is_none()
+                && !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash)
+            {
+                // Look for Administrator NTLM hash for this domain
+                // Also match hashes with empty domain (from secretsdump
+                // runs that didn't tag the domain properly).
+                let domain_lower = domain.to_lowercase();
+                state
+                    .hashes
+                    .iter()
+                    .find(|h| {
+                        h.hash_type.to_lowercase() == "ntlm"
+                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                            && h.username.to_lowercase() == "administrator"
+                    })
+                    .or_else(|| {
+                        // Fall back to any NTLM hash for this domain
+                        state.hashes.iter().find(|h| {
                             h.hash_type.to_lowercase() == "ntlm"
-                                && h.domain.to_lowercase() == domain.to_lowercase()
-                                && h.username.to_lowercase() == "administrator"
+                                && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                                && !state.is_delegation_account(&h.username)
                         })
-                        .or_else(|| {
-                            // Fall back to any NTLM hash for this domain
-                            state.hashes.iter().find(|h| {
-                                h.hash_type.to_lowercase() == "ntlm"
-                                    && h.domain.to_lowercase() == domain.to_lowercase()
-                                    && !state.is_delegation_account(&h.username)
-                            })
-                        })
-                        .map(|h| (Some(h.hash_value.clone()), Some(h.username.clone())))
-                        .unwrap_or((None, None))
-                } else {
-                    (None, None)
-                };
+                    })
+                    .map(|h| (Some(h.hash_value.clone()), Some(h.username.clone())))
+                    .unwrap_or((None, None))
+            } else {
+                (None, None)
+            };
 
             // Need at least a credential or an NTLM hash
             if cred.is_none() && ntlm_hash.is_none() {
@@ -184,6 +188,13 @@ pub async fn auto_adcs_enumeration(
         for item in work {
             // Use DC IP for certipy LDAP queries; fall back to CA host IP
             let target_ip = item.dc_ip.as_deref().unwrap_or(&item.host_ip);
+            // Pass CA host IP separately so the parser sets the correct vuln target
+            // (the CA server, not the DC used for LDAP).
+            let ca_host_ip = if item.dc_ip.is_some() {
+                Some(item.host_ip.as_str())
+            } else {
+                None
+            };
             match dispatcher
                 .request_certipy_find(
                     target_ip,
@@ -191,6 +202,7 @@ pub async fn auto_adcs_enumeration(
                     &item.credential,
                     item.ntlm_hash.as_deref(),
                     item.ntlm_hash_username.as_deref(),
+                    ca_host_ip,
                 )
                 .await
             {

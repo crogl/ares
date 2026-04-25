@@ -81,6 +81,18 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "User Principal Name to request the certificate for. Defaults to Administrator.",
                         "default": "Administrator"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "CA server IP or hostname to connect to for certificate enrollment. REQUIRED when the CA is on a different host than the DC (e.g. CA on braavos but DC is meereen). Without this, certipy tries RPC on the DC which fails with ept_s_not_registered."
+                    },
+                    "sid": {
+                        "type": "string",
+                        "description": "Object SID to embed in the certificate (e.g. 'S-1-5-21-...-500' for Administrator). Required by certipy v5+ to prevent SID mismatch errors during certipy_auth. For Administrator, use the domain SID + '-500'."
+                    },
+                    "out": {
+                        "type": "string",
+                        "description": "Output filename for the PFX certificate (without .pfx extension). A unique name is auto-generated if not specified. The resulting file will be <out>.pfx — use this path for certipy_auth's pfx_path parameter."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca", "template"]
@@ -214,9 +226,140 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "UPN of the target user to impersonate. Defaults to Administrator.",
                         "default": "Administrator"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "CA server IP or hostname for certificate enrollment. REQUIRED when the CA is on a different host than the DC."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "template", "ca"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_ca".into(),
+            description: "Manage a Certificate Authority using Certipy. Can add yourself as a \
+                CA officer (ManageCA right required) or issue a pending certificate request."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain (e.g. contoso.local)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username for authentication (must have ManageCA rights)"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for authentication"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    },
+                    "ca": {
+                        "type": "string",
+                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                    },
+                    "add_officer": {
+                        "type": "boolean",
+                        "description": "Add yourself as a CA officer. Requires ManageCA rights."
+                    },
+                    "issue_request": {
+                        "type": "integer",
+                        "description": "Issue (approve) a pending certificate request by its request ID."
+                    }
+                },
+                "required": ["domain", "username", "password", "dc_ip", "ca"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_retrieve".into(),
+            description: "Retrieve a previously issued certificate from the CA by its request ID. \
+                Used after certipy_ca -issue-request approves a pending request."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain (e.g. contoso.local)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username for authentication"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for authentication"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    },
+                    "ca": {
+                        "type": "string",
+                        "description": "Certificate Authority name"
+                    },
+                    "request_id": {
+                        "type": "integer",
+                        "description": "The certificate request ID to retrieve"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "CA server IP or hostname for RPC enrollment"
+                    }
+                },
+                "required": ["domain", "username", "password", "dc_ip", "ca", "request_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_esc7_full_chain".into(),
+            description: "Execute the full ESC7 exploit chain: add yourself as CA officer \
+                (ManageCA abuse), request a SubCA certificate (gets denied), issue the pending \
+                request, retrieve the certificate, and authenticate to obtain NT hashes. \
+                Requires the user to have ManageCA rights on the target CA."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain (e.g. contoso.local)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username for authentication (must have ManageCA rights)"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for authentication"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    },
+                    "ca": {
+                        "type": "string",
+                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                    },
+                    "target": {
+                        "type": "string",
+                        "description": "CA server IP or hostname for certificate enrollment. REQUIRED when the CA is on a different host than the DC."
+                    },
+                    "upn": {
+                        "type": "string",
+                        "description": "UPN of the user to impersonate. Defaults to 'administrator@<domain>'.",
+                        "default": "administrator"
+                    },
+                    "sid": {
+                        "type": "string",
+                        "description": "SID to embed in the certificate (e.g. domain SID + '-500' for Administrator)"
+                    }
+                },
+                "required": ["domain", "username", "password", "dc_ip", "ca"]
             }),
         },
     ]

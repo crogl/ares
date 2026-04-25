@@ -261,5 +261,24 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["target"]
             }),
         },
+        ToolDefinition {
+            name: "ldap_acl_enumeration".into(),
+            description: "Enumerate ACL attack paths by querying nTSecurityDescriptor attributes on AD objects. Identifies dangerous ACEs (GenericAll, WriteDacl, ForceChangePassword, GenericWrite, WriteOwner, Self-Membership) that can be exploited for privilege escalation. Supports pass-the-hash via the 'hash' parameter.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {"type": "string", "description": "DC IP or hostname"},
+                    "domain": {"type": "string", "description": "Target domain"},
+                    "username": {"type": "string"},
+                    "password": {"type": "string"},
+                    "hash": {"type": "string", "description": "NTLM hash for pass-the-hash (use instead of password)"},
+                    "bind_domain": {
+                        "type": "string",
+                        "description": "Domain for LDAP bind DN when credential domain differs from target domain"
+                    }
+                },
+                "required": ["target", "domain"]
+            }),
+        },
     ]
 }

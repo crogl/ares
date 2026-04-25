@@ -439,6 +439,7 @@ impl Dispatcher {
         credential: &ares_core::models::Credential,
         ntlm_hash: Option<&str>,
         hash_username: Option<&str>,
+        ca_host_ip: Option<&str>,
     ) -> Result<Option<String>> {
         // When PTH hash is available, use the hash user's identity for the target domain
         let (cred_user, cred_pass, cred_domain) = if let Some(_hash) = ntlm_hash {
@@ -462,7 +463,10 @@ impl Dispatcher {
                 "domain": cred_domain,
             },
             "instructions": concat!(
-                "Run the certipy_find tool to enumerate ALL certificate templates and CAs.\n\n",
+                "Run the certipy_find tool with vulnerable=true to enumerate vulnerable ",
+                "certificate templates and CAs.\n\n",
+                "IMPORTANT: You MUST pass vulnerable=true to certipy_find. Without it, the ",
+                "output will not flag ESC vulnerabilities and no vulns will be registered.\n\n",
                 "AUTHENTICATION: If password is empty and an NTLM hash is provided, use the ",
                 "certipy_find tool with the 'hashes' parameter (format ':nthash'). Do NOT pass ",
                 "an empty password.\n\n",
@@ -476,7 +480,8 @@ impl Dispatcher {
                 "client_authentication, any_purpose, enrollment_rights, and which users/groups can enroll\n\n",
                 "Check for: ESC1 (Enrollee Supplies Subject + Client Auth), ESC2 (Any Purpose EKU), ",
                 "ESC3 (enrollment agent), ESC4 (template ACL abuse), ESC6 (EDITF flag), ",
-                "ESC7 (ManageCA), ESC8 (Web Enrollment HTTP relay).\n",
+                "ESC7 (ManageCA), ESC8 (Web Enrollment HTTP relay), ESC9 (UPN Spoofing), ",
+                "ESC13 (Issuance Policy).\n",
                 "If certipy_find fails, try with -stdout flag."
             ),
         });
@@ -486,6 +491,10 @@ impl Dispatcher {
             if let Some(user) = hash_username {
                 payload["hash_username"] = json!(user);
             }
+        }
+        // CA host IP for parser to set correct vuln target
+        if let Some(ca_ip) = ca_host_ip {
+            payload["ca_host_ip"] = json!(ca_ip);
         }
         // task_type "recon" → recon prompt template (supports instructions/ntlm_hash)
         // target_role "privesc" → privesc tools (certipy_find is only in privesc)

@@ -167,7 +167,7 @@ pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
         .flag("-p", password)
         .flag("--target", target_sam)
         .flag("--action", action)
-        .flag("-dc-ip", dc_ip)
+        .flag("--dc-ip", dc_ip)
         .timeout_secs(120)
         .execute()
         .await

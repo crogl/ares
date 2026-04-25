@@ -159,8 +159,12 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
+    info!("auto_acl_discovery: spawned, waiting 45s for initial recon");
+
     // Wait for initial recon to populate domain controllers.
     tokio::time::sleep(Duration::from_secs(45)).await;
+
+    info!("auto_acl_discovery: initial wait complete, entering main loop");
 
     loop {
         tokio::select! {
@@ -172,13 +176,30 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
         }
 
         if !dispatcher.is_technique_allowed("acl_discovery") {
+            debug!("auto_acl_discovery: technique not allowed");
             continue;
         }
 
         let work: Vec<AclDiscoveryWork> = {
             let state = dispatcher.state.read().await;
+            let dcs = state.all_domains_with_dcs();
+            let creds = state.credentials.len();
+            let hashes = state.hashes.len();
+            info!(
+                dc_count = dcs.len(),
+                creds, hashes, "auto_acl_discovery: tick"
+            );
             collect_acl_discovery_work(&state)
         };
+
+        if work.is_empty() {
+            debug!("auto_acl_discovery: no work items");
+        } else {
+            info!(
+                count = work.len(),
+                "auto_acl_discovery: work items collected"
+            );
+        }
 
         for item in work {
             // When PTH hash is available, use the hash user's identity for the target domain
@@ -247,7 +268,10 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                 payload["hash_username"] = json!(user);
             }
 
-            let priority = dispatcher.effective_priority("acl_discovery");
+            // ACL discovery is high-priority — it gates RBCD, shadow creds,
+            // and DACL abuse exploitation paths. Use priority 2 to compete
+            // with credential_access tasks rather than sitting behind them.
+            let priority = 2;
             match dispatcher
                 .throttled_submit("recon", "recon", payload, priority)
                 .await
@@ -271,6 +295,11 @@ pub async fn auto_acl_discovery(dispatcher: Arc<Dispatcher>, mut shutdown: watch
                         .await;
                 }
                 Ok(None) => {
+                    // Don't mark dedup on defer — the deferred queue will
+                    // retry and we need the work item to remain eligible in
+                    // case the deferred task never dispatches. Duplicate
+                    // enqueues to the deferred queue are harmless (it dedupes
+                    // by payload hash).
                     debug!(domain = %item.domain, "ACL discovery deferred");
                 }
                 Err(e) => {

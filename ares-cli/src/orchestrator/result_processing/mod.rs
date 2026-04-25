@@ -171,7 +171,13 @@ pub async fn process_completed_task(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
         {
-            if result.success {
+            // Guard: LLM may call task_complete (success=true) with a result
+            // that actually describes a failure. Don't mark as exploited if the
+            // result summary contains clear failure indicators.
+            let actually_succeeded =
+                result.success && !result_text_indicates_failure(&result.result);
+
+            if actually_succeeded {
                 info!(vuln_id = %vuln_id, task_id = %task_id, "Marking vulnerability as exploited");
                 if let Err(e) = dispatcher
                     .state
@@ -232,6 +238,40 @@ pub async fn process_completed_task(
     dispatcher.delegation_notify.notify_waiters();
 
     let _ = dispatcher.notify_state_update().await;
+}
+
+/// Check whether a task result's text indicates the LLM reported a failure,
+/// even though the task technically completed (task_complete was called).
+fn result_text_indicates_failure(result: &Option<Value>) -> bool {
+    let text = match result {
+        Some(v) => {
+            // Check both "summary" field and full JSON string
+            let summary = v.get("summary").and_then(|s| s.as_str()).unwrap_or("");
+            if !summary.is_empty() {
+                summary.to_string()
+            } else {
+                v.to_string()
+            }
+        }
+        None => return false,
+    };
+    let lower = text.to_lowercase();
+    lower.starts_with("failed")
+        || lower.contains("\"failed:")
+        || lower.contains("\"failed ")
+        || lower.contains("failed to exploit")
+        || lower.contains("failed esc")
+        || lower.contains("missing required")
+        || lower.contains("missing ca")
+        || lower.contains("without ca name")
+        || lower.contains("cannot attempt")
+        || lower.contains("cannot execute")
+        || lower.contains("not available in")
+        || lower.contains("ept_s_not_registered")
+        || lower.contains("blocked:")
+        || lower.contains("invalidcredentials")
+        || lower.contains("status_account_locked")
+        || lower.contains("rpc_s_access_denied")
 }
 
 /// Resolve the domain for hash/credential attribution from the task's target IP.

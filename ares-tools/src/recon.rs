@@ -599,6 +599,113 @@ pub async fn smbclient_kerberos_shares(args: &Value) -> Result<ToolOutput> {
     cmd.arg(format!("@{target}")).execute().await
 }
 
+/// Enumerate ACL attack paths via LDAP nTSecurityDescriptor queries.
+///
+/// Queries all user, group, and computer objects requesting nTSecurityDescriptor,
+/// sAMAccountName, objectClass, and objectSid. The binary SD data is parsed
+/// by the ntsd parser to identify dangerous ACEs.
+///
+/// Required args: `target`, `domain`
+/// Optional args: `username`, `password`, `bind_domain`, `hash`
+pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let domain = required_str(args, "domain")?;
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
+    let bind_domain = optional_str(args, "bind_domain");
+    let hash = optional_str(args, "hash");
+
+    let base_dn = domain_to_base_dn(domain);
+    let uri = format!("ldap://{target}");
+
+    // If hash is provided, use impacket LDAP for pass-the-hash
+    if let (Some(u), Some(h)) = (username, hash) {
+        let nt_hash = if h.contains(':') {
+            h.rsplit(':').next().unwrap_or(h)
+        } else {
+            h
+        };
+        let ldap_query = format!(
+            r#"python3 -c "
+import base64
+from impacket.ldap import ldap as ldap_mod
+conn = ldap_mod.LDAPConnection('ldap://{target}', '{base_dn}', '{target}')
+conn.login('{u}', '', '{domain}', lmhash='', nthash='{nt_hash}')
+sc = ldap_mod.SimplePagedResultsControl(size=1000)
+resp = conn.search(
+    searchFilter='(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))',
+    attributes=['sAMAccountName','objectClass','objectSid','nTSecurityDescriptor'],
+    searchControls=[sc],
+    sizeLimit=0,
+)
+for item in resp:
+    try:
+        dn = str(item['objectName'])
+        if not dn:
+            continue
+        print(f'dn: {{dn}}')
+        for attr in item['attributes']:
+            name = str(attr['type'])
+            for val in attr['vals']:
+                if name == 'nTSecurityDescriptor':
+                    b = bytes(val)
+                    print(f'nTSecurityDescriptor:: {{base64.b64encode(b).decode()}}')
+                elif name == 'objectSid':
+                    b = bytes(val)
+                    print(f'objectSid:: {{base64.b64encode(b).decode()}}')
+                else:
+                    print(f'{{name}}: {{val}}')
+        print()
+    except Exception:
+        pass
+"
+"#,
+            target = target,
+            domain = domain,
+            u = u,
+            nt_hash = nt_hash,
+            base_dn = base_dn,
+        );
+        return CommandBuilder::new("bash")
+            .args(["-c", &ldap_query])
+            .timeout_secs(300)
+            .execute()
+            .await;
+    }
+
+    // Password-based: use ldapsearch with LDAP_SERVER_SD_FLAGS_OID control
+    // to request DACL (value 4) in the nTSecurityDescriptor attribute
+    let mut cmd = CommandBuilder::new("ldapsearch")
+        .arg("-x")
+        .flag("-H", &uri)
+        .timeout_secs(300);
+
+    if let (Some(u), Some(p)) = (username, password) {
+        let auth_domain = bind_domain.unwrap_or(domain);
+        let bind_dn = format!("{u}@{auth_domain}");
+        cmd = cmd.flag("-D", bind_dn).flag("-w", p);
+    }
+
+    cmd = cmd
+        .flag("-b", &base_dn)
+        // Request DACL only via SD_FLAGS control (0x04 = DACL)
+        // BER: SEQUENCE { INTEGER 4 } = 30 03 02 01 04 → base64 MAMCAQQ=
+        .args(["-E", "1.2.840.113556.1.4.801=::MAMCAQQ="])
+        .arg("(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))")
+        .args([
+            "sAMAccountName",
+            "objectClass",
+            "objectSid",
+            "nTSecurityDescriptor",
+        ]);
+
+    cmd.execute().await
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;

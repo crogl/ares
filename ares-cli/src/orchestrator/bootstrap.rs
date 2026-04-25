@@ -8,11 +8,12 @@ use crate::orchestrator::config::OrchestratorConfig;
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::task_queue::TaskQueue;
 
-/// Probe target IPs on port 88 (Kerberos) then 389 (LDAP) to find a real DC.
-/// Returns the first IP that accepts a TCP connection within 500ms.
-pub(crate) async fn probe_dc_port(ips: &[String]) -> Option<String> {
-    for port in [88u16, 389] {
-        for ip in ips {
+/// Probe ALL target IPs on ports 88 (Kerberos) and 389 (LDAP) to find every DC.
+/// Returns all IPs that accept a TCP connection within 500ms on either port.
+pub(crate) async fn probe_all_dcs(ips: &[String]) -> Vec<String> {
+    let mut dc_ips = Vec::new();
+    for ip in ips {
+        for port in [88u16, 389] {
             let addr = format!("{ip}:{port}");
             if let Ok(Ok(_)) = tokio::time::timeout(
                 std::time::Duration::from_millis(500),
@@ -21,11 +22,156 @@ pub(crate) async fn probe_dc_port(ips: &[String]) -> Option<String> {
             .await
             {
                 info!(ip = %ip, port = port, "DC probe: port open");
-                return Some(ip.clone());
+                dc_ips.push(ip.clone());
+                break; // Found open port, skip remaining ports for this IP
             }
         }
     }
-    None
+    dc_ips
+}
+
+/// Query a DC's LDAP rootDSE to discover its domain name.
+///
+/// Sends a minimal anonymous LDAP SearchRequest for `defaultNamingContext`,
+/// parses the DN response (e.g. `DC=north,DC=sevenkingdoms,DC=local`), and
+/// converts it to a domain name (`north.sevenkingdoms.local`).
+///
+/// Returns `None` if the connection fails, the DC doesn't respond, or the
+/// response doesn't contain a parseable `defaultNamingContext`.
+pub(crate) async fn query_dc_domain(ip: &str) -> Option<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Pre-built LDAP SearchRequest:
+    //   messageId=1, base="", scope=baseObject, filter=present(objectClass),
+    //   attributes=[defaultNamingContext]
+    #[rustfmt::skip]
+    let ldap_request: &[u8] = &[
+        0x30, 0x3b,                         // SEQUENCE, length 59
+        0x02, 0x01, 0x01,                   // INTEGER messageId = 1
+        0x63, 0x36,                         // APPLICATION[3] SearchRequest, length 54
+        0x04, 0x00,                         //   baseObject = ""
+        0x0a, 0x01, 0x00,                   //   scope = baseObject (0)
+        0x0a, 0x01, 0x00,                   //   derefAliases = neverDeref (0)
+        0x02, 0x01, 0x00,                   //   sizeLimit = 0
+        0x02, 0x01, 0x05,                   //   timeLimit = 5
+        0x01, 0x01, 0x00,                   //   typesOnly = false
+        0x87, 0x0b,                         //   present filter, length 11
+        b'o', b'b', b'j', b'e', b'c', b't', b'C', b'l', b'a', b's', b's',
+        0x30, 0x16,                         //   attributes SEQUENCE, length 22
+        0x04, 0x14,                         //     OCTET STRING, length 20
+        b'd', b'e', b'f', b'a', b'u', b'l', b't', b'N', b'a', b'm', b'i',
+        b'n', b'g', b'C', b'o', b'n', b't', b'e', b'x', b't',
+    ];
+
+    let addr = format!("{ip}:389");
+    let mut stream = match tokio::time::timeout(
+        std::time::Duration::from_millis(1000),
+        tokio::net::TcpStream::connect(&addr),
+    )
+    .await
+    {
+        Ok(Ok(s)) => s,
+        _ => {
+            warn!(ip = %ip, "LDAP rootDSE: connection failed");
+            return None;
+        }
+    };
+
+    if stream.write_all(ldap_request).await.is_err() {
+        return None;
+    }
+
+    let mut buf = vec![0u8; 4096];
+    let n = match tokio::time::timeout(
+        std::time::Duration::from_millis(2000),
+        stream.read(&mut buf),
+    )
+    .await
+    {
+        Ok(Ok(n)) if n > 0 => n,
+        _ => return None,
+    };
+
+    let domain = parse_dn_from_ldap_response(&buf[..n]);
+    if let Some(ref d) = domain {
+        info!(ip = %ip, domain = %d, "LDAP rootDSE: discovered DC domain");
+    } else {
+        warn!(ip = %ip, "LDAP rootDSE: could not parse defaultNamingContext");
+    }
+    domain
+}
+
+/// Parse `defaultNamingContext` DN from raw LDAP response bytes.
+///
+/// Locates the `defaultNamingContext` attribute name, then finds the subsequent
+/// DN value containing `DC=` components and converts it to a domain name.
+fn parse_dn_from_ldap_response(data: &[u8]) -> Option<String> {
+    let attr_name = b"defaultNamingContext";
+    let pos = data.windows(attr_name.len()).position(|w| w == attr_name)?;
+
+    // After the attribute name, scan forward for "DC=" which starts the DN value
+    let remaining = &data[pos + attr_name.len()..];
+    let dc_pos = remaining
+        .windows(3)
+        .position(|w| w.eq_ignore_ascii_case(b"DC="))?;
+
+    let dn_start = pos + attr_name.len() + dc_pos;
+    let mut dn_end = dn_start;
+    while dn_end < data.len() && data[dn_end] >= 0x20 && data[dn_end] <= 0x7e {
+        dn_end += 1;
+    }
+
+    let dn_str = std::str::from_utf8(&data[dn_start..dn_end]).ok()?;
+    dn_to_domain(dn_str)
+}
+
+/// Convert an LDAP DN like `DC=child,DC=contoso,DC=local` to `child.contoso.local`.
+fn dn_to_domain(dn: &str) -> Option<String> {
+    let parts: Vec<&str> = dn
+        .split(',')
+        .filter_map(|component| {
+            let component = component.trim();
+            if component.len() > 3 && component[..3].eq_ignore_ascii_case("DC=") {
+                Some(&component[3..])
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if parts.is_empty() {
+        return None;
+    }
+    Some(parts.join(".").to_lowercase())
+}
+
+/// Discover all DCs and their domains from target IPs.
+///
+/// 1. Probes all IPs on ports 88/389 to find DCs
+/// 2. Queries each DC's LDAP rootDSE to discover its actual domain
+/// 3. Falls back to `fallback_domain` if LDAP query fails
+///
+/// Returns `Vec<(domain, ip)>` with one entry per unique domain.
+pub(crate) async fn discover_dc_domains(
+    ips: &[String],
+    fallback_domain: &str,
+) -> Vec<(String, String)> {
+    let dc_ips = probe_all_dcs(ips).await;
+    let mut results = Vec::new();
+    let mut seen_domains = std::collections::HashSet::new();
+
+    for ip in &dc_ips {
+        let domain = query_dc_domain(ip)
+            .await
+            .unwrap_or_else(|| fallback_domain.to_lowercase());
+
+        // First DC for each domain wins — skip duplicates (e.g. redundant DCs)
+        if seen_domains.insert(domain.clone()) {
+            results.push((domain, ip.clone()));
+        }
+    }
+
+    results
 }
 
 /// Write initial operation metadata to Redis so workers can discover the operation.
@@ -193,4 +339,122 @@ pub(crate) async fn dispatch_initial_recon(
     }
 
     count
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dn_to_domain_child() {
+        assert_eq!(
+            dn_to_domain("DC=child,DC=contoso,DC=local"),
+            Some("child.contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn dn_to_domain_root() {
+        assert_eq!(
+            dn_to_domain("DC=contoso,DC=local"),
+            Some("contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn dn_to_domain_single_component() {
+        assert_eq!(dn_to_domain("DC=local"), Some("local".to_string()));
+    }
+
+    #[test]
+    fn dn_to_domain_case_insensitive() {
+        assert_eq!(
+            dn_to_domain("dc=CONTOSO,dc=LOCAL"),
+            Some("contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn dn_to_domain_with_spaces() {
+        assert_eq!(
+            dn_to_domain("DC=child, DC=contoso, DC=local"),
+            Some("child.contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn dn_to_domain_mixed_components() {
+        // DN with OU components should only extract DC parts
+        assert_eq!(
+            dn_to_domain("OU=Users,DC=contoso,DC=local"),
+            Some("contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn dn_to_domain_empty() {
+        assert_eq!(dn_to_domain(""), None);
+    }
+
+    #[test]
+    fn dn_to_domain_no_dc() {
+        assert_eq!(dn_to_domain("OU=Users,CN=admin"), None);
+    }
+
+    #[test]
+    fn parse_dn_from_ldap_response_realistic() {
+        // Simulate a response containing the attribute name followed by a BER-encoded value
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x30\x50\x02\x01\x01\x64\x4b"); // LDAP envelope
+        data.extend_from_slice(b"\x04\x00"); // objectName=""
+        data.extend_from_slice(b"\x30\x45"); // attributes SEQUENCE
+        data.extend_from_slice(b"\x30\x43"); // partial attribute SEQUENCE
+        data.extend_from_slice(b"\x04\x14"); // type OCTET STRING, len 20
+        data.extend_from_slice(b"defaultNamingContext");
+        data.extend_from_slice(b"\x31\x29"); // vals SET, len 41
+        data.extend_from_slice(b"\x04\x27"); // value OCTET STRING, len 39
+        data.extend_from_slice(b"DC=child,DC=contoso,DC=local");
+        data.push(0x00); // null terminator (end of printable range)
+
+        assert_eq!(
+            parse_dn_from_ldap_response(&data),
+            Some("child.contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_dn_from_ldap_response_root_domain() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x30\x40\x02\x01\x01\x64\x3b");
+        data.extend_from_slice(b"\x04\x00");
+        data.extend_from_slice(b"\x30\x35\x30\x33");
+        data.extend_from_slice(b"\x04\x14");
+        data.extend_from_slice(b"defaultNamingContext");
+        data.extend_from_slice(b"\x31\x19\x04\x17");
+        data.extend_from_slice(b"DC=contoso,DC=local");
+        data.push(0x00);
+
+        assert_eq!(
+            parse_dn_from_ldap_response(&data),
+            Some("contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_dn_from_ldap_response_no_attr() {
+        let data = b"\x30\x10\x02\x01\x01\x04\x0bsomethingElse";
+        assert_eq!(parse_dn_from_ldap_response(data), None);
+    }
+
+    #[test]
+    fn parse_dn_from_ldap_response_no_dc() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x04\x14");
+        data.extend_from_slice(b"defaultNamingContext");
+        data.extend_from_slice(b"\x31\x0a\x04\x08");
+        data.extend_from_slice(b"OU=Users"); // No DC= in value
+        data.push(0x00);
+
+        assert_eq!(parse_dn_from_ldap_response(&data), None);
+    }
 }

