@@ -10,7 +10,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
             name: "certipy_find".into(),
             description: "Find vulnerable certificate templates in Active Directory Certificate \
                 Services (AD CS). Enumerates CAs, templates, and identifies exploitable \
-                misconfigurations (ESC1-ESC8)."
+                misconfigurations (ESC1-ESC15)."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -93,6 +93,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "out": {
                         "type": "string",
                         "description": "Output filename for the PFX certificate (without .pfx extension). A unique name is auto-generated if not specified. The resulting file will be <out>.pfx — use this path for certipy_auth's pfx_path parameter."
+                    },
+                    "application_policies": {
+                        "type": "string",
+                        "description": "Application policy OID to include in the certificate request. Used for ESC15 (CVE-2024-49019) exploitation where the template uses application policy OIDs for authorization."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca", "template"]
@@ -313,6 +317,31 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca", "request_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_relay".into(),
+            description: "Start a Certipy relay listener for ADCS certificate enrollment via \
+                relay attacks. Supports HTTP relay (ESC8) and RPC relay (ESC11). \
+                For ESC8: target=http://ca-host. For ESC11: target=rpc://ca-host."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Relay target URL. Use 'http://<ca-host>' for ESC8 (HTTP web enrollment relay) or 'rpc://<ca-host>' for ESC11 (RPC certificate enrollment relay)."
+                    },
+                    "ca": {
+                        "type": "string",
+                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": "Certificate template to request during relay. Optional — defaults to Machine for HTTP or uses the CA's default."
+                    }
+                },
+                "required": ["target", "ca"]
             }),
         },
         ToolDefinition {

@@ -149,6 +149,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_ca" => privesc::certipy_ca(arguments).await,
         "certipy_retrieve" => privesc::certipy_retrieve(arguments).await,
         "certipy_esc7_full_chain" => privesc::certipy_esc7_full_chain(arguments).await,
+        "certipy_relay" => privesc::certipy_relay(arguments).await,
         "find_delegation" => privesc::find_delegation(arguments).await,
         "s4u_attack" => privesc::s4u_attack(arguments).await,
         "generate_golden_ticket" => privesc::generate_golden_ticket(arguments).await,

@@ -472,7 +472,7 @@ impl Dispatcher {
                 "an empty password.\n\n",
                 "If a password IS provided, use certipy_find with 'password' parameter.\n\n",
                 "For each vulnerable template found, register a vulnerability with:\n",
-                "  vuln_type: the ESC type (e.g. 'esc1', 'esc2', 'esc3', 'esc4', 'esc6', 'esc8')\n",
+                "  vuln_type: the ESC type (e.g. 'esc1', 'esc2', 'esc3', 'esc4', 'esc6', 'esc8', 'esc10', 'esc11', 'esc15')\n",
                 "  target: the certificate template name\n",
                 "  target_ip: the CA server IP\n",
                 "  domain: the domain\n",
@@ -481,7 +481,9 @@ impl Dispatcher {
                 "Check for: ESC1 (Enrollee Supplies Subject + Client Auth), ESC2 (Any Purpose EKU), ",
                 "ESC3 (enrollment agent), ESC4 (template ACL abuse), ESC6 (EDITF flag), ",
                 "ESC7 (ManageCA), ESC8 (Web Enrollment HTTP relay), ESC9 (UPN Spoofing), ",
-                "ESC13 (Issuance Policy).\n",
+                "ESC10 (Weak Certificate Mapping / StrongCertificateBindingEnforcement=0), ",
+                "ESC11 (RPC enrollment relay / IF_ENFORCEENCRYPTICERTREQUEST disabled), ",
+                "ESC13 (Issuance Policy), ESC15 (Application Policy OID / CVE-2024-49019).\n",
                 "If certipy_find fails, try with -stdout flag."
             ),
         });

@@ -80,18 +80,29 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // domain_controllers doesn't have an entry.
             let dc_ip = state.resolve_dc_ip(&domain);
 
-            // Only use same-domain cleartext cred — cross-domain fallback burns
-            // the dedup slot with a guaranteed-to-fail task, blocking the correct
-            // hash from ever firing.
+            // Prefer same-domain cleartext cred; fall back to any trusted-domain
+            // cred. certipy_find is read-only LDAP enumeration that works cross-domain
+            // via forest trusts, so restricting to same-domain blocks discovery when
+            // early creds come from a different domain than the CA host.
             let cred = if !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_cred) {
+                let domain_lower = domain.to_lowercase();
+                // First try same-domain
                 state
                     .credentials
                     .iter()
                     .find(|c| {
                         !c.password.is_empty()
-                            && c.domain.to_lowercase() == domain.to_lowercase()
+                            && c.domain.to_lowercase() == domain_lower
                             && !state.is_delegation_account(&c.username)
                             && !state.is_credential_quarantined(&c.username, &c.domain)
+                    })
+                    // Fall back to any non-quarantined cred (cross-domain via trust)
+                    .or_else(|| {
+                        state.credentials.iter().find(|c| {
+                            !c.password.is_empty()
+                                && !state.is_delegation_account(&c.username)
+                                && !state.is_credential_quarantined(&c.username, &c.domain)
+                        })
                     })
                     .cloned()
             } else {
@@ -102,9 +113,9 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             let (ntlm_hash, ntlm_hash_username) = if cred.is_none()
                 && !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash)
             {
-                // Look for Administrator NTLM hash for this domain
-                // Also match hashes with empty domain (from secretsdump
-                // runs that didn't tag the domain properly).
+                // Prefer Administrator hash for same domain, then any same-domain hash,
+                // then any Administrator hash (cross-domain), then any hash at all.
+                // certipy_find is read-only LDAP enum — cross-domain hashes work via trust.
                 let domain_lower = domain.to_lowercase();
                 state
                     .hashes
@@ -119,6 +130,20 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                         state.hashes.iter().find(|h| {
                             h.hash_type.to_lowercase() == "ntlm"
                                 && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                                && !state.is_delegation_account(&h.username)
+                        })
+                    })
+                    .or_else(|| {
+                        // Cross-domain: any Administrator hash
+                        state.hashes.iter().find(|h| {
+                            h.hash_type.to_lowercase() == "ntlm"
+                                && h.username.to_lowercase() == "administrator"
+                        })
+                    })
+                    .or_else(|| {
+                        // Cross-domain: any NTLM hash
+                        state.hashes.iter().find(|h| {
+                            h.hash_type.to_lowercase() == "ntlm"
                                 && !state.is_delegation_account(&h.username)
                         })
                     })
@@ -182,7 +207,35 @@ pub async fn auto_adcs_enumeration(
 
         let work = {
             let state = dispatcher.state.read().await;
-            collect_adcs_work(&state)
+            let creds = state.credentials.len();
+            let hashes = state.hashes.len();
+            let certenroll_shares: Vec<_> = state
+                .shares
+                .iter()
+                .filter(|s| s.name.to_lowercase() == "certenroll")
+                .collect();
+            let ce_count = certenroll_shares.len();
+            let ce_hosts: Vec<_> = certenroll_shares.iter().map(|s| s.host.as_str()).collect();
+            let cred_domains: Vec<_> = state
+                .credentials
+                .iter()
+                .map(|c| c.domain.as_str())
+                .collect();
+            let hash_domains: Vec<_> = state.hashes.iter().map(|h| h.domain.as_str()).collect();
+            let domains: Vec<_> = state.domains.iter().map(|d| d.as_str()).collect();
+            let w = collect_adcs_work(&state);
+            info!(
+                creds,
+                hashes,
+                certenroll_shares = ce_count,
+                ?ce_hosts,
+                ?cred_domains,
+                ?hash_domains,
+                ?domains,
+                work_items = w.len(),
+                "auto_adcs_enumeration: tick"
+            );
+            w
         };
 
         for item in work {
@@ -401,7 +454,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_quarantined_same_domain_skipped_without_hash() {
+    fn collect_quarantined_same_domain_falls_back_to_cross_domain() {
         let mut state = StateInner::new("test-op".into());
         state.shares.push(make_share("192.168.58.50", "CertEnroll"));
         state
@@ -415,13 +468,15 @@ mod tests {
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
         state.quarantine_credential("baduser", "contoso.local");
-        // No same-domain cred (quarantined) and no hash → skip (don't burn dedup slot)
+        // Same-domain cred quarantined → falls back to cross-domain cred
+        // (certipy_find is read-only LDAP enum that works via forest trusts)
         let work = collect_adcs_work(&state);
         assert_eq!(
             work.len(),
-            0,
-            "quarantined same-domain cred should not fall back to cross-domain"
+            1,
+            "should fall back to cross-domain cred for certipy_find"
         );
+        assert_eq!(work[0].credential.username, "gooduser");
     }
 
     #[test]

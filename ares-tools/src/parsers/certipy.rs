@@ -154,12 +154,14 @@ fn extract_template_for_esc(output: &str, esc_type: &str) -> Option<String> {
 /// Priority for ESC types (lower = more urgent).
 fn esc_priority(esc_type: &str) -> i32 {
     match esc_type {
-        "esc1" | "esc6" => 1, // Direct enrollment → DA cert
-        "esc4" | "esc8" => 2, // Template abuse / relay
-        "esc2" | "esc3" => 3, // Certificate agent
-        "esc7" | "esc9" => 4, // ManageCA / UPN spoof
-        "esc5" => 5,          // Golden cert (requires CA compromise first)
-        _ => 6,               // ESC10-15 and unknown
+        "esc1" | "esc6" => 1,           // Direct enrollment → DA cert
+        "esc4" | "esc8" => 2,           // Template abuse / relay
+        "esc2" | "esc3" | "esc15" => 3, // Certificate agent / app policy OID
+        "esc7" | "esc9" | "esc10" => 4, // ManageCA / UPN spoof / weak mapping
+        "esc11" => 4,                   // RPC relay (needs coercion)
+        "esc5" => 5,                    // Golden cert (requires CA compromise first)
+        "esc13" => 4,                   // Issuance policy
+        _ => 6,                         // ESC14 and unknown
     }
 }
 
@@ -274,12 +276,13 @@ mod tests {
         assert_eq!(esc_priority("esc8"), 2);
         assert_eq!(esc_priority("esc2"), 3);
         assert_eq!(esc_priority("esc3"), 3);
+        assert_eq!(esc_priority("esc15"), 3);
         assert_eq!(esc_priority("esc7"), 4);
         assert_eq!(esc_priority("esc9"), 4);
+        assert_eq!(esc_priority("esc10"), 4);
+        assert_eq!(esc_priority("esc11"), 4);
+        assert_eq!(esc_priority("esc13"), 4);
         assert_eq!(esc_priority("esc5"), 5);
-        assert_eq!(esc_priority("esc10"), 6);
-        assert_eq!(esc_priority("esc11"), 6);
-        assert_eq!(esc_priority("esc13"), 6);
         assert_eq!(esc_priority("unknown"), 6);
     }
 

