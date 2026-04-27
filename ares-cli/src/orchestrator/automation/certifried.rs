@@ -48,21 +48,14 @@ fn collect_certifried_work(state: &StateInner) -> Vec<CertifriedWork> {
             .map(|h| h.hostname.clone())
             .filter(|h| !h.is_empty());
 
-        // Need a credential for this domain
-        let cred = match state
-            .credentials
-            .iter()
-            .find(|c| {
-                c.domain.to_lowercase() == domain.to_lowercase()
-                    && !c.password.is_empty()
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
-            })
-            .or_else(|| {
-                state.credentials.iter().find(|c| {
-                    !c.password.is_empty()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
-                })
-            }) {
+        // Certifried creates a machine account in the TARGET domain via MAQ.
+        // Cross-forest credentials cannot create machine accounts in a foreign
+        // forest, so require a credential whose domain matches the target.
+        let cred = match state.credentials.iter().find(|c| {
+            c.domain.to_lowercase() == domain.to_lowercase()
+                && !c.password.is_empty()
+                && !state.is_credential_quarantined(&c.username, &c.domain)
+        }) {
             Some(c) => c.clone(),
             None => continue,
         };
@@ -310,7 +303,7 @@ mod tests {
     }
 
     #[test]
-    fn collect_falls_back_to_cross_domain_credential() {
+    fn collect_skips_when_only_cross_forest_credential() {
         let mut state = StateInner::new("test-op".into());
         state
             .domain_controllers
@@ -318,9 +311,10 @@ mod tests {
         state
             .credentials
             .push(make_credential("crossuser", "Cross!1", "fabrikam.local")); // pragma: allowlist secret
+                                                                              // Certifried needs a target-domain credential to create a machine
+                                                                              // account in the target forest; cross-forest creds cannot do this.
         let work = collect_certifried_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].credential.username, "crossuser");
+        assert!(work.is_empty());
     }
 
     #[test]

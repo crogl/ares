@@ -145,7 +145,7 @@ pub async fn auto_ldap_signing(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                             d.insert("channel_binding".to_string(), json!(false));
                             d
                         },
-                        recommended_agent: "credential_access".to_string(),
+                        recommended_agent: "coercion".to_string(),
                         priority: dispatcher.effective_priority("ldap_signing"),
                     };
 
