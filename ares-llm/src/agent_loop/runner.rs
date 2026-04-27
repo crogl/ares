@@ -127,6 +127,7 @@ pub async fn run_agent_loop(
     let mut steps: u32 = 0;
     let mut tool_calls_dispatched: u32 = 0;
     let mut all_discoveries: Vec<serde_json::Value> = Vec::new();
+    let mut all_llm_findings: Vec<serde_json::Value> = Vec::new();
     let mut all_tool_outputs: Vec<String> = Vec::new();
 
     // Dynamic tool filtering: track unavailable tools and per-tool call counts
@@ -146,6 +147,7 @@ pub async fn run_agent_loop(
                 total_usage,
                 tool_calls_dispatched,
                 all_discoveries,
+                all_llm_findings,
                 all_tool_outputs,
             );
         }
@@ -170,6 +172,7 @@ pub async fn run_agent_loop(
                 total_usage,
                 tool_calls_dispatched,
                 all_discoveries,
+                all_llm_findings,
                 all_tool_outputs,
             );
         }
@@ -227,6 +230,7 @@ pub async fn run_agent_loop(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -263,6 +267,7 @@ pub async fn run_agent_loop(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -274,6 +279,7 @@ pub async fn run_agent_loop(
                     total_usage,
                     tool_calls_dispatched,
                     all_discoveries,
+                    all_llm_findings,
                     all_tool_outputs,
                 );
             }
@@ -551,6 +557,7 @@ pub async fn run_agent_loop(
                                     total_usage,
                                     tool_calls_dispatched,
                                     all_discoveries,
+                                    all_llm_findings,
                                     all_tool_outputs,
                                 );
                             }
@@ -563,6 +570,7 @@ pub async fn run_agent_loop(
                                     total_usage,
                                     tool_calls_dispatched,
                                     all_discoveries,
+                                    all_llm_findings,
                                     all_tool_outputs,
                                 );
                             }
@@ -573,11 +581,8 @@ pub async fn run_agent_loop(
                                 }
                                 messages.push(tr);
                             }
-                            Ok(CallbackResult::Finding {
-                                response,
-                                discovery,
-                            }) => {
-                                all_discoveries.push(discovery);
+                            Ok(CallbackResult::LlmFinding { response, finding }) => {
+                                all_llm_findings.push(finding);
                                 messages.push(ChatMessage::tool_result(&call_id, &response));
                             }
                             Err(e) => {
@@ -632,6 +637,7 @@ pub async fn run_agent_loop(
                                 total_usage,
                                 tool_calls_dispatched,
                                 all_discoveries,
+                                all_llm_findings,
                                 all_tool_outputs,
                             );
                         }
@@ -644,6 +650,7 @@ pub async fn run_agent_loop(
                                 total_usage,
                                 tool_calls_dispatched,
                                 all_discoveries,
+                                all_llm_findings,
                                 all_tool_outputs,
                             );
                         }
@@ -654,11 +661,8 @@ pub async fn run_agent_loop(
                             }
                             messages.push(tr);
                         }
-                        Ok(CallbackResult::Finding {
-                            response,
-                            discovery,
-                        }) => {
-                            all_discoveries.push(discovery);
+                        Ok(CallbackResult::LlmFinding { response, finding }) => {
+                            all_llm_findings.push(finding);
                             messages.push(ChatMessage::tool_result(&call.id, &response));
                         }
                         Err(e) => {
@@ -711,6 +715,7 @@ pub async fn run_agent_loop(
                             total_usage,
                             tool_calls_dispatched,
                             all_discoveries,
+                            all_llm_findings,
                             all_tool_outputs,
                         );
                     }
@@ -723,6 +728,7 @@ pub async fn run_agent_loop(
                             total_usage,
                             tool_calls_dispatched,
                             all_discoveries,
+                            all_llm_findings,
                             all_tool_outputs,
                         );
                     }
@@ -733,11 +739,8 @@ pub async fn run_agent_loop(
                         }
                         messages.push(tr);
                     }
-                    Ok(CallbackResult::Finding {
-                        response,
-                        discovery,
-                    }) => {
-                        all_discoveries.push(discovery);
+                    Ok(CallbackResult::LlmFinding { response, finding }) => {
+                        all_llm_findings.push(finding);
                         messages.push(ChatMessage::tool_result(&call.id, &response));
                     }
                     Err(e) => {
@@ -762,6 +765,7 @@ fn finish(
     total_usage: TokenUsage,
     tool_calls_dispatched: u32,
     discoveries: Vec<serde_json::Value>,
+    llm_findings: Vec<serde_json::Value>,
     tool_outputs: Vec<String>,
 ) -> AgentLoopOutcome {
     if session_log.enabled() {
@@ -774,6 +778,7 @@ fn finish(
         steps,
         tool_calls_dispatched,
         discoveries,
+        llm_findings,
         tool_outputs,
     }
 }

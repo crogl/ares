@@ -550,6 +550,42 @@ fn exploit_child_to_parent_has_raise_child() {
 }
 
 #[test]
+fn exploit_child_to_parent_offers_extra_sid_via_child_krbtgt() {
+    let payload = serde_json::json!({
+        "vuln_type": "child_to_parent",
+        "target": "192.168.58.10",
+        "domain": "child.contoso.local",
+        "trusted_domain": "contoso.local",
+        "username": "Administrator",
+        "password": "P@ss1",
+        "dc_ip": "192.168.58.10",
+        "source_sid": "S-1-5-21-1111-2222-3333",
+        "target_sid": "S-1-5-21-4444-5555-6666",
+        "child_krbtgt_hash": "8c6d94541dbc90f085e86828428d2cbf",
+    });
+    let prompt = generate_task_prompt("exploit", "t-32", &payload, None).unwrap();
+    // ExtraSid via child krbtgt — generate_golden_ticket with extra_sid pointing
+    // at the parent's Enterprise Admins SID (RID 519).
+    assert!(prompt.contains("INTRA-FOREST CHILD→PARENT"));
+    assert!(prompt.contains("generate_golden_ticket"));
+    assert!(prompt.contains("8c6d94541dbc90f085e86828428d2cbf"));
+    assert!(prompt.contains("S-1-5-21-4444-5555-6666-519"));
+    // Followed by secretsdump_kerberos on the parent DC.
+    assert!(prompt.contains("secretsdump_kerberos"));
+    // The intra-forest path should NOT *invoke* extract_trust_key/get_sid/
+    // create_inter_realm_ticket — those are unnecessary when the child krbtgt
+    // is in hand and previously caused the LLM to bail out on empty creds.
+    // We allow the names to appear in a "Do NOT call" instruction but never
+    // as actual function-call syntax.
+    assert!(!prompt.contains("extract_trust_key("));
+    assert!(!prompt.contains("create_inter_realm_ticket("));
+    assert!(prompt.contains("Do NOT call extract_trust_key"));
+    // Fallbacks for SPN target name validation / DRSUAPI hardening.
+    assert!(prompt.contains("just_dc_user='krbtgt'"));
+    assert!(prompt.contains("use_vss=true"));
+}
+
+#[test]
 fn exploit_mssql_lateral_enumeration() {
     let state = StateSnapshot {
         credentials: vec![Credential {

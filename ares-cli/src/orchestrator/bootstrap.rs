@@ -105,6 +105,11 @@ pub(crate) async fn query_dc_domain(ip: &str) -> Option<String> {
 ///
 /// Locates the `defaultNamingContext` attribute name, then finds the subsequent
 /// DN value containing `DC=` components and converts it to a domain name.
+///
+/// Uses the BER OCTET STRING length prefix immediately preceding the `DC=`
+/// payload as the authoritative end-of-DN marker. Without this, a printable-byte
+/// scan would happily consume the next BER tag (0x30 SEQUENCE = ASCII '0'),
+/// producing phantom domains like `essos.local0` that poison downstream state.
 fn parse_dn_from_ldap_response(data: &[u8]) -> Option<String> {
     let attr_name = b"defaultNamingContext";
     let pos = data.windows(attr_name.len()).position(|w| w == attr_name)?;
@@ -116,9 +121,34 @@ fn parse_dn_from_ldap_response(data: &[u8]) -> Option<String> {
         .position(|w| w.eq_ignore_ascii_case(b"DC="))?;
 
     let dn_start = pos + attr_name.len() + dc_pos;
+
+    // Prefer the BER OCTET STRING length prefix (the byte immediately before
+    // `DC=`) for the DN length. Short-form only (high bit clear, non-zero).
     let mut dn_end = dn_start;
-    while dn_end < data.len() && data[dn_end] >= 0x20 && data[dn_end] <= 0x7e {
-        dn_end += 1;
+    if dc_pos > 0 {
+        let length_byte = remaining[dc_pos - 1];
+        if length_byte & 0x80 == 0 && length_byte > 0 {
+            let length = length_byte as usize;
+            if let Some(end) = dn_start.checked_add(length) {
+                if end <= data.len() {
+                    dn_end = end;
+                }
+            }
+        }
+    }
+
+    // Fallback: walk only DN-legal characters (alphanumeric, `=`, `,`, `-`).
+    // Stops before BER tag bytes (e.g. 0x30) that happen to be ASCII printable.
+    if dn_end == dn_start {
+        dn_end = dn_start;
+        while dn_end < data.len() {
+            let b = data[dn_end];
+            let is_dn_char = b.is_ascii_alphanumeric() || matches!(b, b'=' | b',' | b'-' | b'.');
+            if !is_dn_char {
+                break;
+            }
+            dn_end += 1;
+        }
     }
 
     let dn_str = std::str::from_utf8(&data[dn_start..dn_end]).ok()?;
@@ -456,5 +486,26 @@ mod tests {
         data.push(0x00);
 
         assert_eq!(parse_dn_from_ldap_response(&data), None);
+    }
+
+    /// Regression: the OCTET STRING value MUST be bounded by its BER length
+    /// prefix. Without that bound, a printable-byte scan happily consumes the
+    /// next BER SEQUENCE tag (0x30 = ASCII '0'), producing phantom domains
+    /// like `essos.local0` that poison the orchestrator's `domain_controllers`
+    /// keys and make the completion loop's required-forest set unsatisfiable.
+    #[test]
+    fn parse_dn_from_ldap_response_does_not_bleed_into_next_ber_tag() {
+        let mut data = Vec::new();
+        data.extend_from_slice(b"\x04\x14");
+        data.extend_from_slice(b"defaultNamingContext");
+        data.extend_from_slice(b"\x31\x13\x04\x11"); // SET len 19, OCTET STRING len 17
+        data.extend_from_slice(b"DC=essos,DC=local"); // exactly 17 bytes
+        data.extend_from_slice(b"\x30\x10"); // next SEQUENCE: tag 0x30 ('0'), len 0x10
+        data.extend_from_slice(b"trailingjunk");
+
+        assert_eq!(
+            parse_dn_from_ldap_response(&data),
+            Some("essos.local".to_string())
+        );
     }
 }

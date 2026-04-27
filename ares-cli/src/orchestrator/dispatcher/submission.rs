@@ -275,6 +275,17 @@ impl Dispatcher {
                         Some(ares_tools::parsers::merge_discoveries(&outcome.discoveries))
                     };
 
+                    // LLM-fabricated findings (`report_finding`,
+                    // `report_lateral_success`) are kept on a SEPARATE field so
+                    // `extract_discoveries` (which only reads "discoveries")
+                    // never feeds them into `publish_*` state writes. Reports
+                    // surface them under `llm_findings` for context only.
+                    let llm_findings_json: Option<Value> = if outcome.llm_findings.is_empty() {
+                        None
+                    } else {
+                        Some(Value::Array(outcome.llm_findings.clone()))
+                    };
+
                     // Collect raw tool outputs for secondary regex extraction
                     let tool_outputs_json: Vec<Value> = outcome
                         .tool_outputs
@@ -313,12 +324,17 @@ impl Dispatcher {
                             // The LLM's task_complete result is untrusted prose —
                             // any discovery-like keys it contains are ignored.
                             // Only ares-tools parsers (run on real tool stdout)
-                            // produce authoritative discoveries.
+                            // produce authoritative discoveries. LLM-fabricated
+                            // findings live on a separate `llm_findings` field.
                             if let Some(obj) = result_json.as_object_mut() {
                                 obj.remove("discoveries");
+                                obj.remove("llm_findings");
                             }
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
@@ -341,6 +357,9 @@ impl Dispatcher {
                             });
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
@@ -366,6 +385,9 @@ impl Dispatcher {
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
                             }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
+                            }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
@@ -384,6 +406,9 @@ impl Dispatcher {
                             let mut result_json = json!({"summary": content});
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
@@ -406,6 +431,9 @@ impl Dispatcher {
                             });
                             if let Some(disc) = merged_discoveries {
                                 result_json["discoveries"] = disc;
+                            }
+                            if let Some(findings) = llm_findings_json.clone() {
+                                result_json["llm_findings"] = findings;
                             }
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =

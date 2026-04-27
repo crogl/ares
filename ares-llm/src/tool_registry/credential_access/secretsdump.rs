@@ -43,6 +43,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "type": "string",
                     "description": "Path to Kerberos ccache ticket file for authentication"
                 },
+                "just_dc_user": {
+                    "type": "string",
+                    "description": "Restrict DCSync to a single account (e.g. 'krbtgt' or 'Administrator'). Bypasses 'SPN target name validation' / DRSUAPI hardening that blocks full dumps."
+                },
+                "use_vss": {
+                    "type": "boolean",
+                    "description": "Use VSS shadow-copy extraction instead of DRSUAPI. Falls back when DRSUAPI is hardened."
+                },
                 "timeout_minutes": {
                     "type": "integer",
                     "description": "Overall operation timeout in minutes (default: 3)",

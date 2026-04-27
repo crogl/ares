@@ -362,6 +362,25 @@ fn strip_trailing_dot_removes_dot() {
 }
 
 #[test]
+fn strip_trailing_dot_removes_netexec_zero_artifact() {
+    use super::strip_trailing_dot;
+    // NetExec appends "0" or "0." to domain names
+    assert_eq!(strip_trailing_dot("contoso.local0"), "contoso.local");
+    assert_eq!(strip_trailing_dot("contoso.local0."), "contoso.local");
+    assert_eq!(
+        strip_trailing_dot("child.contoso.local0"),
+        "child.contoso.local"
+    );
+    assert_eq!(strip_trailing_dot("fabrikam.local0."), "fabrikam.local");
+    // Must NOT strip real trailing 0 from hostnames like "host10"
+    assert_eq!(strip_trailing_dot("host10"), "host10");
+    assert_eq!(
+        strip_trailing_dot("dc10.contoso.local"),
+        "dc10.contoso.local"
+    );
+}
+
+#[test]
 fn strip_ansi_removes_escape_sequences() {
     use super::credentials::strip_ansi;
     let input = "\x1b[31mred text\x1b[0m";
@@ -1054,4 +1073,64 @@ fn dedup_credentials_normalizes_username_case() {
     let creds = vec![make_cred("contoso.local", "ADMIN", "P@ss1")];
     let deduped = dedup_credentials(&creds);
     assert_eq!(deduped[0].username, "admin");
+}
+
+#[test]
+fn is_ghost_machine_account_matches_nopac_pattern() {
+    use super::is_ghost_machine_account;
+    assert!(is_ghost_machine_account("WIN-G9FWV8ZNSCL$"));
+    assert!(is_ghost_machine_account("WIN-4D75DLR6UCC$"));
+    assert!(is_ghost_machine_account("win-bjak8xunhgd$"));
+    // without trailing $
+    assert!(is_ghost_machine_account("WIN-3KSGCLTS7NX"));
+}
+
+#[test]
+fn is_ghost_machine_account_rejects_real_hosts() {
+    use super::is_ghost_machine_account;
+    assert!(!is_ghost_machine_account("DC01$"));
+    assert!(!is_ghost_machine_account("WS01$"));
+    assert!(!is_ghost_machine_account("WIN-2019$")); // wrong length
+    assert!(!is_ghost_machine_account("administrator"));
+    assert!(!is_ghost_machine_account(""));
+}
+
+#[test]
+fn sanitize_credentials_drops_ghost_machine_accounts() {
+    let mut creds = vec![
+        make_cred("contoso.local", "WIN-G9FWV8ZNSCL$", "P@ss1"),
+        make_cred("contoso.local", "jdoe", "P@ss1"),
+    ];
+    sanitize_credentials(&mut creds);
+    assert_eq!(creds.len(), 1);
+    assert_eq!(creds[0].username, "jdoe");
+}
+
+#[test]
+fn dedup_hashes_drops_ghost_machine_accounts() {
+    let hashes = vec![
+        make_hash(
+            "contoso.local",
+            "WIN-4D75DLR6UCC$",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:da118ed665879916ceaacfb98e3ee74e",
+        ),
+        make_hash("contoso.local", "admin", "NTLM", "aabb"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].username, "admin");
+}
+
+#[test]
+fn dedup_users_drops_ghost_machine_accounts() {
+    let nb = HashMap::new();
+    let mut ghost = make_user("contoso.local", "WIN-BJAK8XUNHGD$");
+    ghost.source = "kerberos_enum".to_string();
+    let mut real = make_user("contoso.local", "jdoe");
+    real.source = "kerberos_enum".to_string();
+    let users = vec![ghost, real];
+    let deduped = dedup_users(&users, &nb);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].username, "jdoe");
 }

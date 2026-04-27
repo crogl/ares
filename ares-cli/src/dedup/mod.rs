@@ -7,9 +7,32 @@ pub(crate) mod users;
 #[cfg(test)]
 mod tests;
 
-/// Strip trailing DNS root dot from domain strings (e.g. `child.contoso.local.` → `child.contoso.local`).
+use regex::Regex;
+use std::sync::LazyLock;
+
+/// Strip trailing DNS root dot and NetExec "0." artifact from domain strings
+/// (e.g. `child.contoso.local.` → `child.contoso.local`,
+/// `essos.local0` → `essos.local`).
 pub(super) fn strip_trailing_dot(s: &str) -> &str {
-    s.strip_suffix('.').unwrap_or(s)
+    let s = s.trim_end_matches('.');
+    // NetExec sometimes appends "0" to domain TLDs. Strip if the char
+    // before the trailing 0 is alphabetic (i.e. TLD-like, not "host10").
+    match s.strip_suffix('0') {
+        Some(clean) if clean.ends_with(|c: char| c.is_ascii_alphabetic()) => clean,
+        _ => s,
+    }
+}
+
+/// Auto-generated Windows hostname pattern (`WIN-` + 11 alphanumerics + optional `$`).
+/// Used to filter ghost machine accounts that the agent created itself via
+/// NoPAC / MachineAccountQuota — not real lab hosts, just our own residue.
+static GHOST_MACHINE_ACCOUNT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^WIN-[A-Z0-9]{11}\$?$").unwrap());
+
+/// True if `username` looks like an auto-generated Windows machine account
+/// (e.g. `WIN-G9FWV8ZNSCL$`) — typically agent-created via NoPAC.
+pub(super) fn is_ghost_machine_account(username: &str) -> bool {
+    GHOST_MACHINE_ACCOUNT_RE.is_match(username.trim())
 }
 
 pub(crate) use credentials::{dedup_credentials, sanitize_credentials};

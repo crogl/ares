@@ -106,7 +106,7 @@ pub fn parse_spider_credentials(output: &str, params: &Value) -> Vec<Value> {
                 .unwrap_or(domain);
             let username = &cap[2];
             let password = &cap[3];
-            if is_plausible_password(password) {
+            if is_plausible_password(password) && is_plausible_username(username) {
                 creds.push(json!({
                     "username": username,
                     "password": password,
@@ -120,6 +120,7 @@ pub fn parse_spider_credentials(output: &str, params: &Value) -> Vec<Value> {
         let usernames: Vec<String> = RE_USERNAME
             .captures_iter(content)
             .filter_map(|cap| first_capture(&cap, &[1, 2, 3]))
+            .filter(|u| is_plausible_username(u))
             .collect();
 
         let passwords: Vec<String> = RE_PASSWORD
@@ -157,6 +158,7 @@ pub fn parse_spider_credentials(output: &str, params: &Value) -> Vec<Value> {
         let ps_users: Vec<String> = RE_PS_PARAM_USER
             .captures_iter(content)
             .filter_map(|cap| first_capture(&cap, &[1, 2, 3]))
+            .filter(|u| is_plausible_username(u))
             .collect();
 
         let ps_passes: Vec<String> = RE_PS_PARAM_PASS
@@ -201,13 +203,18 @@ pub fn parse_spider_credentials(output: &str, params: &Value) -> Vec<Value> {
 }
 
 /// Quick check that a value looks like a plausible password (not a variable ref,
-/// not too short, not a common placeholder).
+/// not a PowerShell cmdlet, not too short, not a common placeholder).
 fn is_plausible_password(s: &str) -> bool {
     if s.len() < 2 {
         return false;
     }
     // Skip variable references like $var, %var%
     if s.starts_with('$') || s.starts_with('%') {
+        return false;
+    }
+    // Skip PowerShell cmdlets (Verb-Noun) like `New-Object`, `Get-Credential`.
+    // Captured when scripts assign cmdlet output to $password without quotes.
+    if PS_CMDLET_RE.is_match(s) {
         return false;
     }
     // Skip common placeholders
@@ -217,6 +224,30 @@ fn is_plausible_password(s: &str) -> bool {
         "changeme" | "password" | "pass" | "xxx" | "todo" | "null" | "none" | "empty"
     )
 }
+
+/// Quick check that a value looks like a plausible username (not a variable
+/// reference, property access, or scriptblock fragment).
+fn is_plausible_username(s: &str) -> bool {
+    if s.len() < 2 {
+        return false;
+    }
+    // PowerShell variable / property access: `$x`, `$x.y`, `$env:X`
+    if s.starts_with('$') || s.starts_with('%') {
+        return false;
+    }
+    // Reject anything containing characters that don't appear in real
+    // usernames but DO appear in scriptblock fragments / expressions.
+    if s.chars()
+        .any(|c| matches!(c, '(' | ')' | '{' | '}' | '"' | '\'' | ';' | ' '))
+    {
+        return false;
+    }
+    true
+}
+
+/// PowerShell cmdlet shape: `Verb-Noun` with TitleCase verb and noun.
+static PS_CMDLET_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Z][a-zA-Z]+-[A-Z][a-zA-Z]+$").unwrap());
 
 #[cfg(test)]
 mod tests {
@@ -312,6 +343,29 @@ $pass = "P@ssw0rd"
     fn empty_output() {
         let creds = parse_spider_credentials("", &json!({}));
         assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn rejects_powershell_expression_username_and_cmdlet_password() {
+        // Real-world false positive that produced
+        // `essos.local\$user.username:New-Object` in loot. The username is a
+        // PowerShell property access expression, the "password" is a cmdlet
+        // name (Verb-Noun). Neither is a literal credential.
+        let output = r#"
+--- SYSVOL/scripts/userInfo.ps1 ---
+$user = $User.UserName
+$password = New-Object PSCredential
+"#;
+        let params = json!({"domain": "essos.local"});
+        let creds = parse_spider_credentials(output, &params);
+        assert!(
+            creds.is_empty(),
+            "expected zero creds, got {:?}",
+            creds
+                .iter()
+                .map(|c| format!("{}:{}", c["username"], c["password"]))
+                .collect::<Vec<_>>()
+        );
     }
 
     // ── split_domain_user ─────────────────────────────────────────

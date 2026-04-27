@@ -68,14 +68,15 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                 .to_string();
             info!(finding_type = %finding_type, target = %target, severity = %severity, "Finding reported: {description}");
 
-            // Build a structured vulnerability discovery so findings flow into
-            // reports via the normal discoveries pipeline instead of just logging.
+            // Route into `llm_findings` (NOT `discoveries`). The LLM-asserted
+            // payload reaches reports for context but MUST NOT feed
+            // `publish_vulnerability` — only parser-produced discoveries do.
             let vuln_id = if target.is_empty() {
                 format!("finding_{finding_type}")
             } else {
                 format!("finding_{}_{}", finding_type, target.replace('.', "_"))
             };
-            let discovery = serde_json::json!({
+            let finding = serde_json::json!({
                 "vulnerabilities": [{
                     "vuln_id": vuln_id,
                     "vuln_type": finding_type,
@@ -87,9 +88,9 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                     },
                 }]
             });
-            Ok(CallbackResult::Finding {
+            Ok(CallbackResult::LlmFinding {
                 response: format!("Finding recorded: {finding_type}"),
-                discovery,
+                finding,
             })
         }
         "report_lateral_success" => {
@@ -104,9 +105,9 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                 .to_string();
             info!(target = %target, technique = %technique, "Lateral movement succeeded");
 
-            // Inject as a finding so lateral success appears in reports
+            // Surface as an LLM finding only — does NOT feed `publish_vulnerability`.
             let vuln_id = format!("lateral_success_{}_{}", technique, target.replace('.', "_"));
-            let discovery = serde_json::json!({
+            let finding = serde_json::json!({
                 "vulnerabilities": [{
                     "vuln_id": vuln_id,
                     "vuln_type": format!("lateral_{technique}"),
@@ -118,9 +119,9 @@ pub(super) fn handle_builtin_callback(call: &ToolCall) -> Result<CallbackResult>
                     },
                 }]
             });
-            Ok(CallbackResult::Finding {
+            Ok(CallbackResult::LlmFinding {
                 response: format!("Lateral movement recorded: {technique} → {target}"),
-                discovery,
+                finding,
             })
         }
         "report_lateral_failed" => {
@@ -390,17 +391,14 @@ mod tests {
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Finding {
-                response,
-                discovery,
-            } => {
+            CallbackResult::LlmFinding { response, finding } => {
                 assert!(response.contains("kerberoastable_account"));
-                let vulns = discovery["vulnerabilities"].as_array().unwrap();
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
                 assert_eq!(vulns.len(), 1);
                 assert_eq!(vulns[0]["vuln_type"], "kerberoastable_account");
                 assert_eq!(vulns[0]["target"], "192.168.58.10");
             }
-            other => panic!("Expected Finding, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 
@@ -412,17 +410,14 @@ mod tests {
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Finding {
-                response,
-                discovery,
-            } => {
+            CallbackResult::LlmFinding { response, finding } => {
                 assert!(response.contains("psexec"));
                 assert!(response.contains("192.168.58.10"));
-                let vulns = discovery["vulnerabilities"].as_array().unwrap();
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
                 assert_eq!(vulns.len(), 1);
                 assert_eq!(vulns[0]["vuln_type"], "lateral_psexec");
             }
-            other => panic!("Expected Finding, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 
@@ -435,16 +430,13 @@ mod tests {
         );
         let result = handle_builtin_callback(&call).unwrap();
         match result {
-            CallbackResult::Finding {
-                response,
-                discovery,
-            } => {
+            CallbackResult::LlmFinding { response, finding } => {
                 assert!(response.contains("wmiexec"));
                 assert!(response.contains("srv01.contoso.local"));
-                let vulns = discovery["vulnerabilities"].as_array().unwrap();
+                let vulns = finding["vulnerabilities"].as_array().unwrap();
                 assert_eq!(vulns[0]["vuln_type"], "lateral_wmiexec");
             }
-            other => panic!("Expected Finding, got {other:?}"),
+            other => panic!("Expected LlmFinding, got {other:?}"),
         }
     }
 

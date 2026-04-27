@@ -5,7 +5,7 @@ use std::sync::LazyLock;
 
 use ares_core::models::Credential;
 
-use super::strip_trailing_dot;
+use super::{is_ghost_machine_account, strip_trailing_dot};
 
 /// Strip ANSI escape sequences from text.
 pub(super) static RE_ANSI: LazyLock<Regex> =
@@ -73,6 +73,9 @@ pub(crate) fn sanitize_credentials(creds: &mut Vec<Credential>) {
             return false;
         }
         if username.starts_with("evil") && username.ends_with('$') {
+            return false;
+        }
+        if is_ghost_machine_account(&username) {
             return false;
         }
         true

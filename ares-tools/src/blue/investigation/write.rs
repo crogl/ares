@@ -36,13 +36,24 @@ pub async fn add_evidence(args: &Value) -> Result<ToolOutput> {
         )));
     }
 
-    // Validate evidence against recent query results and adjust confidence
-    let (query_validated, _source_query_id) = evidence_validator::validate_evidence_value(value);
+    // Grounding: refuse to write evidence whose value was not seen in any
+    // recent query result (or is a MITRE technique ID, which auto-validates).
+    // Without this check, an agent could fabricate an IP/user/hash and have it
+    // accepted as evidence — confidence-only penalties don't deter that.
+    let (query_validated, source_query_id) = evidence_validator::validate_evidence_value(value);
+    if !query_validated {
+        return Ok(make_error(&format!(
+            "Evidence rejected: value '{value}' was not found in any recorded query result. \
+             Run a Loki/Prometheus query that returns this value first, then add it as evidence. \
+             Evidence values must be IOCs grounded in observed data, not asserted by the agent."
+        )));
+    }
     let raw_confidence = args
         .get("confidence")
         .and_then(Value::as_f64)
         .unwrap_or(0.5);
     let confidence = evidence_validator::adjust_confidence(raw_confidence, query_validated);
+    let _ = source_query_id;
 
     // Auto-assign pyramid level from evidence type when caller omits it
     let pyramid_level = optional_str(args, "pyramid_level")
@@ -198,7 +209,17 @@ pub async fn add_evidence_batch(args: &Value) -> Result<ToolOutput> {
             continue;
         }
 
+        // Grounding: reject items whose value was not seen in any recent
+        // query result (MITRE technique IDs auto-validate inside
+        // `validate_evidence_value`).
         let (query_validated, _) = evidence_validator::validate_evidence_value(value);
+        if !query_validated {
+            validation_errors.push(format!(
+                "item[{i}] {evidence_type}={value}: value not found in any recorded query result \
+                 (run a query returning this IOC before recording it as evidence)"
+            ));
+            continue;
+        }
         let raw_confidence = item
             .get("confidence")
             .and_then(Value::as_f64)

@@ -294,7 +294,12 @@ pub(super) fn print_loot_human(
     print_mitre_techniques(&state.all_techniques, &state.all_timeline_events);
 }
 
-/// Print discovered vulnerabilities table.
+/// Priority threshold (inclusive) at or below which a vulnerability is treated
+/// as actively exploitable rather than an informational finding.
+const EXPLOITABLE_PRIORITY_MAX: i32 = 3;
+
+/// Print vulnerabilities split into two tables: actively exploitable
+/// (priority <= EXPLOITABLE_PRIORITY_MAX) and informational findings (rest).
 fn print_vulnerabilities(
     discovered: &HashMap<String, VulnerabilityInfo>,
     exploited: &HashSet<String>,
@@ -303,20 +308,57 @@ fn print_vulnerabilities(
         return;
     }
 
-    let mut vulns: Vec<(&String, &VulnerabilityInfo)> = discovered.iter().collect();
-    vulns.sort_by(|a, b| {
-        a.1.priority
-            .cmp(&b.1.priority)
-            .then(a.1.vuln_type.cmp(&b.1.vuln_type))
-    });
+    let mut exploitable: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
+    let mut findings: Vec<(&String, &VulnerabilityInfo)> = Vec::new();
+    for (id, vuln) in discovered.iter() {
+        if vuln.priority <= EXPLOITABLE_PRIORITY_MAX {
+            exploitable.push((id, vuln));
+        } else {
+            findings.push((id, vuln));
+        }
+    }
+    let sort_vulns = |vulns: &mut Vec<(&String, &VulnerabilityInfo)>| {
+        vulns.sort_by(|a, b| {
+            a.1.priority
+                .cmp(&b.1.priority)
+                .then(a.1.vuln_type.cmp(&b.1.vuln_type))
+        });
+    };
+    sort_vulns(&mut exploitable);
+    sort_vulns(&mut findings);
 
-    println!("Discovered Vulnerabilities ({}):", vulns.len());
+    let exploited_in_exploitable = exploitable
+        .iter()
+        .filter(|(id, _)| exploited.contains(*id))
+        .count();
+
+    println!(
+        "Exploitable Vulnerabilities ({}, {} exploited):",
+        exploitable.len(),
+        exploited_in_exploitable
+    );
+    if exploitable.is_empty() {
+        println!("  (none)");
+    } else {
+        print_vuln_table(&exploitable, exploited);
+    }
+    println!();
+
+    println!("Findings ({}):", findings.len());
+    if !findings.is_empty() {
+        print_vuln_table(&findings, exploited);
+    }
+    println!();
+}
+
+/// Render a single vulnerability table body (header + rows).
+fn print_vuln_table(vulns: &[(&String, &VulnerabilityInfo)], exploited: &HashSet<String>) {
     println!(
         "  {:<30} {:<20} {:>8} {:>9}  Details",
         "Type", "Target", "Priority", "Exploited"
     );
     println!("  {}", "-".repeat(100));
-    for (vuln_id, vuln) in &vulns {
+    for (vuln_id, vuln) in vulns {
         let is_exploited = exploited.contains(*vuln_id);
         let exploited_mark = if is_exploited { "\u{2713}" } else { "\u{2717}" };
 
@@ -336,7 +378,6 @@ fn print_vulnerabilities(
             vuln.vuln_type, vuln.target, vuln.priority, exploited_mark, details_display
         );
     }
-    println!();
 }
 
 /// Format vulnerability details HashMap into a readable string.

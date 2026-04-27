@@ -3,8 +3,83 @@ use super::admin_checks::{
 };
 use super::parsing::{has_domain_admin_indicator, parse_discoveries, resolve_parent_id};
 use super::timeline::{credential_techniques, hash_techniques, is_critical_hash};
+use super::{result_has_credential_evidence, result_has_parser_evidence};
 use ares_core::models::{Credential, Hash};
 use serde_json::json;
+
+#[test]
+fn parser_evidence_requires_discoveries_key() {
+    // No payload at all → no evidence
+    assert!(!result_has_parser_evidence(&None));
+    // Payload without discoveries → no evidence
+    assert!(!result_has_parser_evidence(&Some(json!({"summary": "ok"}))));
+    // Empty discoveries object → no evidence
+    assert!(!result_has_parser_evidence(&Some(
+        json!({"discoveries": {}})
+    )));
+    // Empty arrays → no evidence
+    assert!(!result_has_parser_evidence(&Some(
+        json!({"discoveries": {"credentials": [], "hashes": []}})
+    )));
+}
+
+#[test]
+fn parser_evidence_accepts_any_populated_array() {
+    for key in [
+        "credentials",
+        "hashes",
+        "hosts",
+        "shares",
+        "vulnerabilities",
+        "delegations",
+        "trusts",
+        "users",
+        "spns",
+    ] {
+        let payload = json!({"discoveries": {key: [{"placeholder": true}]}});
+        assert!(
+            result_has_parser_evidence(&Some(payload)),
+            "key {key} should count as parser evidence"
+        );
+    }
+}
+
+#[test]
+fn credential_evidence_only_credentials_or_hashes() {
+    // Only hosts → not credential evidence
+    assert!(!result_has_credential_evidence(&Some(
+        json!({"discoveries": {"hosts": [{"ip": "192.168.58.10"}]}})
+    )));
+    // Credentials present → credential evidence
+    assert!(result_has_credential_evidence(&Some(
+        json!({"discoveries": {"credentials": [{"username": "admin"}]}})
+    )));
+    // Hashes present → credential evidence
+    assert!(result_has_credential_evidence(&Some(
+        json!({"discoveries": {"hashes": [{"username": "admin"}]}})
+    )));
+    // Vulnerabilities alone are NOT credential evidence (would be parser evidence)
+    assert!(!result_has_credential_evidence(&Some(
+        json!({"discoveries": {"vulnerabilities": [{"vuln_id": "v1"}]}})
+    )));
+}
+
+#[test]
+fn llm_findings_field_is_not_treated_as_evidence() {
+    // LLM-fabricated findings live under `llm_findings`, never `discoveries`.
+    // The grounding check must IGNORE them.
+    let payload = json!({
+        "summary": "claimed exploit success",
+        "llm_findings": [{
+            "vulnerabilities": [{
+                "vuln_id": "finding_kerberoastable_account_192_168_58_10",
+                "vuln_type": "kerberoastable_account",
+            }]
+        }]
+    });
+    assert!(!result_has_parser_evidence(&Some(payload.clone())));
+    assert!(!result_has_credential_evidence(&Some(payload)));
+}
 
 #[test]
 fn parse_credentials_array() {

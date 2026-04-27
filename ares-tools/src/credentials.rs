@@ -29,6 +29,15 @@ pub fn hash_args(hash: &str) -> Vec<String> {
     vec!["-hashes".to_string(), h]
 }
 
+/// Extract the NT hash from a hash string that may be in `LM:NT` colon form.
+///
+/// `impacket-ticketer -nthash` rejects the concatenated `LM:NT` form with
+/// `'Odd-length string'` because it expects a 32-char hex NT hash. This helper
+/// returns the right-most colon-delimited segment, trimmed.
+pub fn nt_hash_only(hash: &str) -> &str {
+    hash.rsplit(':').next().unwrap_or(hash).trim()
+}
+
 /// Build netexec-style credential args: `-u user -p pass -d domain` or `-u user -H hash`.
 pub fn netexec_creds(
     username: Option<&str>,
@@ -138,6 +147,33 @@ mod tests {
     fn hash_args_lm_nt_pair() {
         let args = hash_args("aad3b435:aabbccdd");
         assert_eq!(args, vec!["-hashes", "aad3b435:aabbccdd"]);
+    }
+
+    #[test]
+    fn nt_hash_only_strips_lm_half() {
+        assert_eq!(
+            nt_hash_only("aad3b435b51404eeaad3b435b51404ee:d350c5900e26d2c95f501e94cf95b078"),
+            "d350c5900e26d2c95f501e94cf95b078"
+        );
+    }
+
+    #[test]
+    fn nt_hash_only_passes_through_plain_nt() {
+        assert_eq!(
+            nt_hash_only("d350c5900e26d2c95f501e94cf95b078"),
+            "d350c5900e26d2c95f501e94cf95b078"
+        );
+    }
+
+    #[test]
+    fn nt_hash_only_trims_whitespace() {
+        assert_eq!(nt_hash_only("  abcd  "), "abcd");
+        assert_eq!(nt_hash_only("aad3b435:abcd\n"), "abcd");
+    }
+
+    #[test]
+    fn nt_hash_only_empty_string() {
+        assert_eq!(nt_hash_only(""), "");
     }
 
     #[test]

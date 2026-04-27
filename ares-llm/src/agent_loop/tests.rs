@@ -57,15 +57,12 @@ fn handle_report_finding_callback() {
     };
     let result = handle_builtin_callback(&call).unwrap();
     match result {
-        CallbackResult::Finding {
-            response,
-            discovery,
-        } => {
+        CallbackResult::LlmFinding { response, finding } => {
             assert!(response.contains("smb_signing_disabled"));
-            let vulns = discovery["vulnerabilities"].as_array().unwrap();
+            let vulns = finding["vulnerabilities"].as_array().unwrap();
             assert_eq!(vulns[0]["vuln_type"], "smb_signing_disabled");
         }
-        _ => panic!("Expected Finding"),
+        _ => panic!("Expected LlmFinding"),
     }
 }
 

@@ -10,7 +10,7 @@ use redis::aio::ConnectionLike;
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueueCore;
 
-use super::sanitize_credential;
+use super::{sanitize_credential, strip_netexec_artifact};
 
 impl SharedState {
     /// Add a credential to state and Redis (with dedup).
@@ -42,8 +42,10 @@ impl SharedState {
         let mut conn = queue.connection();
         let added = reader.add_credential(&mut conn, &cred).await?;
         if added {
-            // Auto-extract domain from credential (matches Python add_credential)
-            let cred_domain = cred.domain.to_lowercase();
+            // Auto-extract domain from credential (matches Python add_credential).
+            // Strip NetExec's `essos.local0`/`essos.local0.` artifact so we don't
+            // pollute the canonical `domains` set with phantom suffixes.
+            let cred_domain = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
             if cred_domain.contains('.') {
                 let mut state = self.inner.write().await;
                 if !state.domains.contains(&cred_domain) {
@@ -115,7 +117,8 @@ impl SharedState {
                             // First pass: find a sibling whose domain matches a known DC
                             let from_dc = state.hashes.iter().find_map(|h| {
                                 if h.parent_id.as_deref() == Some(pid) && !h.domain.is_empty() {
-                                    let d = h.domain.to_lowercase();
+                                    let d = strip_netexec_artifact(&h.domain.to_lowercase())
+                                        .to_string();
                                     if state.domain_controllers.contains_key(&d) {
                                         return Some(d);
                                     }
@@ -126,7 +129,10 @@ impl SharedState {
                             from_dc.or_else(|| {
                                 state.hashes.iter().find_map(|h| {
                                     if h.parent_id.as_deref() == Some(pid) && !h.domain.is_empty() {
-                                        Some(h.domain.to_lowercase())
+                                        Some(
+                                            strip_netexec_artifact(&h.domain.to_lowercase())
+                                                .to_string(),
+                                        )
                                     } else {
                                         None
                                     }
@@ -135,7 +141,7 @@ impl SharedState {
                         })
                         .unwrap_or_default()
                 } else {
-                    hash_domain.to_lowercase()
+                    strip_netexec_artifact(&hash_domain.to_lowercase()).to_string()
                 };
                 // Only mark as dominated if the domain is a known DC domain.
                 // This prevents false domination claims from misattributed hashes

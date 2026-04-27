@@ -10,6 +10,26 @@ use super::parsing::has_domain_admin_indicator;
 use super::timeline::{create_admin_upgrade_timeline_event, create_domain_admin_timeline_event};
 use crate::orchestrator::dispatcher::Dispatcher;
 
+/// Validate that a string looks like a domain FQDN.
+///
+/// Rejects empty strings, IP-like patterns, strings with whitespace, and strings
+/// without at least one dot. Used to filter out malformed domain values that
+/// occasionally appear in tool payloads (e.g. `"10.1.2.51 - north"`).
+fn is_valid_domain_fqdn(s: &str) -> bool {
+    if s.is_empty() || s.contains(' ') || s.contains(':') || s.contains('/') {
+        return false;
+    }
+    if !s.contains('.') {
+        return false;
+    }
+    let first_label = s.split('.').next().unwrap_or("");
+    if first_label.is_empty() || first_label.chars().all(|c| c.is_ascii_digit()) {
+        return false;
+    }
+    s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+}
+
 /// Determine the domain admin path from a payload.
 ///
 /// If `has_domain_admin` is explicitly `true`, returns the `domain_admin_path`
@@ -318,7 +338,7 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
             .get("domain")
             .and_then(|v| v.as_str())
             .map(|d| d.to_lowercase())
-            .filter(|d| !d.is_empty());
+            .filter(|d| is_valid_domain_fqdn(d));
         let domain = match domain {
             Some(d) => d,
             None => {

@@ -102,6 +102,32 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "smb_login_check".into(),
+            description: "Validate a single credential against a target via SMB. Use this to verify that a credential works before attempting more complex attacks.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Target IP address or hostname"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username to authenticate with"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password to authenticate with"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Target domain name"
+                    }
+                },
+                "required": ["target", "username", "password", "domain"]
+            }),
+        },
+        ToolDefinition {
             name: "gpp_password_finder".into(),
             description: "Search Group Policy Preferences for credentials (cpassword). Finds GPP XML files in SYSVOL containing encrypted passwords that can be trivially decrypted.".into(),
             input_schema: json!({

@@ -40,11 +40,13 @@ pub enum CallbackResult {
     RequestAssistance { issue: String, context: String },
     /// Callback processed, continue the loop with this response.
     Continue(String),
-    /// Finding reported — continue the loop and inject a structured discovery
-    /// (vulnerability) into the discoveries collection so it reaches reports.
-    Finding {
+    /// LLM-fabricated finding — continue the loop and route the structured
+    /// payload into `llm_findings` (NOT `discoveries`). Reports may surface
+    /// these for context, but they MUST NOT feed `publish_*` state writes;
+    /// only parser-produced discoveries are authoritative.
+    LlmFinding {
         response: String,
-        discovery: serde_json::Value,
+        finding: serde_json::Value,
     },
 }
 
@@ -84,7 +86,13 @@ pub struct AgentLoopOutcome {
     /// Number of tool calls dispatched.
     pub tool_calls_dispatched: u32,
     /// Accumulated structured discoveries from all tool results.
+    /// Only parser-produced — never LLM-fabricated. Safe to feed into
+    /// `extract_discoveries` → `publish_*`.
     pub discoveries: Vec<serde_json::Value>,
+    /// LLM-fabricated findings (`report_finding` / `report_lateral_success`).
+    /// Surfaced in reports but never used as authoritative state — must never
+    /// feed `publish_*` calls.
+    pub llm_findings: Vec<serde_json::Value>,
     /// Raw tool output strings for secondary regex extraction.
     pub tool_outputs: Vec<String>,
 }

@@ -229,7 +229,7 @@ pub async fn auto_golden_ticket(dispatcher: Arc<Dispatcher>, mut shutdown: watch
 /// Uses the credential's own domain for NTLM auth (not the target domain) so
 /// cross-domain trust authentication works — e.g. a `child.contoso.local`
 /// cred can resolve the SID of `contoso.local` via its parent DC.
-async fn resolve_domain_sid(
+pub(crate) async fn resolve_domain_sid(
     _domain: &str,
     dc_ip: &str,
     password_cred: Option<&ares_core::models::Credential>,

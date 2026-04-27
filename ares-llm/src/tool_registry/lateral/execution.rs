@@ -416,6 +416,14 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Target IP address (if different from hostname resolution)"
                     },
+                    "just_dc_user": {
+                        "type": "string",
+                        "description": "Restrict DCSync to a single account (e.g. 'krbtgt' or 'Administrator'). Bypasses 'SPN target name validation' / DRSUAPI hardening blocking full dumps."
+                    },
+                    "use_vss": {
+                        "type": "boolean",
+                        "description": "Use VSS shadow-copy method instead of DRSUAPI replication. Falls back when DRSUAPI is restricted by domain hardening."
+                    },
                     "timeout_minutes": {
                         "type": "integer",
                         "description": "Maximum time in minutes before aborting the dump",
@@ -463,6 +471,14 @@ pub fn secretsdump_kerberos_definition() -> Vec<ToolDefinition> {
                 "target_ip": {
                     "type": "string",
                     "description": "Target IP address (if different from hostname resolution)"
+                },
+                "just_dc_user": {
+                    "type": "string",
+                    "description": "Restrict DCSync to a single account (e.g. 'krbtgt' or 'Administrator'). Bypasses 'SPN target name validation' / DRSUAPI hardening blocking full dumps."
+                },
+                "use_vss": {
+                    "type": "boolean",
+                    "description": "Use VSS shadow-copy method instead of DRSUAPI replication. Falls back when DRSUAPI is restricted by domain hardening."
                 },
                 "timeout_minutes": {
                     "type": "integer",

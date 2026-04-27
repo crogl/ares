@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use ares_core::models::User;
 
-use super::strip_trailing_dot;
+use super::{is_ghost_machine_account, strip_trailing_dot};
 
 /// Noise usernames that should be filtered.
 pub(super) const NOISE_USERNAMES: &[&str] = &[
@@ -81,6 +81,7 @@ pub(crate) fn dedup_users(users: &[User], netbios_to_fqdn: &HashMap<String, Stri
             || NOISE_USERNAME_PREFIXES
                 .iter()
                 .any(|p| username.starts_with(p))
+            || is_ghost_machine_account(&username)
         {
             continue;
         }

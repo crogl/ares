@@ -129,15 +129,26 @@ pub async fn process_completed_task(
         extract_from_raw_text(payload, dispatcher, &default_domain).await;
     }
 
-    // Mark host as owned when a credential_access task succeeds and we have the target IP.
-    // This triggers downstream automations (lsassy_dump, credential_expansion).
+    // Mark host as owned when a credential_access task succeeds AND parser
+    // evidence proves credentials/hashes were extracted. The LLM's
+    // `task_complete(success=true)` is not sufficient on its own — without
+    // parser-grounded credential evidence we treat the claim as unverified
+    // and skip the state write.
     if result.success {
         if let Some(ref ip) = task_target_ip {
-            if task_id.starts_with("credential_access_") {
+            if task_id.starts_with("credential_access_")
+                && result_has_credential_evidence(&result.result)
+            {
                 let _ = dispatcher
                     .state
                     .mark_host_owned(&dispatcher.queue, ip)
                     .await;
+            } else if task_id.starts_with("credential_access_") {
+                debug!(
+                    task_id = %task_id,
+                    ip = %ip,
+                    "Skipping mark_host_owned: no parser-extracted credential/hash evidence"
+                );
             }
         }
     }
@@ -173,9 +184,13 @@ pub async fn process_completed_task(
         {
             // Guard: LLM may call task_complete (success=true) with a result
             // that actually describes a failure. Don't mark as exploited if the
-            // result summary contains clear failure indicators.
-            let actually_succeeded =
-                result.success && !result_text_indicates_failure(&result.result);
+            // result summary contains clear failure indicators OR if no parser
+            // evidence (discoveries from real tool stdout) corroborates the
+            // exploit. The text heuristic catches obvious lies; the parser
+            // check catches silent fabrication.
+            let actually_succeeded = result.success
+                && !result_text_indicates_failure(&result.result)
+                && result_has_parser_evidence(&result.result);
 
             if actually_succeeded {
                 info!(vuln_id = %vuln_id, task_id = %task_id, "Marking vulnerability as exploited");
@@ -238,6 +253,54 @@ pub async fn process_completed_task(
     dispatcher.delegation_notify.notify_waiters();
 
     let _ = dispatcher.notify_state_update().await;
+}
+
+/// Return true if the task result carries any parser-extracted discoveries.
+/// "Parser-extracted" means populated by ares-tools parsers running on real
+/// tool stdout — never LLM-fabricated. Used to ground state writes (e.g.
+/// `mark_exploited`) against actual evidence.
+fn result_has_parser_evidence(result: &Option<Value>) -> bool {
+    let Some(payload) = result.as_ref() else {
+        return false;
+    };
+    let Some(disc) = payload.get("discoveries") else {
+        return false;
+    };
+    const KEYS: &[&str] = &[
+        "credentials",
+        "hashes",
+        "hosts",
+        "shares",
+        "vulnerabilities",
+        "delegations",
+        "trusts",
+        "users",
+        "spns",
+    ];
+    KEYS.iter().any(|k| {
+        disc.get(*k)
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// Return true if the task produced parser-extracted credential or hash
+/// evidence — the grounding signal for `mark_host_owned` on
+/// `credential_access_*` tasks.
+fn result_has_credential_evidence(result: &Option<Value>) -> bool {
+    let Some(payload) = result.as_ref() else {
+        return false;
+    };
+    let Some(disc) = payload.get("discoveries") else {
+        return false;
+    };
+    ["credentials", "hashes"].iter().any(|k| {
+        disc.get(*k)
+            .and_then(|v| v.as_array())
+            .map(|a| !a.is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// Check whether a task result's text indicates the LLM reported a failure,

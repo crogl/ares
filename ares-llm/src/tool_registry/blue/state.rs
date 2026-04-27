@@ -9,7 +9,7 @@ pub(super) fn investigation_state_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: "add_evidence".into(),
-            description: "Add a single evidence item to the investigation. For multiple items, prefer add_evidence_batch to record them all in one call.".into(),
+            description: "Add a single evidence item to the investigation. The `value` MUST be an IOC that appeared in a recent Loki/Prometheus query result (or a MITRE technique ID like T1003.006) — values not seen in observed query data are rejected. For multiple items, prefer add_evidence_batch to record them all in one call.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -54,7 +54,7 @@ pub(super) fn investigation_state_tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "add_evidence_batch".into(),
-            description: "Add multiple evidence items in a single call. Use this instead of calling add_evidence repeatedly — it records all items in one Redis pipeline round-trip and has its own separate call budget.".into(),
+            description: "Add multiple evidence items in a single call. Each item's `value` MUST be an IOC observed in a recent Loki/Prometheus query (or a MITRE technique ID) — items whose values were not seen in any recorded query result are rejected. Use this instead of calling add_evidence repeatedly — it records all items in one Redis pipeline round-trip and has its own separate call budget.".into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {

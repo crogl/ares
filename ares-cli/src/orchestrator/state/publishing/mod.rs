@@ -111,6 +111,23 @@ pub(super) fn sanitize_credential(
     Some(cred)
 }
 
+/// Strip the trailing "0." artifact that NetExec sometimes appends to domain
+/// names (e.g. `dc01.essos.local0.` → `dc01.essos.local`,
+/// `essos.local0` → `essos.local`).
+pub(super) fn strip_netexec_artifact(s: &str) -> &str {
+    let s = s.trim_end_matches('.');
+    // "0." already collapsed to "0" after trimming "."; strip if preceded by a label
+    match s.strip_suffix("0.") {
+        Some(clean) => clean.trim_end_matches('.'),
+        None => match s.strip_suffix('0') {
+            // Avoid stripping a real trailing 0 from e.g. "host10" —
+            // only strip if the char before the 0 is alphabetic (TLD-like).
+            Some(clean) if clean.ends_with(|c: char| c.is_ascii_alphabetic()) => clean,
+            _ => s,
+        },
+    }
+}
+
 /// Check if a hostname is an AWS internal PTR name.
 pub(super) fn is_aws_hostname(hostname: &str) -> bool {
     let lower = hostname.to_lowercase();
@@ -291,5 +308,49 @@ mod tests {
     #[test]
     fn ip_prefix_without_compute_internal_rejected() {
         assert!(!is_aws_hostname("ip-missing-suffix.local"));
+    }
+
+    // --- strip_netexec_artifact ---
+
+    #[test]
+    fn strip_netexec_zero_dot() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local0."),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_zero_no_dot() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local0"),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_preserves_clean_hostname() {
+        assert_eq!(
+            strip_netexec_artifact("dc01.contoso.local"),
+            "dc01.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_preserves_numeric_suffix() {
+        // Must NOT strip the 0 from "host10" or "dc10"
+        assert_eq!(strip_netexec_artifact("host10"), "host10");
+        assert_eq!(
+            strip_netexec_artifact("dc10.contoso.local"),
+            "dc10.contoso.local"
+        );
+    }
+
+    #[test]
+    fn strip_netexec_child_domain() {
+        assert_eq!(
+            strip_netexec_artifact("dc02.child.contoso.local0."),
+            "dc02.child.contoso.local"
+        );
     }
 }

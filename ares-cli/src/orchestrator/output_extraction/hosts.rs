@@ -56,9 +56,23 @@ pub fn extract_hosts(output: &str) -> Vec<Host> {
                 .map(|c| c.get(1).unwrap().as_str().trim().to_string())
                 .unwrap_or_default();
 
+            // Synthesize FQDN as `<netbios>.<domain>`, but reject workgroup-only
+            // hosts where impacket reports the machine's NetBIOS name as the
+            // first label of the "domain" field (e.g.
+            // `(name:WIN-X) (domain:WIN-X.GXM0.LOCAL)` from a non-domain-joined
+            // Windows box). Without this guard we synthesize
+            // `win-x.win-x.gxm0.local` and `publish_host` then extracts the
+            // junk suffix `win-x.gxm0.local` into `state.domains`.
             let hostname =
                 if !netbios_name.is_empty() && !domain.is_empty() && !netbios_name.contains('.') {
-                    format!("{}.{}", netbios_name.to_lowercase(), domain.to_lowercase())
+                    let nb = netbios_name.to_lowercase();
+                    let dom = domain.to_lowercase();
+                    let workgroup_self = dom == nb || dom.starts_with(&format!("{}.", nb));
+                    if workgroup_self {
+                        netbios_name
+                    } else {
+                        format!("{nb}.{dom}")
+                    }
                 } else {
                     netbios_name
                 };
@@ -160,6 +174,20 @@ SMB  192.168.58.10  445  DC01  [*]  Windows Server (name:DC01) (domain:contoso.l
     #[test]
     fn extract_empty_input() {
         assert!(extract_hosts("").is_empty());
+    }
+
+    #[test]
+    fn extract_workgroup_self_domain_does_not_duplicate_netbios() {
+        // Workgroup-only Windows hosts often report their own NetBIOS name as
+        // the first label of the SMB "domain" field. We must NOT synthesize
+        // `win-x.win-x.gxm0.local`; use the bare NetBIOS name instead so the
+        // junk suffix never reaches `state.domains`.
+        let output = "SMB  10.1.2.100  445  WIN-E4G4GC587O4  [*]  Windows Server 2003 \
+            (name:WIN-E4G4GC587O4) (domain:WIN-E4G4GC587O4.GXM0.LOCAL) (signing:False)";
+        let hosts = extract_hosts(output);
+        assert_eq!(hosts.len(), 1);
+        assert_eq!(hosts[0].hostname, "WIN-E4G4GC587O4");
+        assert!(!hosts[0].hostname.contains('.'));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use ares_core::models::Hash;
 
 use super::credentials::strip_ansi;
-use super::strip_trailing_dot;
+use super::{is_ghost_machine_account, strip_trailing_dot};
 
 fn normalize_hash_type(hash_type: &str) -> String {
     match hash_type.trim().to_lowercase().as_str() {
@@ -20,6 +20,10 @@ pub(crate) fn dedup_hashes(hashes: &[Hash]) -> Vec<Hash> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
     for h in hashes {
+        let username = strip_ansi(&h.username);
+        if is_ghost_machine_account(&username) {
+            continue;
+        }
         let domain = strip_trailing_dot(h.domain.trim()).to_lowercase();
         let hash_value = strip_ansi(&h.hash_value);
         let key = (
