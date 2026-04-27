@@ -125,7 +125,7 @@ pub async fn auto_krbrelayup(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
 
             let priority = dispatcher.effective_priority("krbrelayup");
             match dispatcher
-                .throttled_submit("exploit", "privesc", payload, priority)
+                .throttled_submit("privesc", "privesc", payload, priority)
                 .await
             {
                 Ok(Some(task_id)) => {
