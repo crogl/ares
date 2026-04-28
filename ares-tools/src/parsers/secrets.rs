@@ -2,6 +2,30 @@
 
 use serde_json::{json, Value};
 
+/// Strip the `SMB <IP> <PORT> <HOST>` framing that `nxc smb` prepends to every
+/// line of pass-through output. If the line doesn't have the framing, return it
+/// untouched. Needed because `forge_inter_realm_and_dump` shells out to
+/// `nxc smb --ntds` instead of `impacket-secretsdump` (the latter's DRSUAPI
+/// bind rejects cross-realm Kerberos credentials), so the secretsdump parser
+/// has to handle nxc-framed lines too.
+fn strip_nxc_framing(line: &str) -> &str {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("SMB ") && !trimmed.starts_with("SMB\t") {
+        return line;
+    }
+    // Walk through the first 4 whitespace-delimited tokens (SMB, IP, PORT, HOST)
+    // and return everything after the 4th token's trailing whitespace.
+    let mut rest = trimmed;
+    for _ in 0..4 {
+        rest = rest.trim_start();
+        match rest.find(char::is_whitespace) {
+            Some(end) => rest = &rest[end..],
+            None => return line,
+        }
+    }
+    rest.trim_start()
+}
+
 pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value>) {
     // Prefer target_domain (the domain being dumped) over domain (auth credential's domain)
     // to correctly attribute hashes when authenticating cross-domain.
@@ -14,8 +38,34 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
     let mut hashes = Vec::new();
     let creds = Vec::new();
 
-    for line in output.lines() {
-        let line = line.trim();
+    // First pass: collect AES256 trust/account keys keyed by lowercase username.
+    // Win2016+ DCs reject RC4-only inter-realm tickets (KDC_ERR_TGT_REVOKED), so
+    // we attach the AES256 key to the matching NTLM hash entry below.
+    // Format: "DOMAIN\\user:aes256-cts-hmac-sha1-96:<hex>" or
+    //         "domain.local/user:aes256-cts-hmac-sha1-96:<hex>"
+    let mut aes_keys: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for raw_line in output.lines() {
+        let line = strip_nxc_framing(raw_line).trim();
+        if line.is_empty() || line.starts_with('[') {
+            continue;
+        }
+        if let Some(rest) = line.split_once(":aes256-cts-hmac-sha1-96:") {
+            let raw_user = rest.0;
+            let aes_hex = rest.1.trim();
+            if aes_hex.is_empty() || !aes_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let username = raw_user
+                .rsplit_once(['\\', '/'])
+                .map(|(_, u)| u)
+                .unwrap_or(raw_user)
+                .to_string();
+            aes_keys.insert(username.to_lowercase(), aes_hex.to_lowercase());
+        }
+    }
+
+    for raw_line in output.lines() {
+        let line = strip_nxc_framing(raw_line).trim();
 
         // NTLM hash format: "username:RID:LMhash:NThash:::"
         // or "DOMAIN\username:RID:LMhash:NThash:::"
@@ -23,13 +73,14 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
             let parts: Vec<&str> = line.split(':').collect();
             if parts.len() >= 4 {
                 let raw_user = parts[0];
-                let (user_domain, username) = if raw_user.contains('\\') {
-                    let split: Vec<&str> = raw_user.splitn(2, '\\').collect();
-                    let netbios = split[0];
-                    // Resolve NetBIOS domain prefix to FQDN using target_domain.
-                    // e.g. "CONTOSO" → "contoso.local" when target_domain="contoso.local"
-                    let resolved = resolve_netbios_to_fqdn(netbios, domain);
-                    (resolved, split[1].to_string())
+                let (user_domain, username) = if let Some(idx) = raw_user.find(['\\', '/']) {
+                    let prefix = &raw_user[..idx];
+                    let user = &raw_user[idx + 1..];
+                    // Resolve NetBIOS prefix to FQDN using target_domain.
+                    // raiseChild emits "domain.local/user" (slash + FQDN),
+                    // standard secretsdump emits "DOMAIN\\user" (backslash + NetBIOS).
+                    let resolved = resolve_netbios_to_fqdn(prefix, domain);
+                    (resolved, user.to_string())
                 } else {
                     (domain.to_string(), raw_user.to_string())
                 };
@@ -40,13 +91,17 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     let lm_hash = parts[2];
                     let hash_value = format!("{}:{}", lm_hash, nt_hash);
 
-                    hashes.push(json!({
+                    let mut entry = json!({
                         "username": username,
                         "domain": user_domain,
                         "hash_value": hash_value,
                         "hash_type": "ntlm",
                         "source": "secretsdump",
-                    }));
+                    });
+                    if let Some(aes) = aes_keys.get(&username.to_lowercase()) {
+                        entry["aes_key"] = json!(aes);
+                    }
+                    hashes.push(entry);
                 }
             }
         }
@@ -244,6 +299,40 @@ FABRIKAM\\bob:1104:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef1234567890ab
     }
 
     #[test]
+    fn parse_secretsdump_slash_separator() {
+        // raiseChild.py emits FQDN/user with a slash; parser must accept both.
+        let output = "\
+contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
+contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0]["username"], "krbtgt");
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+        assert_eq!(hashes[1]["username"], "Administrator");
+    }
+
+    #[test]
+    fn parse_secretsdump_attaches_aes256_key_to_trust_account() {
+        let output = "\
+[*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)
+FABRIKAM\\CONTOSO$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+[*] Kerberos keys grabbed
+FABRIKAM\\CONTOSO$:aes256-cts-hmac-sha1-96:4444444444444444444444444444444444444444444444444444444444444444
+FABRIKAM\\CONTOSO$:aes128-cts-hmac-sha1-96:55555555555555555555555555555555
+[*] Cleaning up...";
+        let params = json!({"target_domain": "fabrikam.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "CONTOSO$");
+        assert_eq!(hashes[0]["domain"], "fabrikam.local");
+        assert_eq!(
+            hashes[0]["aes_key"],
+            "4444444444444444444444444444444444444444444444444444444444444444"
+        );
+    }
+
+    #[test]
     fn parse_secretsdump_skips_comments_and_brackets() {
         let output = "\
 [*] Service RemoteRegistry is in stopped state
@@ -305,5 +394,69 @@ $krb5asrep$23$svc_backup@CONTOSO.LOCAL:789xyz";
     fn parse_asrep_roast_empty() {
         let hashes = parse_asrep_roast("[-] No AS-REP roastable accounts", &json!({}));
         assert!(hashes.is_empty());
+    }
+
+    #[test]
+    fn strip_nxc_framing_removes_smb_prefix() {
+        let line = "SMB         192.168.58.10   445    DC01             contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::";
+        assert_eq!(
+            strip_nxc_framing(line),
+            "contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::"
+        );
+    }
+
+    #[test]
+    fn strip_nxc_framing_passes_through_unframed() {
+        let line = "Administrator:500:aad3b435b51404eeaad3b435b51404ee:99999999999999999999999999999999:::";
+        assert_eq!(strip_nxc_framing(line), line);
+    }
+
+    #[test]
+    fn strip_nxc_framing_handles_status_lines() {
+        let line = "SMB         192.168.58.10   445    DC01             [+] Dumped 111 NTDS hashes";
+        assert_eq!(strip_nxc_framing(line), "[+] Dumped 111 NTDS hashes");
+    }
+
+    #[test]
+    fn strip_nxc_framing_short_line_kept() {
+        // Less than 4 tokens — return original.
+        let line = "SMB only-three tokens";
+        assert_eq!(strip_nxc_framing(line), line);
+    }
+
+    #[test]
+    fn parse_secretsdump_strips_nxc_framing() {
+        // nxc smb --ntds vss output: every line gets "SMB <IP> <PORT> <HOST>" prefix.
+        let output = "\
+SMB         192.168.58.10   445    DC01             [*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)
+SMB         192.168.58.10   445    DC01             contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
+SMB         192.168.58.10   445    DC01             contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::
+SMB         192.168.58.10   445    DC01             [+] Dumped 2 NTDS hashes";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0]["username"], "krbtgt");
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+        assert!(hashes[0]["hash_value"]
+            .as_str()
+            .unwrap()
+            .contains("11111111111111111111111111111111"));
+        assert_eq!(hashes[1]["username"], "Administrator");
+    }
+
+    #[test]
+    fn parse_secretsdump_strips_nxc_framing_with_aes_keys() {
+        // nxc-framed output should still let AES-key collection work.
+        let output = "\
+SMB         192.168.58.20   445    DC02             FABRIKAM\\CONTOSO$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+SMB         192.168.58.20   445    DC02             FABRIKAM\\CONTOSO$:aes256-cts-hmac-sha1-96:4444444444444444444444444444444444444444444444444444444444444444";
+        let params = json!({"target_domain": "fabrikam.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "CONTOSO$");
+        assert_eq!(
+            hashes[0]["aes_key"],
+            "4444444444444444444444444444444444444444444444444444444444444444"
+        );
     }
 }

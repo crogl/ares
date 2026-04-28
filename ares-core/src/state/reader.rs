@@ -347,8 +347,26 @@ impl RedisStateReader {
         let added: bool = conn.hset_nx(&key, &dedup_field, &data).await?;
         if added {
             let _: () = conn.expire(&key, 86400).await?;
+            return Ok(true);
         }
-        Ok(added)
+
+        // Upsert path: a prior call added this user/hash with no AES256 key,
+        // and this call carries one. Win2016+ DCs reject RC4-only inter-realm
+        // tickets, so the AES key is required for cross-forest forge — we
+        // can't afford to lose it to dedup.
+        if hash.aes_key.is_some() {
+            let existing: Option<String> = conn.hget(&key, &dedup_field).await?;
+            let existing_has_aes = existing
+                .as_deref()
+                .and_then(|s| serde_json::from_str::<Hash>(s).ok())
+                .and_then(|h| h.aes_key)
+                .is_some();
+            if !existing_has_aes {
+                let _: () = conn.hset(&key, &dedup_field, &data).await?;
+                let _: () = conn.expire(&key, 86400).await?;
+            }
+        }
+        Ok(false)
     }
 
     /// Set a meta field in the operation's meta HASH.

@@ -90,8 +90,38 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
         "run_bloodhound" => {
             // BloodHound collection doesn't produce immediate discoveries
         }
-        "secretsdump" | "secretsdump_kerberos" => {
+        "secretsdump" | "secretsdump_kerberos" | "forge_inter_realm_and_dump" => {
+            // forge_inter_realm_and_dump runs ticketer + secretsdump in one
+            // call. The orchestrator passes `target_domain` so secretsdump
+            // hashes get attributed to the dumped (target/parent) realm,
+            // not the forging (source/child) realm.
             let (hashes, creds) = parse_secretsdump(output, params);
+            if !hashes.is_empty() {
+                discoveries["hashes"] = Value::Array(hashes);
+            }
+            if !creds.is_empty() {
+                discoveries["credentials"] = Value::Array(creds);
+            }
+        }
+        "raise_child" => {
+            // raiseChild.py performs the parent-domain NTDS dump in standard
+            // secretsdump format (lines like "domain.local/user:RID:LM:NT:::"
+            // or "DOMAIN\\user:RID:..."). Derive parent FQDN from child_domain
+            // and pass as target_domain so bare-username lines and NetBIOS
+            // prefixes get attributed to the parent forest root.
+            let child_domain = params
+                .get("child_domain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            let parent_domain = child_domain
+                .split_once('.')
+                .map(|(_, rest)| rest)
+                .unwrap_or(child_domain);
+            let mut params_with_target = params.clone();
+            if let Some(obj) = params_with_target.as_object_mut() {
+                obj.insert("target_domain".into(), json!(parent_domain));
+            }
+            let (hashes, creds) = parse_secretsdump(output, &params_with_target);
             if !hashes.is_empty() {
                 discoveries["hashes"] = Value::Array(hashes);
             }
@@ -305,6 +335,64 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                         "description": format!("WinRM access confirmed on {target}"),
                         "target_ip": target,
                     },
+                }]);
+            }
+        }
+        "relay_and_coerce" => {
+            // Composite ESC8 tool prints `PFX_FILE=...` and `RELAYED_USER=...`
+            // markers when the cert is captured. Convert to a
+            // `certificate_obtained` vuln so `auto_certipy_auth` picks it up.
+            let pfx_path = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("PFX_FILE="))
+                .map(str::trim);
+            let relayed_user = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("RELAYED_USER="))
+                .map(str::trim);
+
+            if let Some(pfx) = pfx_path {
+                // Cert is for the target DC's realm (the relayed identity's
+                // home), not the coercion credential's domain. Caller passes
+                // `target_domain` for cross-forest cases; fall back to
+                // `coerce_domain` for same-forest.
+                let target_domain = params
+                    .get("target_domain")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| params.get("coerce_domain").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let coerce_target = params
+                    .get("coerce_target")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| params.get("target_dc").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                let user = relayed_user.unwrap_or("");
+                let mut details = serde_json::Map::new();
+                details.insert("pfx_path".into(), json!(pfx));
+                if !target_domain.is_empty() {
+                    details.insert("domain".into(), json!(target_domain));
+                }
+                if !user.is_empty() {
+                    details.insert("target_user".into(), json!(user));
+                    details.insert("account_name".into(), json!(user));
+                }
+                if !coerce_target.is_empty() {
+                    details.insert("target_ip".into(), json!(coerce_target));
+                }
+                details.insert("source".into(), json!("relay_and_coerce"));
+                details.insert(
+                    "description".into(),
+                    json!(format!(
+                        "ESC8 relay captured certificate for {user} in {target_domain}"
+                    )),
+                );
+                let user_safe = user.replace(['$', '.'], "_");
+                let domain_safe = target_domain.replace('.', "_");
+                discoveries["vulnerabilities"] = json!([{
+                    "vuln_id": format!("certificate_obtained_{user_safe}_{domain_safe}"),
+                    "vuln_type": "certificate_obtained",
+                    "target": coerce_target,
+                    "details": details,
                 }]);
             }
         }
@@ -710,6 +798,28 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
     }
 
     #[test]
+    fn parse_tool_output_raise_child_attributes_to_parent() {
+        // raise_child dumps the parent NTDS in slash-separated FQDN format.
+        // Parser must derive parent_domain from child_domain and attribute hashes there.
+        let output = "\
+[*] Forest is contoso.local
+contoso.local/krbtgt:502:aad3b435b51404eeaad3b435b51404ee:11111111111111111111111111111111:::
+contoso.local/Administrator:500:aad3b435b51404eeaad3b435b51404ee:22222222222222222222222222222222:::";
+        let params = json!({
+            "child_domain": "child.contoso.local",
+            "username": "testuser",
+            "password": "REDACTED",
+        });
+        let disc = parse_tool_output("raise_child", output, &params);
+        let hashes = disc["hashes"].as_array().expect("hashes array");
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0]["username"], "krbtgt");
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+        assert_eq!(hashes[1]["username"], "Administrator");
+        assert_eq!(hashes[1]["domain"], "contoso.local");
+    }
+
+    #[test]
     fn parse_tool_output_kerberoast() {
         let output = "$krb5tgs$23$*svc_sql$CONTOSO$contoso.local/svc_sql*$abc";
         let params = json!({"domain": "contoso.local"});
@@ -792,6 +902,75 @@ SMB  192.168.58.121  445  DC01  bob         2026-03-25 23:21:09 0  Bob"#;
         let merged = merge_discoveries(&[d1, d2]);
         let td = merged["trusted_domains"].as_array().unwrap();
         assert_eq!(td.len(), 1, "Duplicate trusted domains should be deduped");
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_emits_cert_vuln() {
+        let output = "RELAY_PID=1234\n\
+                      === Coercing via MS-DFSNM ===\n\
+                      CERT_CAPTURED_VIA=MS-DFSNM\n\
+                      PFX_FILE=/tmp/ares_relay_999/DC01$.pfx\n\
+                      RELAYED_USER=DC01$\n\
+                      === RELAY LOG ===\n\
+                      [*] Servers started\n";
+        let params = json!({
+            "ca_host": "192.168.58.10",
+            "coerce_target": "192.168.58.20",
+            "target_domain": "contoso.local",
+            "coerce_domain": "child.contoso.local",
+        });
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        let vulns = disc["vulnerabilities"].as_array().expect("vulns array");
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_type"], "certificate_obtained");
+        assert_eq!(
+            vulns[0]["details"]["pfx_path"],
+            "/tmp/ares_relay_999/DC01$.pfx"
+        );
+        assert_eq!(vulns[0]["details"]["domain"], "contoso.local");
+        assert_eq!(vulns[0]["details"]["target_user"], "DC01$");
+        assert_eq!(vulns[0]["target"], "192.168.58.20");
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_no_capture_no_vuln() {
+        let output = "RELAY_PID=1234\n\
+                      === Coercing via MS-DFSNM ===\n\
+                      === Coercing via MS-EFSR ===\n\
+                      === Coercing via MS-RPRN ===\n\
+                      === RELAY LOG ===\n\
+                      [*] Servers started\n";
+        let params = json!({"ca_host": "192.168.58.10", "coerce_target": "192.168.58.20"});
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        assert!(disc.get("vulnerabilities").is_none());
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_falls_back_to_coerce_domain() {
+        // Same-forest case: only coerce_domain present.
+        let output = "PFX_FILE=/tmp/ares_relay_1/dc01$.pfx\nRELAYED_USER=dc01$\n";
+        let params = json!({
+            "ca_host": "192.168.58.10",
+            "coerce_target": "192.168.58.20",
+            "coerce_domain": "contoso.local",
+        });
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        let vulns = disc["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns[0]["details"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn parse_tool_output_relay_and_coerce_legacy_target_dc_alias() {
+        // Backwards-compat: orchestrator state may still emit `target_dc`.
+        let output = "PFX_FILE=/tmp/ares_relay_2/dc01$.pfx\nRELAYED_USER=dc01$\n";
+        let params = json!({
+            "ca_host": "192.168.58.10",
+            "target_dc": "192.168.58.20",
+            "coerce_domain": "contoso.local",
+        });
+        let disc = parse_tool_output("relay_and_coerce", output, &params);
+        let vulns = disc["vulnerabilities"].as_array().unwrap();
+        assert_eq!(vulns[0]["target"], "192.168.58.20");
     }
 
     #[test]

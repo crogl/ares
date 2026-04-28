@@ -43,7 +43,7 @@ impl SharedState {
         let added = reader.add_credential(&mut conn, &cred).await?;
         if added {
             // Auto-extract domain from credential (matches Python add_credential).
-            // Strip NetExec's `essos.local0`/`essos.local0.` artifact so we don't
+            // Strip NetExec's `contoso.local0`/`contoso.local0.` artifact so we don't
             // pollute the canonical `domains` set with phantom suffixes.
             let cred_domain = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
             if cred_domain.contains('.') {

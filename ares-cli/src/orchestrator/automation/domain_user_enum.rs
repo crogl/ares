@@ -2,8 +2,8 @@
 //!
 //! Unlike initial recon (which does broad DC scanning), this module dispatches
 //! targeted LDAP user enumeration per domain using the best available credential.
-//! This fills the gap where essos.local users are not enumerated because the
-//! initial recon agent only has north/sevenkingdoms creds.
+//! This fills the gap where a trusted domain's users are not enumerated because
+//! the initial recon agent only has primary-domain credentials.
 //!
 //! Dispatches `ldap_user_enumeration` to the recon role for each domain that
 //! has a DC but hasn't been fully enumerated yet.

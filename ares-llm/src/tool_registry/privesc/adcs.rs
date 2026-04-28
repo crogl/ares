@@ -84,7 +84,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "target": {
                         "type": "string",
-                        "description": "CA server IP or hostname to connect to for certificate enrollment. REQUIRED when the CA is on a different host than the DC (e.g. CA on braavos but DC is meereen). Without this, certipy tries RPC on the DC which fails with ept_s_not_registered."
+                        "description": "CA server IP or hostname to connect to for certificate enrollment. REQUIRED when the CA is on a different host than the DC (e.g. CA on a member server, DC on the domain controller). Without this, certipy tries RPC on the DC which fails with ept_s_not_registered."
                     },
                     "sid": {
                         "type": "string",
@@ -265,7 +265,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "ca": {
                         "type": "string",
-                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                        "description": "Certificate Authority name (e.g. 'CONTOSO-CA')"
                     },
                     "add_officer": {
                         "type": "boolean",
@@ -334,7 +334,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "ca": {
                         "type": "string",
-                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                        "description": "Certificate Authority name (e.g. 'CONTOSO-CA')"
                     },
                     "template": {
                         "type": "string",
@@ -372,7 +372,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "ca": {
                         "type": "string",
-                        "description": "Certificate Authority name (e.g. 'ESSOS-CA')"
+                        "description": "Certificate Authority name (e.g. 'CONTOSO-CA')"
                     },
                     "target": {
                         "type": "string",

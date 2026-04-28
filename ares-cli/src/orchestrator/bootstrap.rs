@@ -33,8 +33,8 @@ pub(crate) async fn probe_all_dcs(ips: &[String]) -> Vec<String> {
 /// Query a DC's LDAP rootDSE to discover its domain name.
 ///
 /// Sends a minimal anonymous LDAP SearchRequest for `defaultNamingContext`,
-/// parses the DN response (e.g. `DC=north,DC=sevenkingdoms,DC=local`), and
-/// converts it to a domain name (`north.sevenkingdoms.local`).
+/// parses the DN response (e.g. `DC=child,DC=contoso,DC=local`), and
+/// converts it to a domain name (`child.contoso.local`).
 ///
 /// Returns `None` if the connection fails, the DC doesn't respond, or the
 /// response doesn't contain a parseable `defaultNamingContext`.
@@ -109,7 +109,7 @@ pub(crate) async fn query_dc_domain(ip: &str) -> Option<String> {
 /// Uses the BER OCTET STRING length prefix immediately preceding the `DC=`
 /// payload as the authoritative end-of-DN marker. Without this, a printable-byte
 /// scan would happily consume the next BER tag (0x30 SEQUENCE = ASCII '0'),
-/// producing phantom domains like `essos.local0` that poison downstream state.
+/// producing phantom domains like `contoso.local0` that poison downstream state.
 fn parse_dn_from_ldap_response(data: &[u8]) -> Option<String> {
     let attr_name = b"defaultNamingContext";
     let pos = data.windows(attr_name.len()).position(|w| w == attr_name)?;
@@ -346,8 +346,8 @@ pub(crate) async fn dispatch_initial_recon(
                 "\"domain\": \"<domain from the user's AD domain, NOT the local machine domain>\", \"source\": \"desc_enumeration\"}\n\n",
                 "IMPORTANT: The 'domain' field for credentials and users MUST be the AD domain the user ",
                 "belongs to (look at userPrincipalName suffix, or the domain reported by LDAP/RPC), NOT ",
-                "the local machine name or workgroup. If the target is a DC for 'north.sevenkingdoms.local', ",
-                "users belong to 'north.sevenkingdoms.local'. Use the 'domain' field from this task's payload ",
+                "the local machine name or workgroup. If the target is a DC for 'contoso.local', ",
+                "users belong to 'contoso.local'. Use the 'domain' field from this task's payload ",
                 "as the default domain unless evidence shows otherwise.\n\n",
                 "Also report ALL discovered users in the discovered_users array:\n",
                 "  {\"username\": \"samaccountname\", \"domain\": \"<AD domain>\", ",
@@ -491,21 +491,21 @@ mod tests {
     /// Regression: the OCTET STRING value MUST be bounded by its BER length
     /// prefix. Without that bound, a printable-byte scan happily consumes the
     /// next BER SEQUENCE tag (0x30 = ASCII '0'), producing phantom domains
-    /// like `essos.local0` that poison the orchestrator's `domain_controllers`
+    /// like `contoso.local0` that poison the orchestrator's `domain_controllers`
     /// keys and make the completion loop's required-forest set unsatisfiable.
     #[test]
     fn parse_dn_from_ldap_response_does_not_bleed_into_next_ber_tag() {
         let mut data = Vec::new();
         data.extend_from_slice(b"\x04\x14");
         data.extend_from_slice(b"defaultNamingContext");
-        data.extend_from_slice(b"\x31\x13\x04\x11"); // SET len 19, OCTET STRING len 17
-        data.extend_from_slice(b"DC=essos,DC=local"); // exactly 17 bytes
+        data.extend_from_slice(b"\x31\x15\x04\x13"); // SET len 21, OCTET STRING len 19
+        data.extend_from_slice(b"DC=contoso,DC=local"); // exactly 19 bytes
         data.extend_from_slice(b"\x30\x10"); // next SEQUENCE: tag 0x30 ('0'), len 0x10
         data.extend_from_slice(b"trailingjunk");
 
         assert_eq!(
             parse_dn_from_ldap_response(&data),
-            Some("essos.local".to_string())
+            Some("contoso.local".to_string())
         );
     }
 }

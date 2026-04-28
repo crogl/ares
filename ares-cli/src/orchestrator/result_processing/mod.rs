@@ -352,8 +352,8 @@ async fn resolve_domain_from_ip(dispatcher: &Arc<Dispatcher>, target_ip: Option<
                 return domain.clone();
             }
         }
-        // Derive domain from FQDN hostname (e.g. winterfell.north.sevenkingdoms.local
-        // → north.sevenkingdoms.local)
+        // Derive domain from FQDN hostname (e.g. dc01.child.contoso.local
+        // → child.contoso.local)
         for host in &state.hosts {
             if host.ip == ip {
                 if let Some(dot) = host.hostname.find('.') {

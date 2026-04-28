@@ -64,18 +64,6 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "hash": {
                         "type": "string",
                         "description": "NTLM hash for pass-the-hash authentication (e.g. aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0). Use this OR password."
-                    },
-                    "target_domain": {
-                        "type": "string",
-                        "description": "Parent domain FQDN (auto-detected from child if omitted)"
-                    },
-                    "dc_ip": {
-                        "type": "string",
-                        "description": "Child DC IP. Pass when DNS cannot resolve `child_domain` (raiseChild binds LDAP to the child DC first)."
-                    },
-                    "target_ip": {
-                        "type": "string",
-                        "description": "Parent DC IP. Pass when DNS cannot resolve the parent FQDN (raiseChild dumps the parent after escalation)."
                     }
                 },
                 "required": ["child_domain", "username"]

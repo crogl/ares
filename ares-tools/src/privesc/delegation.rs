@@ -199,27 +199,24 @@ pub async fn krbrelayup(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `child_domain`, `username`
 /// Auth: `password` (plaintext) OR `hash` (NTLM pass-the-hash). At least one required.
-/// Optional args: `target_domain`, `dc_ip` (child DC IP, bypasses DNS),
-///                `target_ip` (parent DC IP, bypasses DNS)
+///
+/// raiseChild auto-discovers the parent forest root via the child DC's
+/// trustedDomain LDAP objects, so callers don't need to supply parent FQDN
+/// or DC IPs. The script accepts only the positional `domain/user[:pass]`
+/// plus `-hashes`, `-w`, `-target-exec`, `-targetRID`, `-k`, `-aesKey`,
+/// `-no-pass`. Passing `-dc-ip` / `-target-ip` / `-target-domain` makes
+/// argparse exit 2.
 pub async fn raise_child(args: &Value) -> Result<ToolOutput> {
     let child_domain = required_str(args, "child_domain")?;
     let username = required_str(args, "username")?;
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
-    let target_domain = optional_str(args, "target_domain");
-    let dc_ip = optional_str(args, "dc_ip");
-    let target_ip = optional_str(args, "target_ip");
 
     if password.is_none() && hash.is_none() {
         anyhow::bail!("raise_child requires either 'password' or 'hash' for authentication");
     }
 
     let mut cmd = CommandBuilder::new("raiseChild.py");
-
-    cmd = cmd
-        .flag_opt("-target-domain", target_domain)
-        .flag_opt("-dc-ip", dc_ip)
-        .flag_opt("-target-ip", target_ip);
 
     if let Some(h) = hash {
         cmd = cmd

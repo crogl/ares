@@ -12,7 +12,7 @@ use std::sync::LazyLock;
 
 /// Strip trailing DNS root dot and NetExec "0." artifact from domain strings
 /// (e.g. `child.contoso.local.` → `child.contoso.local`,
-/// `essos.local0` → `essos.local`).
+/// `contoso.local0` → `contoso.local`).
 pub(super) fn strip_trailing_dot(s: &str) -> &str {
     let s = s.trim_end_matches('.');
     // NetExec sometimes appends "0" to domain TLDs. Strip if the char

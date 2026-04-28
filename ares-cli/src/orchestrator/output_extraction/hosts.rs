@@ -182,7 +182,7 @@ SMB  192.168.58.10  445  DC01  [*]  Windows Server (name:DC01) (domain:contoso.l
         // the first label of the SMB "domain" field. We must NOT synthesize
         // `win-x.win-x.gxm0.local`; use the bare NetBIOS name instead so the
         // junk suffix never reaches `state.domains`.
-        let output = "SMB  10.1.2.100  445  WIN-E4G4GC587O4  [*]  Windows Server 2003 \
+        let output = "SMB  192.168.58.30  445  WIN-E4G4GC587O4  [*]  Windows Server 2003 \
             (name:WIN-E4G4GC587O4) (domain:WIN-E4G4GC587O4.GXM0.LOCAL) (signing:False)";
         let hosts = extract_hosts(output);
         assert_eq!(hosts.len(), 1);

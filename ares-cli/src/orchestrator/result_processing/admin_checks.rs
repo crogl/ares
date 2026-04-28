@@ -14,7 +14,7 @@ use crate::orchestrator::dispatcher::Dispatcher;
 ///
 /// Rejects empty strings, IP-like patterns, strings with whitespace, and strings
 /// without at least one dot. Used to filter out malformed domain values that
-/// occasionally appear in tool payloads (e.g. `"10.1.2.51 - north"`).
+/// occasionally appear in tool payloads (e.g. `"192.168.58.30 - dc01"`).
 fn is_valid_domain_fqdn(s: &str) -> bool {
     if s.is_empty() || s.contains(' ') || s.contains(':') || s.contains('/') {
         return false;

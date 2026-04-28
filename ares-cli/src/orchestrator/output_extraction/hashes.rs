@@ -29,9 +29,29 @@ static RE_NTLM_PARTIAL: LazyLock<Regex> =
 static RE_NTLM_CONTINUATION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[a-fA-F0-9]+:::$").unwrap());
 
+// AES256 trust/account key from secretsdump:
+//   DOMAIN\\user:aes256-cts-hmac-sha1-96:<hex>
+//   domain.local/user:aes256-cts-hmac-sha1-96:<hex>
+//   user:aes256-cts-hmac-sha1-96:<hex>
+static RE_AES256_KEY: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:[^\\/\s:]+[\\/])?([^:\s\\/]+):aes256-cts-hmac-sha1-96:([a-fA-F0-9]+)").unwrap()
+});
+
 pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
+
+    // Pre-scan for AES256 keys; these are emitted on separate lines from the
+    // NTLM hash by impacket-secretsdump. Win2016+ DCs reject RC4-only
+    // inter-realm tickets (KDC_ERR_TGT_REVOKED), so we attach the AES256 key
+    // to the matching Hash entry by username.
+    let mut aes_by_user: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for caps in RE_AES256_KEY.captures_iter(output) {
+        let user = caps.get(1).unwrap().as_str().to_lowercase();
+        let aes = caps.get(2).unwrap().as_str().to_lowercase();
+        aes_by_user.insert(user, aes);
+    }
 
     // First pass: unwrap line-wrapped NTLM hashes
     let lines: Vec<&str> = output.lines().collect();
@@ -72,7 +92,7 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
                 });
             }
             continue;
@@ -100,7 +120,7 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
                 });
             }
             continue;
@@ -126,7 +146,7 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
                 });
             }
             continue;
@@ -155,7 +175,7 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     discovered_at: Some(chrono::Utc::now()),
                     parent_id: None,
                     attack_step: 0,
-                    aes_key: None,
+                    aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
                 });
             }
         }
@@ -360,6 +380,20 @@ mod tests {
     #[test]
     fn extract_hashes_empty_output() {
         assert!(extract_hashes("", "CONTOSO").is_empty());
+    }
+
+    #[test]
+    fn extract_hashes_attaches_aes256_to_trust_account() {
+        let output = "\
+FABRIKAM\\CONTOSO$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+FABRIKAM\\CONTOSO$:aes256-cts-hmac-sha1-96:4444444444444444444444444444444444444444444444444444444444444444";
+        let hashes = extract_hashes(output, "fabrikam.local");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].username, "CONTOSO$");
+        assert_eq!(
+            hashes[0].aes_key.as_deref(),
+            Some("4444444444444444444444444444444444444444444444444444444444444444")
+        );
     }
 
     #[test]

@@ -348,7 +348,7 @@ $pass = "P@ssw0rd"
     #[test]
     fn rejects_powershell_expression_username_and_cmdlet_password() {
         // Real-world false positive that produced
-        // `essos.local\$user.username:New-Object` in loot. The username is a
+        // `contoso.local\$user.username:New-Object` in loot. The username is a
         // PowerShell property access expression, the "password" is a cmdlet
         // name (Verb-Noun). Neither is a literal credential.
         let output = r#"
@@ -356,7 +356,7 @@ $pass = "P@ssw0rd"
 $user = $User.UserName
 $password = New-Object PSCredential
 "#;
-        let params = json!({"domain": "essos.local"});
+        let params = json!({"domain": "contoso.local"});
         let creds = parse_spider_credentials(output, &params);
         assert!(
             creds.is_empty(),

@@ -60,6 +60,30 @@ impl SharedState {
         Ok(())
     }
 
+    /// Remove a dedup set entry from Redis (used to allow retries after a
+    /// transient failure such as auth-mismatch on enumeration).
+    pub async fn unpersist_dedup(
+        &self,
+        queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
+        set_name: &str,
+        key: &str,
+    ) -> Result<()> {
+        let operation_id = {
+            let state = self.inner.read().await;
+            state.operation_id.clone()
+        };
+        let redis_key = format!(
+            "{}:{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_DEDUP_PREFIX,
+            set_name
+        );
+        let mut conn = queue.connection();
+        let _: () = conn.srem(&redis_key, key).await?;
+        Ok(())
+    }
+
     /// Persist MSSQL enum dispatched entry to Redis.
     pub async fn persist_mssql_dispatched(
         &self,

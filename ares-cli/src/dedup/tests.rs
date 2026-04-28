@@ -1107,6 +1107,61 @@ fn sanitize_credentials_drops_ghost_machine_accounts() {
 }
 
 #[test]
+fn dedup_hashes_collapses_bare_and_prefixed_same_user() {
+    // Parsers emit the same hash twice when secretsdump output mixes
+    // `Administrator:RID:...` (bare) and `DOMAIN\Administrator:RID:...` (prefixed)
+    // — bare gets empty domain, prefixed gets the resolved FQDN.
+    // The bare row should be folded into the prefixed one.
+    let hashes = vec![
+        make_hash("", "Administrator", "NTLM", "aabbccdd"),
+        make_hash("contoso.local", "Administrator", "NTLM", "aabbccdd"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].domain, "contoso.local");
+}
+
+#[test]
+fn dedup_hashes_keeps_distinct_users_sharing_hash() {
+    // Two different users can end up with identical NTLMs (shared password).
+    // They must NOT be folded together — dedup keys on
+    // (username, hash_type, hash_value), not just (hash_type, hash_value).
+    let hashes = vec![
+        make_hash("contoso.local", "Administrator", "NTLM", "deadbeefcafe"),
+        make_hash("contoso.local", "svc_backup", "NTLM", "deadbeefcafe"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 2);
+}
+
+#[test]
+fn dedup_hashes_bare_with_no_domain_sibling_kept() {
+    // If we only ever saw the bare form, we cannot infer a domain — keep it as-is.
+    let hashes = vec![make_hash("", "Administrator", "NTLM", "aabbccdd")];
+    let deduped = dedup_hashes(&hashes);
+    assert_eq!(deduped.len(), 1);
+    assert_eq!(deduped[0].domain, "");
+}
+
+#[test]
+fn dedup_hashes_picks_longest_domain_when_multiple_known() {
+    // If the same user+hash appears with both a parent and a child domain (rare
+    // cross-forest replication artifact), prefer the longer/more-specific FQDN
+    // when filling in a bare entry.
+    let hashes = vec![
+        make_hash("", "krbtgt", "NTLM", "deadbeef"),
+        make_hash("contoso.local", "krbtgt", "NTLM", "deadbeef"),
+        make_hash("child.contoso.local", "krbtgt", "NTLM", "deadbeef"),
+    ];
+    let deduped = dedup_hashes(&hashes);
+    // The bare entry folds into the longest sibling; the two populated entries stay distinct.
+    assert_eq!(deduped.len(), 2);
+    let domains: Vec<&str> = deduped.iter().map(|h| h.domain.as_str()).collect();
+    assert!(domains.contains(&"contoso.local"));
+    assert!(domains.contains(&"child.contoso.local"));
+}
+
+#[test]
 fn dedup_hashes_drops_ghost_machine_accounts() {
     let hashes = vec![
         make_hash(

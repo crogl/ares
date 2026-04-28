@@ -31,7 +31,7 @@ static RE_NETEXEC_SUCCESS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"\[\+\]\s+([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-$]+):([^\s(]+)").unwrap()
 });
 
-/// Regex for rpcclient `queryuser` output: `User Name   :\tsamwell.tarly`
+/// Regex for rpcclient `queryuser` output: `User Name   :\tjdoe`
 static RE_RPC_USER_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^\s*User\s+Name\s*:\s*(\S+)").unwrap());
 

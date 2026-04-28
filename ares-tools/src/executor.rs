@@ -15,6 +15,7 @@ pub struct CommandBuilder {
     env_vars: Vec<(String, String)>,
     timeout: Duration,
     stdin_data: Option<String>,
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl CommandBuilder {
@@ -25,6 +26,7 @@ impl CommandBuilder {
             env_vars: Vec::new(),
             timeout: DEFAULT_TIMEOUT,
             stdin_data: None,
+            cwd: None,
         }
     }
 
@@ -79,6 +81,11 @@ impl CommandBuilder {
         self
     }
 
+    pub fn current_dir(mut self, dir: impl Into<std::path::PathBuf>) -> Self {
+        self.cwd = Some(dir.into());
+        self
+    }
+
     pub async fn execute(self) -> Result<ToolOutput> {
         #[cfg(test)]
         {
@@ -92,6 +99,10 @@ impl CommandBuilder {
 
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args);
+
+        if let Some(ref dir) = self.cwd {
+            cmd.current_dir(dir);
+        }
 
         for (key, value) in &self.env_vars {
             cmd.env(key, value);

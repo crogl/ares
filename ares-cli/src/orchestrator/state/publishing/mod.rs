@@ -112,8 +112,8 @@ pub(super) fn sanitize_credential(
 }
 
 /// Strip the trailing "0." artifact that NetExec sometimes appends to domain
-/// names (e.g. `dc01.essos.local0.` → `dc01.essos.local`,
-/// `essos.local0` → `essos.local`).
+/// names (e.g. `dc01.contoso.local0.` → `dc01.contoso.local`,
+/// `contoso.local0` → `contoso.local`).
 pub(super) fn strip_netexec_artifact(s: &str) -> &str {
     let s = s.trim_end_matches('.');
     // "0." already collapsed to "0" after trimming "."; strip if preceded by a label

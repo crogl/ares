@@ -10,8 +10,8 @@
 //!   - Credentials obtained via MSSQL linked server pivots
 //!   - Admin credentials from owned DCs in the foreign forest
 //!
-//! This covers the gap where essos.local users are not enumerated because
-//! initial recon only has north/sevenkingdoms creds.
+//! This covers the gap where the trusted forest's users are not enumerated
+//! because initial recon only has primary-forest credentials.
 
 use std::sync::Arc;
 use std::time::Duration;

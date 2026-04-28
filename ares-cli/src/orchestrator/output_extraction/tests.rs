@@ -531,25 +531,25 @@ fn extract_cracked_no_false_positive_on_raw_asrep_hash() {
 #[test]
 fn extract_rpcclient_queryuser_description_password() {
     let output = "\
-\tUser Name   :\tsamwell.tarly\n\
+\tUser Name   :\tjdoe\n\
 \tFull Name   :\t\n\
 \tHome Drive  :\t\n\
 \tDir Drive   :\t\n\
 \tProfile Path:\t\n\
 \tLogon Script:\t\n\
-\tDescription :\tSamwell Tarly (Password : Heartsbane)\n\
+\tDescription :\tJohn Doe (Password : Summer2024!)\n\
 \tWorkstations:\t\n\
 \tComment     :\t\n\
 \tRemote Dial :\n";
-    let creds = extract_plaintext_passwords(output, "north.contoso.local");
+    let creds = extract_plaintext_passwords(output, "child.contoso.local");
     assert_eq!(
         creds.len(),
         1,
         "Should extract credential from rpcclient queryuser block"
     );
-    assert_eq!(creds[0].username, "samwell.tarly");
-    assert_eq!(creds[0].password, "Heartsbane");
-    assert_eq!(creds[0].domain, "north.contoso.local");
+    assert_eq!(creds[0].username, "jdoe");
+    assert_eq!(creds[0].password, "Summer2024!");
+    assert_eq!(creds[0].domain, "child.contoso.local");
     assert_eq!(creds[0].source, "description_field");
 }
 
@@ -557,22 +557,18 @@ fn extract_rpcclient_queryuser_description_password() {
 #[test]
 fn extract_rpcclient_queryuser_multiple_users() {
     let output = "\
-\tUser Name   :\tjohn.snow\n\
-\tDescription :\tJohn Snow\n\
+\tUser Name   :\tasmith\n\
+\tDescription :\tAlice Smith\n\
 \n\
-\tUser Name   :\tsamwell.tarly\n\
-\tDescription :\tSamwell Tarly (Password : Heartsbane)\n\
+\tUser Name   :\tjdoe\n\
+\tDescription :\tJohn Doe (Password : Summer2024!)\n\
 \n\
-\tUser Name   :\tarya.stark\n\
-\tDescription :\tArya Stark\n";
-    let creds = extract_plaintext_passwords(output, "north.contoso.local");
-    assert_eq!(
-        creds.len(),
-        1,
-        "Only samwell.tarly has a password in description"
-    );
-    assert_eq!(creds[0].username, "samwell.tarly");
-    assert_eq!(creds[0].password, "Heartsbane");
+\tUser Name   :\tbjones\n\
+\tDescription :\tBob Jones\n";
+    let creds = extract_plaintext_passwords(output, "child.contoso.local");
+    assert_eq!(creds.len(), 1, "Only jdoe has a password in description");
+    assert_eq!(creds[0].username, "jdoe");
+    assert_eq!(creds[0].password, "Summer2024!");
 }
 
 #[test]

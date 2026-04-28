@@ -31,7 +31,7 @@ impl SharedState {
     ) -> Result<bool> {
         // Normalize hostname: strip trailing artifacts and AWS internal names.
         // NetExec sometimes appends "0." to domain names (e.g.
-        // "dc01.essos.local0." → "dc01.essos.local"). Strip both forms.
+        // "dc01.contoso.local0." → "dc01.contoso.local"). Strip both forms.
         let mut host = host;
         host.hostname = strip_netexec_artifact(&host.hostname).to_lowercase();
         if is_aws_hostname(&host.hostname) {

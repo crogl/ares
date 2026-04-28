@@ -266,9 +266,9 @@ mod tests {
     #[test]
     fn real_domain_not_machine_hostname() {
         assert!(!is_machine_hostname_domain("contoso.local"));
-        assert!(!is_machine_hostname_domain("north.sevenkingdoms.local"));
-        assert!(!is_machine_hostname_domain("NORTH"));
-        assert!(!is_machine_hostname_domain("SEVENKINGDOMS"));
+        assert!(!is_machine_hostname_domain("child.contoso.local"));
+        assert!(!is_machine_hostname_domain("CONTOSO"));
+        assert!(!is_machine_hostname_domain("CHILD"));
     }
 
     // --- extract_users with machine hostname filtering ---
@@ -277,32 +277,32 @@ mod tests {
     fn extract_users_smb_banner_machine_domain_ignored() {
         // SMB banner with Kali machine domain should not override default_domain
         let output = concat!(
-            "SMB  192.168.56.10  445  KINGSLANDING  (domain:WIN-G7FPA5ZZXZV) ...\n",
-            "user:[samwell.tarly] rid:[0x44e]\n",
+            "SMB  192.168.58.10  445  DC01  (domain:WIN-G7FPA5ZZXZV) ...\n",
+            "user:[jdoe] rid:[0x44e]\n",
         );
-        let users = extract_users(output, "north.sevenkingdoms.local");
+        let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0].username, "samwell.tarly");
+        assert_eq!(users[0].username, "jdoe");
         // Should use default_domain, not the machine hostname
-        assert_eq!(users[0].domain, "north.sevenkingdoms.local");
+        assert_eq!(users[0].domain, "contoso.local");
     }
 
     #[test]
     fn extract_users_upn_machine_domain_substituted() {
         // UPN with machine FQDN should substitute default_domain
-        let output = "samwell.tarly@win-g7fpa5zzxzv.w5an.local\n";
-        let users = extract_users(output, "north.sevenkingdoms.local");
+        let output = "jdoe@win-g7fpa5zzxzv.w5an.local\n";
+        let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0].username, "samwell.tarly");
-        assert_eq!(users[0].domain, "north.sevenkingdoms.local");
+        assert_eq!(users[0].username, "jdoe");
+        assert_eq!(users[0].domain, "contoso.local");
     }
 
     #[test]
     fn extract_users_real_upn_preserved() {
         // Real UPN should keep its domain
-        let output = "samwell.tarly@north.sevenkingdoms.local\n";
-        let users = extract_users(output, "north.sevenkingdoms.local");
+        let output = "jdoe@contoso.local\n";
+        let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
-        assert_eq!(users[0].domain, "north.sevenkingdoms.local");
+        assert_eq!(users[0].domain, "contoso.local");
     }
 }

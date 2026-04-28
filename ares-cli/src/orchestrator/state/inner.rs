@@ -290,8 +290,8 @@ impl StateInner {
     }
 
     /// Get the forest root for a domain.
-    /// If the domain is a child (e.g. `north.sevenkingdoms.local`), the forest
-    /// root is the parent (e.g. `sevenkingdoms.local`). Otherwise returns self.
+    /// If the domain is a child (e.g. `child.contoso.local`), the forest
+    /// root is the parent (e.g. `contoso.local`). Otherwise returns self.
     fn forest_root_of(&self, domain: &str) -> String {
         let d = domain.to_lowercase();
         // Check if this domain is a child of any known domain
@@ -332,6 +332,13 @@ impl StateInner {
             .entry(set_name.to_string())
             .or_default()
             .insert(key);
+    }
+
+    /// Remove a key from the named dedup set so it can be retried.
+    pub fn unmark_processed(&mut self, set_name: &str, key: &str) {
+        if let Some(s) = self.dedup.get_mut(set_name) {
+            s.remove(key);
+        }
     }
 
     /// Check if all discovered forests have been dominated (krbtgt obtained).

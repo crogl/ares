@@ -5,7 +5,7 @@
 //! cross-domain attack paths that BloodHound's intra-domain analysis might miss.
 //!
 //! Dispatches LDAP queries per trust relationship to find:
-//! - Foreign users in local groups (e.g., essos\daenerys in sevenkingdoms\AcrossTheNarrowSea)
+//! - Foreign users in local groups (e.g., FABRIKAM\jdoe in CONTOSO\TrustedAdmins)
 //! - Foreign groups nested in local groups
 //! - Domain Local groups with foreign members (the primary FSP container)
 

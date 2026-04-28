@@ -160,6 +160,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "raise_child" => privesc::raise_child(arguments).await,
         "extract_trust_key" => privesc::extract_trust_key(arguments).await,
         "create_inter_realm_ticket" => privesc::create_inter_realm_ticket(arguments).await,
+        "forge_inter_realm_and_dump" => privesc::forge_inter_realm_and_dump(arguments).await,
         "get_sid" => privesc::get_sid(arguments).await,
         "dnstool" => privesc::dnstool(arguments).await,
         "gmsa_dump_passwords" => privesc::gmsa_dump_passwords(arguments).await,
@@ -193,6 +194,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "ntlmrelayx_to_adcs" => coercion::ntlmrelayx_to_adcs(arguments).await,
         "ntlmrelayx_to_smb" => coercion::ntlmrelayx_to_smb(arguments).await,
         "ntlmrelayx_multirelay" => coercion::ntlmrelayx_multirelay(arguments).await,
+        "relay_and_coerce" => coercion::relay_and_coerce(arguments).await,
 
         _ => Err(anyhow::anyhow!("unknown tool: {tool_name}")),
     }

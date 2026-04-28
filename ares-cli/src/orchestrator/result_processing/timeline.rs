@@ -401,7 +401,7 @@ mod tests {
 
     #[test]
     fn exploitation_techniques_mssql() {
-        let t = exploitation_techniques("mssql_impersonation_braavos");
+        let t = exploitation_techniques("mssql_impersonation_sql01");
         assert!(t.contains(&"T1505".to_string()));
     }
 

@@ -20,7 +20,7 @@ fn extract_domain_from_fqdn(fqdn: &str) -> Option<String> {
 /// Work item for ADCS enumeration.
 struct AdcsWork {
     host_ip: String,
-    /// Auth-typed dedup key (e.g., "10.1.2.220:cred" or "10.1.2.220:hash")
+    /// Auth-typed dedup key (e.g., "192.168.58.10:cred" or "192.168.58.10:hash")
     dedup_key: String,
     dc_ip: Option<String>,
     domain: String,

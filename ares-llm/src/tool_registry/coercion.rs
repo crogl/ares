@@ -196,6 +196,49 @@ pub(super) fn tool_definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "relay_and_coerce".into(),
+            description: "Run the full ADCS ESC8 relay+coerce attack as ONE deterministic call. Starts ntlmrelayx targeting the AD CS web enrollment endpoint, then coerces a remote machine to authenticate back: phase 1 attempts unauthenticated PetitPotam (works on unpatched DCs without any creds — preferred); phase 2 falls back to authenticated DFSCoerce (MS-DFSNM); phase 3 falls back to coercer over MS-EFSR → MS-RPRN if creds are supplied. CRITICAL: source ≠ target. coerce_target MUST be a different machine than ca_host — Windows NTLM same-machine loopback protection blocks relay when the coerced host is the relay target. Coerce a DC or other machine and relay it to the CA. The captured certificate is decoded from the relay log and a `certificate_obtained` vulnerability is emitted automatically — `auto_certipy_auth` will then PKINIT and extract the NT hash. Use this instead of orchestrating ntlmrelayx_to_adcs + petitpotam/coercer manually.".into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ca_host": {
+                        "type": "string",
+                        "description": "AD CS server IP/hostname running the Certificate Authority web enrollment service (HTTP /certsrv)"
+                    },
+                    "coerce_target": {
+                        "type": "string",
+                        "description": "Machine to coerce (NOT ca_host — must be a different host). Its machine account is what the relay will impersonate. Typically a DC's IP/hostname; in cross-forest scenarios any reachable machine in the target's RPC scope works."
+                    },
+                    "attacker_ip": {
+                        "type": "string",
+                        "description": "Local listener IP that the coerced machine will authenticate to"
+                    },
+                    "coerce_user": {
+                        "type": "string",
+                        "description": "Optional username for authenticated coercer fallback (only needed if unauth PetitPotam is patched; cross-forest: child user with RPC access)"
+                    },
+                    "coerce_password": {
+                        "type": "string",
+                        "description": "Password for coerce_user (provide either coerce_password OR coerce_hash; only required if coerce_user is set)"
+                    },
+                    "coerce_hash": {
+                        "type": "string",
+                        "description": "NT hash for coerce_user (provide either coerce_password OR coerce_hash; only required if coerce_user is set)"
+                    },
+                    "coerce_domain": {
+                        "type": "string",
+                        "description": "Domain for coerce_user (the user's home realm, may differ from coerce_target's realm; only required if coerce_user is set)"
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": "Certificate template to request (default: DomainController)",
+                        "default": "DomainController"
+                    }
+                },
+                "required": ["ca_host", "coerce_target", "attacker_ip"]
+            }),
+        },
+        ToolDefinition {
             name: "ntlmrelayx_multirelay".into(),
             description: "Relay captured NTLM authentication to multiple SMB targets simultaneously. Attempts to dump SAM database hashes from each target where the relayed account has local administrator privileges.".into(),
             input_schema: json!({
