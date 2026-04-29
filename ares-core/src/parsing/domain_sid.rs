@@ -12,6 +12,12 @@ static RID500_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^500:\s+[^\\]+\\(.+?)\s+\(SidTypeUser\)").expect("rid500 regex")
 });
 
+/// Regex matching any RID line in lookupsid output to capture the flat/NetBIOS
+/// domain name. Matches lines like: `500: DOMAIN\AccountName (SidType...)`.
+static RID_FLAT_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\d+:\s+([^\\\s]+)\\.+?\s+\(SidType").expect("rid flat name regex")
+});
+
 /// Extract the first domain SID (`S-1-5-21-...`) found in the output.
 pub fn extract_domain_sid(output: &str) -> Option<String> {
     DOMAIN_SID_RE.find(output).map(|m| m.as_str().to_string())
@@ -25,6 +31,25 @@ pub fn extract_domain_sid(output: &str) -> Option<String> {
 /// tickets with a mismatched username (`KDC_ERR_TGT_REVOKED`).
 pub fn extract_rid500_name(output: &str) -> Option<String> {
     RID500_RE.captures(output).map(|c| c[1].to_string())
+}
+
+/// Extract `(flat_name, sid)` together from lookupsid output, anchoring the
+/// SID to the NetBIOS/flat name visible on the same RID lines.
+///
+/// Returns `None` if either the SID or the flat name is missing — the caller
+/// must then resolve the FQDN itself rather than guessing from task context.
+///
+/// Why this matters: a task targeting `north.contoso.local` can produce output
+/// referencing `S-1-5-21-…` for the trusted forest's domain (e.g. via lookupsid
+/// over a foreign trust). Anchoring to the flat name lets the caller map the
+/// SID to the correct FQDN via `netbios_to_fqdn` instead of misattributing it
+/// to the task's source domain.
+pub fn extract_domain_sid_and_flat_name(output: &str) -> Option<(String, String)> {
+    let sid = extract_domain_sid(output)?;
+    let flat = RID_FLAT_NAME_RE
+        .captures(output)
+        .map(|c| c[1].to_uppercase())?;
+    Some((flat, sid))
 }
 
 #[cfg(test)]
@@ -102,5 +127,38 @@ mod tests {
             extract_rid500_name("500: DOMAIN\\DomainAdmins (SidTypeGroup)"),
             None
         );
+    }
+
+    #[test]
+    fn extracts_flat_name_alongside_sid() {
+        let output = "[*] Brute forcing SIDs at 192.168.58.10\n\
+                       [*] Domain SID is: S-1-5-21-100-200-300\n\
+                       498: CONTOSO\\Enterprise Read-only Domain Controllers (SidTypeGroup)\n\
+                       500: CONTOSO\\Administrator (SidTypeUser)\n";
+        let result = extract_domain_sid_and_flat_name(output);
+        assert_eq!(
+            result,
+            Some(("CONTOSO".to_string(), "S-1-5-21-100-200-300".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_flat_name_and_sid_uppercases() {
+        let output = "[*] Domain SID is: S-1-5-21-1-2-3\n\
+                       500: contoso\\Administrator (SidTypeUser)\n";
+        let result = extract_domain_sid_and_flat_name(output);
+        assert_eq!(result.as_ref().map(|(f, _)| f.as_str()), Some("CONTOSO"));
+    }
+
+    #[test]
+    fn extract_flat_name_without_sid_returns_none() {
+        let output = "500: CONTOSO\\Administrator (SidTypeUser)\n";
+        assert_eq!(extract_domain_sid_and_flat_name(output), None);
+    }
+
+    #[test]
+    fn extract_flat_name_without_rid_lines_returns_none() {
+        let output = "[*] Domain SID is: S-1-5-21-1-2-3\n";
+        assert_eq!(extract_domain_sid_and_flat_name(output), None);
     }
 }

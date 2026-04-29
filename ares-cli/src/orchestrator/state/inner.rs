@@ -341,6 +341,27 @@ impl StateInner {
         }
     }
 
+    /// Remove every key in `set_name` that starts with `prefix`. Returns the
+    /// removed keys so the caller can also drop them from the persisted store.
+    /// Used by trust automation to wake cross-forest fallback automations
+    /// (FSP/ACL/group enum) for a target domain when their dedup format is
+    /// `{kind}:{domain}[:tail]` — clearing all entries for a target without
+    /// knowing the full key.
+    pub fn unmark_processed_by_prefix(&mut self, set_name: &str, prefix: &str) -> Vec<String> {
+        let Some(s) = self.dedup.get_mut(set_name) else {
+            return Vec::new();
+        };
+        let to_remove: Vec<String> = s
+            .iter()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for k in &to_remove {
+            s.remove(k);
+        }
+        to_remove
+    }
+
     /// Check if all discovered forests have been dominated (krbtgt obtained).
     ///
     /// Returns `true` when `compute_undominated_forests()` returns an empty list,
@@ -412,6 +433,29 @@ mod tests {
         state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.10".into());
         state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.10".into());
         assert_eq!(state.dedup[DEDUP_SECRETSDUMP].len(), 1);
+    }
+
+    #[test]
+    fn unmark_processed_by_prefix_removes_matching() {
+        let mut state = StateInner::new("op-1".into());
+        state.mark_processed(DEDUP_SECRETSDUMP, "xforest:fabrikam.local:dc01".into());
+        state.mark_processed(DEDUP_SECRETSDUMP, "xforest:fabrikam.local:dc02".into());
+        state.mark_processed(DEDUP_SECRETSDUMP, "xforest:contoso.local:dc01".into());
+        state.mark_processed(DEDUP_SECRETSDUMP, "unrelated:key".into());
+        let removed =
+            state.unmark_processed_by_prefix(DEDUP_SECRETSDUMP, "xforest:fabrikam.local:");
+        assert_eq!(removed.len(), 2);
+        assert!(removed
+            .iter()
+            .all(|k| k.starts_with("xforest:fabrikam.local:")));
+        assert_eq!(state.dedup[DEDUP_SECRETSDUMP].len(), 2);
+    }
+
+    #[test]
+    fn unmark_processed_by_prefix_unknown_set_returns_empty() {
+        let mut state = StateInner::new("op-1".into());
+        let removed = state.unmark_processed_by_prefix("does_not_exist", "x:");
+        assert!(removed.is_empty());
     }
 
     #[test]

@@ -48,8 +48,15 @@ pub fn parse_domain_trusts(output: &str) -> Vec<Value> {
 
         let classified_type = classify_trust_type(trust_type, trust_attributes, cn);
 
-        let sid_filtering =
-            trust_attributes & TRUST_ATTR_FOREST_TRANSITIVE != 0 || classified_type == "forest";
+        // SID filtering is on by default for both forest and external trusts in
+        // modern AD (Server 2003+). Explicit attribute flags override the default,
+        // but absent the flag we still treat cross-forest/external trusts as
+        // filtered — mirrors `netdom trust /SidFiltering` which defaults to "yes"
+        // and blocks ExtraSid claims with RID < 1000.
+        let sid_filtering = trust_attributes & TRUST_ATTR_FOREST_TRANSITIVE != 0
+            || trust_attributes & TRUST_ATTR_QUARANTINED_DOMAIN != 0
+            || classified_type == "forest"
+            || classified_type == "external";
 
         Some(json!({
             "domain": cn.to_lowercase(),
@@ -238,7 +245,8 @@ flatName: CHILD
         assert_eq!(trusts.len(), 1);
         assert_eq!(trusts[0]["direction"], "outbound");
         assert_eq!(trusts[0]["trust_type"], "external");
-        assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
+        // External trusts have SID filtering on by default in modern AD.
+        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]
@@ -288,6 +296,7 @@ flatName: CHILD
         let trusts = parse_domain_trusts(output);
         assert_eq!(trusts.len(), 1);
         assert_eq!(trusts[0]["trust_type"], "external");
+        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]

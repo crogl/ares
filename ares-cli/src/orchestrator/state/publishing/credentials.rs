@@ -48,8 +48,26 @@ impl SharedState {
             let cred_domain = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
             if cred_domain.contains('.') {
                 let mut state = self.inner.write().await;
-                if !state.domains.contains(&cred_domain) {
-                    state.domains.push(cred_domain.clone());
+                // If `cred_domain` matches a known host's FQDN, the parser
+                // captured the host FQDN as the credential's AD domain. Strip
+                // the leading label to recover the actual domain
+                // (e.g. `WIN-XXX.c26h.local` → `c26h.local`).
+                let matches_host_fqdn = state
+                    .hosts
+                    .iter()
+                    .any(|h| h.hostname.eq_ignore_ascii_case(&cred_domain));
+                let normalized = if matches_host_fqdn {
+                    cred_domain
+                        .split_once('.')
+                        .map(|(_, rest)| rest.to_string())
+                        .filter(|d| d.contains('.'))
+                        .unwrap_or_else(|| cred_domain.clone())
+                } else {
+                    cred_domain.clone()
+                };
+
+                if normalized.contains('.') && !state.domains.contains(&normalized) {
+                    state.domains.push(normalized.clone());
                     let domain_key = format!(
                         "{}:{}:{}",
                         state::KEY_PREFIX,
@@ -57,11 +75,12 @@ impl SharedState {
                         state::KEY_DOMAINS,
                     );
                     let _: Result<(), _> =
-                        redis::AsyncCommands::sadd(&mut conn, &domain_key, &cred_domain).await;
+                        redis::AsyncCommands::sadd(&mut conn, &domain_key, &normalized).await;
                     let _: Result<(), _> =
                         redis::AsyncCommands::expire(&mut conn, &domain_key, 86400i64).await;
                     tracing::info!(
-                        domain = %cred_domain,
+                        domain = %normalized,
+                        raw_cred_domain = %cred_domain,
                         username = %cred.username,
                         "Auto-extracted domain from credential"
                     );

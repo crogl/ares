@@ -104,7 +104,7 @@ impl SharedState {
                 }
                 let new_is_dc = host.is_dc || host.detect_dc();
                 let was_dc = existing.is_dc;
-                let had_hostname = !existing.hostname.is_empty();
+                let had_fqdn = existing.hostname.contains('.');
                 let mut changed = false;
 
                 if new_is_dc && !existing.is_dc {
@@ -116,7 +116,17 @@ impl SharedState {
                     existing.hostname = String::new();
                     changed = true;
                 }
-                if !host.hostname.is_empty() && existing.hostname.is_empty() {
+                // Upgrade short name to FQDN when a better hostname arrives.
+                // Without this, the short name (e.g. "kingslanding") sticks
+                // and `register_dc` can't derive a domain from it, which
+                // forces the ambiguous fallback path and mis-maps DCs.
+                let upgrade_to_fqdn = host.hostname.contains('.')
+                    && !existing.hostname.contains('.')
+                    && host
+                        .hostname
+                        .to_lowercase()
+                        .starts_with(&format!("{}.", existing.hostname.to_lowercase()));
+                if (!host.hostname.is_empty() && existing.hostname.is_empty()) || upgrade_to_fqdn {
                     existing.hostname = host.hostname.clone();
                     changed = true;
                 }
@@ -140,11 +150,11 @@ impl SharedState {
                 }
 
                 // Re-register DC if it just became a DC, or if its hostname
-                // was just filled in (so we can correct the domain mapping).
+                // was upgraded to (or first set to) an FQDN — that's when we
+                // can finally derive the correct domain instead of guessing.
                 let is_dc_now = existing.is_dc;
-                let has_hostname_now = !existing.hostname.is_empty();
-                let needs_dc =
-                    (is_dc_now && !was_dc) || (is_dc_now && has_hostname_now && !had_hostname);
+                let has_fqdn_now = existing.hostname.contains('.');
+                let needs_dc = (is_dc_now && !was_dc) || (is_dc_now && has_fqdn_now && !had_fqdn);
                 (needs_dc, true)
             } else {
                 // No existing host — will be added below
@@ -268,14 +278,23 @@ impl SharedState {
         };
 
         // If we can't derive a domain from the hostname, fall back to the
-        // target domain already in state. This unblocks automation for DCs
-        // discovered before their FQDN is resolved.
+        // sole known domain. This unblocks automation for DCs discovered
+        // before their FQDN is resolved.
+        //
+        // Only fall back when exactly one domain is in state. With ≥2
+        // domains, "first" is a guess that mis-maps DCs to the wrong domain
+        // (e.g. registering a parent DC under the child domain), and that
+        // bad mapping survives later cleanup — `register_dc` only purges
+        // stale entries by IP, so a subsequent correct registration with a
+        // *different* IP can't dislodge the wrong (domain, ip) pair. Skip
+        // and let the next FQDN-bearing discovery populate the entry.
         let raw_domain = if raw_domain.is_empty()
             || raw_domain.contains("compute.internal")
             || raw_domain.contains("amazonaws.com")
         {
             let state = self.inner.read().await;
-            if let Some(fallback) = state.domains.first().cloned() {
+            if state.domains.len() == 1 {
+                let fallback = state.domains[0].clone();
                 tracing::info!(
                     ip = %host.ip,
                     hostname = %host.hostname,
@@ -287,7 +306,8 @@ impl SharedState {
                 tracing::debug!(
                     ip = %host.ip,
                     hostname = %host.hostname,
-                    "Skipping DC registration: no FQDN and no fallback domain in state"
+                    known_domains = state.domains.len(),
+                    "Skipping DC registration: no FQDN and ambiguous fallback domain"
                 );
                 return Ok(());
             }
@@ -679,6 +699,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_dc_skips_ambiguous_fallback_with_multiple_domains() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        // Two domains in state — fallback would be a guess.
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("fabrikam.local".to_string());
+        }
+
+        // DC discovered with no FQDN — must NOT pick the first domain,
+        // because that would mis-map (e.g. parent DC under child domain)
+        // and the bad mapping survives later cleanup.
+        let host = make_host("192.168.58.1", "", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domain_controllers.is_empty(),
+            "must skip registration when fallback domain is ambiguous"
+        );
+    }
+
+    #[tokio::test]
     async fn register_dc_three_part_hostname_extracts_full_domain() {
         // Sanity check the >=3 parts branch with a deeper FQDN to make sure
         // the parts[1..].join(".") slice is right (not just the last label).
@@ -692,6 +737,46 @@ mod tests {
         assert_eq!(
             s.domain_controllers.get("eu.contoso.local"),
             Some(&"192.168.58.1".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_upgrades_short_hostname_to_fqdn_and_reregisters_dc() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        // Pre-populate two domains so the ambiguous fallback would fire
+        // if FQDN derivation didn't work.
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+            s.domains.push("fabrikam.local".to_string());
+        }
+
+        // First sighting: short name only — register_dc must skip (ambiguous).
+        let h1 = make_host("192.168.58.1", "dc01", true);
+        state.publish_host(&q, h1).await.unwrap();
+        {
+            let s = state.inner.read().await;
+            assert!(s.domain_controllers.is_empty());
+            assert_eq!(s.hosts[0].hostname, "dc01");
+        }
+
+        // Second sighting: FQDN. Must upgrade hostname AND trigger
+        // re-registration so the DC lands under the correct domain.
+        let h2 = make_host("192.168.58.1", "dc01.fabrikam.local", true);
+        state.publish_host(&q, h2).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(s.hosts[0].hostname, "dc01.fabrikam.local");
+        assert_eq!(
+            s.domain_controllers.get("fabrikam.local"),
+            Some(&"192.168.58.1".to_string()),
+            "DC must register under the domain derived from the upgraded FQDN"
+        );
+        assert!(
+            !s.domain_controllers.contains_key("contoso.local"),
+            "must not also register under the wrong (first) domain"
         );
     }
 

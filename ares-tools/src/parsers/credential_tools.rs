@@ -7,13 +7,43 @@ use std::sync::LazyLock;
 
 // ── Lsassy ──────────────────────────────────────────────────────────────────
 
+/// Real ANSI escape sequences (e.g. `\x1b[1;33m`).
+static ANSI_ESC_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[a-zA-Z]").expect("ansi esc regex"));
+
+/// Bare-text ANSI leftovers when ESC bytes are stripped during transport.
+/// Matches things like `[1;33m`, `[0m`, `[32m` — but NOT arbitrary bracketed
+/// text like `[LSASSY]` or `[NT]`.
+static ANSI_BARE_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[\d+(?:;\d+)*m").expect("ansi bare regex"));
+
+/// Match the first plausibly-clean `DOMAIN\username` token in a line.
+///
+/// Domain: starts with alphanumeric, allows alphanumerics/`._-`, no spaces or
+/// brackets — keeps us from sucking up `"SMB 192.168.58.10 445 DC01 [+] contoso.local"`
+/// as the "domain" when the real domain prefix appears later in the line.
+///
+/// Captures: 1=domain, 2=username, 3=remainder of line.
+static LSASSY_DOMAIN_USER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?:^|[\s\]\)>])([A-Za-z0-9][A-Za-z0-9._-]*)\\([A-Za-z0-9._$@-]+)(.*)$")
+        .expect("lsassy domain\\user regex")
+});
+
+/// Match `[NT] <hash>` (with optional `[SHA1] <sha>` suffix) in lsassy output.
+/// Captures: 1=NT hash (32 hex chars).
+static LSASSY_NT_HASH_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\[NT\]\s+([0-9a-fA-F]{32})\b").expect("lsassy NT hash regex"));
+
 /// Parse lsassy output for cleartext credentials and NTLM hashes.
 ///
-/// Lsassy dumps credentials from LSASS memory:
+/// Handles several output flavors:
 /// ```text
-/// CONTOSO\alice.johnson  Password123
-/// CONTOSO\bob.smith      31d6...hash...
+/// CONTOSO\alice  Password123
+/// CONTOSO\bob    aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0
+/// SMB  192.168.58.10  445  DC01  [LSASSY] CONTOSO\carol [NT] 31d6... [SHA1] f9e3...
 /// ```
+/// ANSI color codes (real ESC sequences and bare-text leftovers like `[1;33m`)
+/// are stripped before parsing.
 pub fn parse_lsassy(output: &str, params: &Value) -> (Vec<Value>, Vec<Value>) {
     let default_domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -21,19 +51,15 @@ pub fn parse_lsassy(output: &str, params: &Value) -> (Vec<Value>, Vec<Value>) {
     let mut creds = Vec::new();
 
     for line in output.lines() {
+        let line = strip_ansi(line.trim());
         let line = line.trim();
-        // Skip noise lines
-        if line.is_empty()
-            || line.starts_with('[')
-            || line.starts_with("INFO")
-            || line.starts_with("WARNING")
-            || line.starts_with("ERROR")
-            || line.contains("authentication")
-        {
+        if line.is_empty() {
+            continue;
+        }
+        if is_lsassy_noise(line) {
             continue;
         }
 
-        // Try DOMAIN\username:password or DOMAIN\username password
         if let Some((domain, username, secret)) = parse_lsassy_line(line) {
             let domain = if domain.is_empty() {
                 default_domain.to_string()
@@ -65,33 +91,84 @@ pub fn parse_lsassy(output: &str, params: &Value) -> (Vec<Value>, Vec<Value>) {
     (hashes, creds)
 }
 
+/// Strip ANSI color codes and bare-text leftovers (when ESC bytes were dropped).
+fn strip_ansi(s: &str) -> String {
+    let s = ANSI_ESC_RE.replace_all(s, "");
+    ANSI_BARE_RE.replace_all(&s, "").to_string()
+}
+
+/// Identify lines that lsassy emits but contain no credential we can parse.
+fn is_lsassy_noise(line: &str) -> bool {
+    line.starts_with("INFO")
+        || line.starts_with("WARNING")
+        || line.starts_with("ERROR")
+        || line.contains("authentication")
+        // Lines that are pure status (start with `[`/`(`) and contain no `\`
+        // can't carry a DOMAIN\user pair — skip them up-front.
+        || ((line.starts_with('[') || line.starts_with('('))
+            && !line.contains('\\'))
+}
+
 fn parse_lsassy_line(line: &str) -> Option<(String, String, String)> {
-    // Format: DOMAIN\username  password  OR  DOMAIN\username:password
-    if let Some(backslash_pos) = line.find('\\') {
-        let domain = line[..backslash_pos].trim().to_string();
-        let rest = &line[backslash_pos + 1..];
-
-        // Try splitting on whitespace first (most common lsassy format)
-        // This must come before colon check because NTLM hashes contain colons
-        let parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
-        if parts.len() == 2 && !parts[1].trim().is_empty() {
-            let username = parts[0].trim().to_string();
-            let secret = parts[1].trim().to_string();
-            if !username.is_empty() && !secret.is_empty() {
-                return Some((domain, username, secret));
-            }
-        }
-
-        // Fallback: colon-separated (DOMAIN\username:password)
-        if let Some(colon_pos) = rest.find(':') {
-            let username = rest[..colon_pos].trim().to_string();
-            let after_colon = rest[colon_pos + 1..].trim().to_string();
-            if !username.is_empty() && !after_colon.is_empty() {
-                return Some((domain, username, after_colon));
+    // Special-case `[NT] hash` form first — it's unambiguous and the regex
+    // anchors are friendlier to a clean DOMAIN\user lookahead.
+    if let Some(nt_caps) = LSASSY_NT_HASH_RE.captures(line) {
+        if let Some(caps) = LSASSY_DOMAIN_USER_RE.captures(line) {
+            let domain = caps.get(1)?.as_str();
+            let username = caps.get(2)?.as_str();
+            if is_clean_domain(domain) && !username.is_empty() {
+                return Some((
+                    domain.to_string(),
+                    username.to_string(),
+                    nt_caps[1].to_string(),
+                ));
             }
         }
     }
+
+    // General DOMAIN\user form: parse the first clean DOMAIN\user token, then
+    // pull a secret out of the remainder.
+    let caps = LSASSY_DOMAIN_USER_RE.captures(line)?;
+    let domain = caps.get(1)?.as_str();
+    let username = caps.get(2)?.as_str();
+    let rest = caps.get(3)?.as_str();
+
+    if !is_clean_domain(domain) || username.is_empty() {
+        return None;
+    }
+
+    // Colon-prefixed (DOMAIN\user:secret) — preserve full LM:NT pair.
+    if let Some(stripped) = rest.strip_prefix(':') {
+        let secret = stripped.trim();
+        if !secret.is_empty() {
+            return Some((domain.to_string(), username.to_string(), secret.to_string()));
+        }
+    }
+
+    // Whitespace-separated (DOMAIN\user  secret).
+    let secret = rest.trim();
+    if !secret.is_empty() {
+        // Take only the first whitespace-delimited token to avoid swallowing
+        // trailing `[SHA1] …` decorations into the password.
+        let first = secret.split_whitespace().next().unwrap_or("");
+        if !first.is_empty() {
+            return Some((domain.to_string(), username.to_string(), first.to_string()));
+        }
+    }
+
     None
+}
+
+/// Validate a DOMAIN string looks like an AD domain prefix, not garbage.
+fn is_clean_domain(d: &str) -> bool {
+    !d.is_empty()
+        && d.len() < 64
+        && d.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_')
+        && d.chars()
+            .next()
+            .map(|c| c.is_ascii_alphanumeric())
+            .unwrap_or(false)
 }
 
 fn looks_like_ntlm_hash(s: &str) -> bool {
@@ -576,5 +653,84 @@ _msdcs.contoso.local.  CNAME  dc01.contoso.local.";
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0]["username"], "alice");
         assert_eq!(creds[0]["password"], "Password123");
+    }
+
+    #[test]
+    fn lsassy_handles_nxc_prefix_with_nt_hash_marker() {
+        // Real lsassy-via-nxc line format: a transport prefix, then the
+        // credential block. Domain prefix appears mid-line, not at the start.
+        let output = "\
+SMB         192.168.58.10   445    DC01             [LSASSY] CONTOSO\\Administrator [NT] 31d6cfe0d16ae931b73c59d7e0c089c0 [SHA1] f9e37e83b83c47a93c2f09f66408631b16769e6a";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, creds) = parse_lsassy(output, &params);
+        assert_eq!(hashes.len(), 1, "should pick up the [NT] hash");
+        assert!(creds.is_empty());
+        assert_eq!(hashes[0]["username"], "Administrator");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+        assert_eq!(hashes[0]["hash_value"], "31d6cfe0d16ae931b73c59d7e0c089c0");
+    }
+
+    #[test]
+    fn lsassy_strips_real_ansi_escape_sequences() {
+        // Real ANSI from the wire — the parser must not see them.
+        let output =
+            "\x1b[1;33mCONTOSO\\alice\x1b[0m  \x1b[1;32m[NT]\x1b[0m 31d6cfe0d16ae931b73c59d7e0c089c0";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, _) = parse_lsassy(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "alice");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+    }
+
+    #[test]
+    fn lsassy_strips_bare_text_ansi_leftovers() {
+        // When ESC bytes are stripped during transport, the visible style
+        // codes (`[1;33m`, `[0m`) survive as bare text. Strip them too.
+        let output = "[1;33mCONTOSO\\alice[0m  [1;32m[NT][0m 31d6cfe0d16ae931b73c59d7e0c089c0";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, _) = parse_lsassy(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0]["username"], "alice");
+        assert_eq!(hashes[0]["domain"], "CONTOSO");
+        assert_eq!(hashes[0]["hash_value"], "31d6cfe0d16ae931b73c59d7e0c089c0");
+    }
+
+    #[test]
+    fn lsassy_rejects_garbage_domain_from_naive_first_backslash() {
+        // The pre-fix bug: nxc prefix has no backslash, but `contoso.local\Administrator:HASH`
+        // sits in the line. Naive first-backslash parsing wrongly stuffed the
+        // entire prefix ("SMB ... DC01 [+] contoso.local") into `domain`.
+        // The fix must extract a clean domain ("contoso.local") instead.
+        let output = "\
+SMB         192.168.58.10   445    DC01             [+] contoso.local\\Administrator:31d6cfe0d16ae931b73c59d7e0c089c0";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, creds) = parse_lsassy(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert!(creds.is_empty());
+        assert_eq!(hashes[0]["domain"], "contoso.local");
+        assert_eq!(hashes[0]["username"], "Administrator");
+    }
+
+    #[test]
+    fn lsassy_rejects_path_like_backslashes() {
+        // Backslashes in Windows paths shouldn't be treated as DOMAIN\user.
+        // The token after `\` here is empty / has no secret following.
+        let output = "[*] Loading file C:\\Windows\\Temp\\dump.dmp";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, creds) = parse_lsassy(output, &params);
+        assert!(hashes.is_empty());
+        assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn lsassy_does_not_swallow_sha1_decoration_into_password() {
+        // Whitespace-separated form with `[SHA1] …` trailing decoration.
+        // The parser should pick the NT hash, not concatenate the rest.
+        let output = "CONTOSO\\bob 31d6cfe0d16ae931b73c59d7e0c089c0 [SHA1] f9e37e83b83c47a93c2f09f66408631b16769e6a";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, creds) = parse_lsassy(output, &params);
+        assert_eq!(hashes.len(), 1);
+        assert!(creds.is_empty());
+        assert_eq!(hashes[0]["hash_value"], "31d6cfe0d16ae931b73c59d7e0c089c0");
     }
 }

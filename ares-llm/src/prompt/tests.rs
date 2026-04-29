@@ -511,6 +511,56 @@ fn exploit_adcs_esc8() {
     assert!(prompt.contains("ntlmrelayx"));
     assert!(prompt.contains("web enrollment"));
     assert!(!prompt.contains("certipy_request"));
+    // No coerce_target field provided -> no "Coerce Target:" header rendered
+    assert!(!prompt.contains("Coerce Target:"));
+}
+
+#[test]
+fn exploit_adcs_esc8_renders_coerce_target_when_present() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26", &payload, None).unwrap();
+    assert!(prompt.contains("Coerce Target (primary): 192.168.58.20"));
+    assert!(prompt.contains("Relay Listener: 192.168.58.50"));
+    assert!(prompt.contains("Coerce 192.168.58.20"));
+}
+
+#[test]
+fn exploit_adcs_esc8_renders_fallback_targets() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "coerce_targets": ["192.168.58.20", "192.168.58.30", "192.168.58.51"],
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26b", &payload, None).unwrap();
+    assert!(prompt.contains("Fallback Coerce Targets"));
+    assert!(prompt.contains("192.168.58.30"));
+    assert!(prompt.contains("192.168.58.51"));
+}
+
+#[test]
+fn exploit_adcs_esc8_omits_fallback_block_when_only_one_candidate() {
+    let payload = serde_json::json!({
+        "vuln_type": "adcs_esc8",
+        "target": "192.168.58.15",
+        "ca_server": "192.168.58.10",
+        "domain": "contoso.local",
+        "coerce_target": "192.168.58.20",
+        "coerce_targets": ["192.168.58.20"],
+        "listener_ip": "192.168.58.50",
+    });
+    let prompt = generate_task_prompt("exploit", "t-26c", &payload, None).unwrap();
+    assert!(!prompt.contains("Fallback Coerce Targets"));
 }
 
 #[test]

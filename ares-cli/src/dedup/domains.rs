@@ -179,12 +179,14 @@ pub(crate) fn normalize_state_domains(
 
     {
         let mut valid_domains: HashSet<String> = HashSet::new();
+        let mut host_fqdns: HashSet<String> = HashSet::new();
         if let Some(td) = target_domain {
             valid_domains.insert(td.to_lowercase());
         }
         for host in hosts {
             if !host.hostname.is_empty() && host.hostname.contains('.') {
                 let lower = host.hostname.to_lowercase();
+                host_fqdns.insert(lower.clone());
                 let parts: Vec<&str> = lower.split('.').collect();
                 if parts.len() > 1 {
                     valid_domains.insert(parts[1..].join("."));
@@ -193,10 +195,20 @@ pub(crate) fn normalize_state_domains(
         }
         for user in users {
             if !user.domain.is_empty() {
-                valid_domains.insert(user.domain.to_lowercase());
+                let d = user.domain.to_lowercase();
+                // Skip user.domain values that are actually a host FQDN —
+                // some parsers misattribute and assign the DC's FQDN as the
+                // user's AD domain, which would otherwise let the FQDN survive
+                // the retain() filter below as a phantom "domain".
+                if !host_fqdns.contains(&d) {
+                    valid_domains.insert(d);
+                }
             }
         }
 
-        domains.retain(|d| valid_domains.contains(&d.to_lowercase()));
+        domains.retain(|d| {
+            let lower = d.to_lowercase();
+            valid_domains.contains(&lower) && !host_fqdns.contains(&lower)
+        });
     }
 }

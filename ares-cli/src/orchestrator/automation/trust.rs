@@ -45,6 +45,104 @@ fn trust_account_name(flat_name: &str) -> String {
     format!("{}$", flat_name.to_uppercase())
 }
 
+/// Returns true when source and target are in different forests
+/// (neither is a parent or child of the other, and they are not equal).
+///
+/// Inter-forest trusts are subject to SID filtering on the target DC, which
+/// strips ExtraSid claims with RID < 1000 (Enterprise Admins, Domain Admins,
+/// Administrator). The inter-realm TGT authenticates but the privileged claim
+/// is silently dropped — DCSync against the target DC then fails with
+/// `rpc_s_access_denied`. This helper distinguishes the doomed path from
+/// child→parent escalation (intra-forest), which is exploitable.
+fn is_inter_forest(source: &str, target: &str) -> bool {
+    let s = source.to_lowercase();
+    let t = target.to_lowercase();
+    if s.is_empty() || t.is_empty() || s == t {
+        return false;
+    }
+    if s.ends_with(&format!(".{t}")) || t.ends_with(&format!(".{s}")) {
+        return false;
+    }
+    true
+}
+
+/// Returns true if the trust source→target is inter-forest with SID filtering
+/// active — meaning `forge_inter_realm_and_dump` will be rejected at DCSync
+/// regardless of trust key validity. Caller should suppress the doomed
+/// dispatch and accelerate cross-forest fallback paths instead.
+///
+/// Decision tree:
+/// - Intra-forest (child↔parent or same domain): false (raise_child handles it)
+/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=true`: true
+/// - Explicit `TrustInfo` with `is_cross_forest()` and `sid_filtering=false`:
+///   false (someone disabled SID filtering — try the forge)
+/// - No `TrustInfo` but the names are inter-forest: false (try the forge —
+///   missing metadata means we can't be sure SID filtering is on, and the
+///   ~30s cost of an unnecessary attempt is cheaper than silently dropping
+///   a valid attack path on a misconfigured trust)
+fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str) -> bool {
+    if !is_inter_forest(source, target) {
+        return false;
+    }
+    let target_l = target.to_lowercase();
+    // Look up only the target's metadata. `trusted_domains` is keyed by the
+    // foreign-side domain name in each enumeration result, so the entry for
+    // `target_l` describes the source→target relationship. Falling back to
+    // the source key returns *some other* trust the source happens to have
+    // (e.g. north→sevenkingdoms parent_child stored under "sevenkingdoms.local"
+    // when we query sevenkingdoms→essos), which would wrongly classify the
+    // unknown cross-forest path as intra-forest and let the doomed forge fire.
+    if let Some(t) = state.trusted_domains.get(&target_l) {
+        if t.is_cross_forest() {
+            return t.sid_filtering;
+        }
+        // Trust enumeration disagrees with name-based heuristic — trust the
+        // explicit metadata (e.g. unusual same-forest cross-DNS-suffix setup).
+        return false;
+    }
+    // No metadata — try the forge. False positives (SID filtering actually on)
+    // cost ~30s for a doomed DCSync attempt; false negatives (refusing a valid
+    // attack on a misconfigured trust where SID filtering is off) cost the
+    // entire foreign domain. Prefer the cheaper failure mode.
+    false
+}
+
+/// Clear cross-forest fallback dedup keys for `target_domain` so the next
+/// tick of `auto_cross_forest_enum`, `auto_foreign_group_enum`, and
+/// `auto_acl_discovery` re-fires against the foreign forest with current
+/// credentials. Called when a doomed forest_trust_escalation is suppressed
+/// — the trust hash extraction usually populates new state (DC IPs, SIDs)
+/// that should kick the fallbacks back into action.
+async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &str) {
+    let target_l = target_domain.to_lowercase();
+    // (set_name, prefix) pairs — must stay in sync with the auto_*_enum
+    // dedup-key formats in their respective modules.
+    let prefixes = [
+        (DEDUP_CROSS_FOREST_ENUM, format!("xforest:{target_l}:")),
+        (
+            DEDUP_FOREIGN_GROUP_ENUM,
+            format!("foreign_group:{target_l}"),
+        ),
+        (DEDUP_ACL_DISCOVERY, format!("acl_disc:{target_l}:")),
+    ];
+    let cleared: Vec<(&str, Vec<String>)> = {
+        let mut s = dispatcher.state.write().await;
+        prefixes
+            .iter()
+            .map(|(set, prefix)| (*set, s.unmark_processed_by_prefix(set, prefix)))
+            .filter(|(_, v)| !v.is_empty())
+            .collect()
+    };
+    for (set, keys) in cleared {
+        for key in keys {
+            let _ = dispatcher
+                .state
+                .unpersist_dedup(&dispatcher.queue, set, &key)
+                .await;
+        }
+    }
+}
+
 /// Check if a credential domain matches a target domain (exact, child, or parent).
 fn is_domain_related(cred_domain: &str, target_domain: &str) -> bool {
     let cd = cred_domain.to_lowercase();
@@ -1216,6 +1314,39 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 continue;
             }
 
+            // Suppress the ExtraSid forge when the trust has SID filtering
+            // active. ticketer adds Enterprise Admins (RID 519) via
+            // `--extra-sid` to satisfy DCSync — but a SID-filtered forest
+            // trust strips RID<1000 SIDs from the cross-realm PAC, and the
+            // target KDC returns rpc_s_access_denied. Burn the dedup so this
+            // doomed dispatch can't loop, mark the vuln exploited as a
+            // strategic choice, and wake the cross-forest fallback paths
+            // (ACL/MSSQL/FSP) to take over.
+            {
+                let state = dispatcher.state.read().await;
+                if is_filtered_inter_forest_trust(&state, &item.source_domain, &item.target_domain)
+                {
+                    info!(
+                        source = %item.source_domain,
+                        target = %item.target_domain,
+                        trust_account = %item.hash.username,
+                        "Suppressing forge_inter_realm_and_dump — SID filtering on cross-forest trust would reject ExtraSid; waking fallbacks"
+                    );
+                    drop(state);
+                    dispatcher
+                        .state
+                        .write()
+                        .await
+                        .mark_processed(DEDUP_TRUST_FOLLOW, item.dedup_key.clone());
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &item.dedup_key)
+                        .await;
+                    wake_cross_forest_fallbacks(&dispatcher, &item.target_domain).await;
+                    continue;
+                }
+            }
+
             // Forge-and-present the inter-realm TGT as a deterministic worker
             // task — NOT an LLM task. Both `create_inter_realm_ticket` and
             // `secretsdump_kerberos` run sequentially on the same worker via
@@ -1692,5 +1823,115 @@ mod tests {
     fn trust_enum_dedup_key_empty_domain() {
         assert_eq!(trust_enum_dedup_key("", false), "trust_enum:");
         assert_eq!(trust_enum_dedup_key("", true), "trust_enum_hash:");
+    }
+
+    // is_filtered_inter_forest_trust
+
+    fn state_with_trust(domain: &str, trust: ares_core::models::TrustInfo) -> StateInner {
+        let mut s = StateInner::new("op-test".into());
+        s.trusted_domains.insert(domain.to_lowercase(), trust);
+        s
+    }
+
+    #[test]
+    fn filtered_inter_forest_intra_forest_returns_false() {
+        let s = StateInner::new("op-test".into());
+        // child↔parent — not inter-forest, never filtered.
+        assert!(!is_filtered_inter_forest_trust(
+            &s,
+            "child.contoso.local",
+            "contoso.local"
+        ));
+    }
+
+    #[test]
+    fn filtered_inter_forest_explicit_filtering_on() {
+        let trust = ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: true,
+        };
+        let s = state_with_trust("fabrikam.local", trust);
+        assert!(is_filtered_inter_forest_trust(
+            &s,
+            "contoso.local",
+            "fabrikam.local"
+        ));
+    }
+
+    #[test]
+    fn filtered_inter_forest_explicit_filtering_off() {
+        let trust = ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: false,
+        };
+        let s = state_with_trust("fabrikam.local", trust);
+        assert!(!is_filtered_inter_forest_trust(
+            &s,
+            "contoso.local",
+            "fabrikam.local"
+        ));
+    }
+
+    #[test]
+    fn filtered_inter_forest_no_metadata_tries_forge() {
+        let s = StateInner::new("op-test".into());
+        // No TrustInfo for the target. Without explicit filtering metadata we
+        // try the forge — the cost of an unnecessary attempt (~30s) is cheaper
+        // than silently dropping a valid attack on a misconfigured trust.
+        assert!(!is_filtered_inter_forest_trust(
+            &s,
+            "contoso.local",
+            "fabrikam.local"
+        ));
+    }
+
+    #[test]
+    fn filtered_inter_forest_ignores_unrelated_source_metadata() {
+        // Repro of op-20260429-111016 bug: north discovered its parent trust
+        // and stored TrustInfo{ domain="sevenkingdoms.local", parent_child,
+        // sid_filtering=false }. Querying the unrelated cross-forest path
+        // sevenkingdoms.local → essos.local must NOT be answered with that
+        // parent_child entry (which would wrongly classify the cross-forest
+        // path as intra-forest). With no metadata for the actual target we
+        // now try the forge rather than silently suppressing it.
+        let parent_trust = ares_core::models::TrustInfo {
+            domain: "contoso.local".into(),
+            flat_name: "CONTOSO".into(),
+            direction: "bidirectional".into(),
+            trust_type: "parent_child".into(),
+            sid_filtering: false,
+        };
+        let s = state_with_trust("contoso.local", parent_trust);
+        // Target fabrikam.local has no metadata — try the forge.
+        assert!(!is_filtered_inter_forest_trust(
+            &s,
+            "contoso.local",
+            "fabrikam.local"
+        ));
+    }
+
+    #[test]
+    fn filtered_inter_forest_target_metadata_authoritative() {
+        // When the target's TrustInfo says cross-forest with SID filtering,
+        // suppress the forge regardless of any source-side parent_child entry.
+        let target_trust = ares_core::models::TrustInfo {
+            domain: "fabrikam.local".into(),
+            flat_name: "FABRIKAM".into(),
+            direction: "bidirectional".into(),
+            trust_type: "forest".into(),
+            sid_filtering: true,
+        };
+        let s = state_with_trust("fabrikam.local", target_trust);
+        assert!(is_filtered_inter_forest_trust(
+            &s,
+            "contoso.local",
+            "fabrikam.local"
+        ));
     }
 }

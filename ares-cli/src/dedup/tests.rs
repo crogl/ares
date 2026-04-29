@@ -641,6 +641,26 @@ fn normalize_state_domains_domain_filtering_based_on_host_fqdns() {
 }
 
 #[test]
+fn normalize_state_domains_drops_host_fqdn_masquerading_as_domain() {
+    // A parser/credential publish path sometimes pushes a DC's FQDN
+    // (e.g. `WIN-30DZ5NGFA7M.c26h.local`) into the domain set. The dedup
+    // filter must drop entries that exactly match a known host hostname,
+    // even when a user or credential has the FQDN in its `domain` field.
+    let users = vec![make_user("win-30dz5ngfa7m.c26h.local", "admin")];
+    let mut creds = vec![];
+    let mut hashes = vec![];
+    let mut domains = vec![
+        "c26h.local".to_string(),
+        "win-30dz5ngfa7m.c26h.local".to_string(),
+    ];
+    let hosts = vec![make_host("192.168.58.10", "win-30dz5ngfa7m.c26h.local")];
+
+    normalize_state_domains(&users, &mut creds, &mut hashes, &mut domains, &hosts, None);
+
+    assert_eq!(domains, vec!["c26h.local".to_string()]);
+}
+
+#[test]
 fn normalize_state_domains_domain_kept_from_target_domain() {
     // target_domain should cause that domain to be retained even without hosts/users.
     let users: Vec<User> = vec![];
