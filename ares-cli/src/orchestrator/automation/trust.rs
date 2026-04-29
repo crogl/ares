@@ -348,19 +348,24 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         let dispatcher_bg = dispatcher.clone();
                         let domain_bg = domain.clone();
                         let key_bg = key.clone();
+                        let auth_method_bg = auth_method.to_string();
                         tokio::spawn(async move {
                             let result = dispatcher_bg
                                 .llm_runner
                                 .tool_dispatcher()
                                 .dispatch_tool("recon", &task_id, &call)
                                 .await;
-                            // On any failure (tool error or dispatch error),
-                            // clear the dedup so the next 30s tick can retry
-                            // — typically with a freshly discovered credential
-                            // for the target domain. The original cred chosen
-                            // here may have been a sibling-domain match (via
-                            // is_domain_related) that fails LDAP bind 52e
-                            // against a parent/foreign DC.
+                            // Failure handling depends on which auth attempt
+                            // just failed:
+                            //
+                            // - password attempt: leave the dedup mark in place
+                            //   so the next 30s tick sees `pw_done=true` and
+                            //   escalates to the hash-key path (gated on the
+                            //   domain being in `dominated_domains`). Clearing
+                            //   the mark would loop forever on the same wrong
+                            //   sibling-domain credential.
+                            // - hash attempt: clear so a future tick can retry
+                            //   if a fresh hash becomes available.
                             let clear_dedup = || async {
                                 dispatcher_bg
                                     .state
@@ -376,15 +381,23 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                     )
                                     .await;
                             };
+                            let on_failure = || async {
+                                if auth_method_bg == "password" {
+                                    // Mark stays — escalation to hash retry on next tick.
+                                } else {
+                                    clear_dedup().await;
+                                }
+                            };
                             match result {
                                 Ok(exec_result) => {
                                     if let Some(err) = exec_result.error.as_ref() {
                                         warn!(
                                             err = %err,
                                             domain = %domain_bg,
-                                            "enumerate_domain_trusts returned error — clearing dedup for retry"
+                                            auth = %auth_method_bg,
+                                            "enumerate_domain_trusts returned error"
                                         );
-                                        clear_dedup().await;
+                                        on_failure().await;
                                         return;
                                     }
                                     let trust_count = exec_result
@@ -404,9 +417,10 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                     warn!(
                                         err = %e,
                                         domain = %domain_bg,
-                                        "enumerate_domain_trusts dispatch errored — clearing dedup for retry"
+                                        auth = %auth_method_bg,
+                                        "enumerate_domain_trusts dispatch errored"
                                     );
-                                    clear_dedup().await;
+                                    on_failure().await;
                                 }
                             }
                         });
