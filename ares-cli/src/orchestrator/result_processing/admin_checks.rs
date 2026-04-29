@@ -382,7 +382,21 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
         return;
     }
     let combined = text_parts.join("\n");
-    let sid = match ares_core::parsing::extract_domain_sid(&combined) {
+
+    // Only cache when the output is genuine impacket-lookupsid output — i.e.
+    // it has the canonical `[*] Domain SID is: …` header AND we can trust
+    // that header's SID. Arbitrary recon output (LDAP group enumeration,
+    // BloodHound dumps, etc.) routinely contains foreign-security-principal
+    // SIDs that *look* like domain SIDs but are actually `<sid>-<rid>`
+    // entries from a different forest. Caching a regex-truncated FSP SID
+    // against the task's payload domain misforges every downstream golden
+    // / inter-realm ticket — caused op-20260429-164553 to forge a TGT for
+    // sevenkingdoms.local with a bogus ExtraSid that the parent KDC
+    // rejected with rpc_s_access_denied.
+    let sid = match ares_core::parsing::LOOKUPSID_HEADER_RE
+        .captures(&combined)
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    {
         Some(s) => s,
         None => return,
     };

