@@ -14,6 +14,22 @@ pub static LOOKUPSID_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
         .expect("lookupsid header regex")
 });
 
+/// Match `rpcclient -c lsaquery` output. Produces:
+///
+/// ```text
+/// Domain Name: ESSOS
+/// Domain Sid: S-1-5-21-3030751166-2423545109-3706592460
+/// ```
+///
+/// Like impacket-lookupsid, this is an authoritative LSARPC response — the
+/// flat name and SID together belong to the queried server's primary domain.
+/// Often works with anonymous/null sessions where impacket-lookupsid fails,
+/// so it's the primary unauth path for cross-forest target SID discovery.
+pub static LSAQUERY_DOMAIN_SID_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?m)^Domain Name:\s+(\S+)\s*\r?\nDomain Sid:\s+(S-1-5-21-\d+-\d+-\d+)")
+        .expect("lsaquery domain sid regex")
+});
+
 /// Regex to extract the RID-500 account name from lookupsid output.
 /// Matches lines like: `500: DOMAIN\AccountName (SidTypeUser)`
 static RID500_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -76,6 +92,17 @@ pub fn extract_domain_sid_and_flat_name(output: &str) -> Option<(String, String)
     let flat = RID_FLAT_NAME_RE
         .captures(output)
         .map(|c| c[1].to_uppercase())?;
+    Some((flat, sid))
+}
+
+/// Extract `(flat_name, sid)` from `rpcclient lsaquery` output. Returns the
+/// queried server's primary-domain flat name (uppercased) paired with the
+/// authoritative LSARPC-reported domain SID. Returns `None` if the output is
+/// not from `lsaquery` or only one of the two fields is present.
+pub fn extract_lsaquery_domain_sid(output: &str) -> Option<(String, String)> {
+    let caps = LSAQUERY_DOMAIN_SID_RE.captures(output)?;
+    let flat = caps.get(1)?.as_str().to_uppercase();
+    let sid = caps.get(2)?.as_str().to_string();
     Some((flat, sid))
 }
 
@@ -226,5 +253,67 @@ mod tests {
             extract_domain_sid(output),
             Some("S-1-5-21-100-200-300".to_string())
         );
+    }
+
+    #[test]
+    fn extract_lsaquery_basic() {
+        let output = "Domain Name: ESSOS\n\
+                       Domain Sid: S-1-5-21-3030751166-2423545109-3706592460\n";
+        assert_eq!(
+            extract_lsaquery_domain_sid(output),
+            Some((
+                "ESSOS".to_string(),
+                "S-1-5-21-3030751166-2423545109-3706592460".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn extract_lsaquery_with_preamble() {
+        let output = "[*] Connecting to 10.1.2.58\n\
+                       Domain Name: CONTOSO\n\
+                       Domain Sid: S-1-5-21-100-200-300\n\
+                       [*] Done.\n";
+        assert_eq!(
+            extract_lsaquery_domain_sid(output),
+            Some(("CONTOSO".to_string(), "S-1-5-21-100-200-300".to_string()))
+        );
+    }
+
+    #[test]
+    fn extract_lsaquery_uppercases_flat_name() {
+        let output = "Domain Name: contoso\nDomain Sid: S-1-5-21-1-2-3\n";
+        assert_eq!(
+            extract_lsaquery_domain_sid(output).map(|(f, _)| f),
+            Some("CONTOSO".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_lsaquery_handles_crlf() {
+        let output = "Domain Name: ESSOS\r\nDomain Sid: S-1-5-21-1-2-3\r\n";
+        assert_eq!(
+            extract_lsaquery_domain_sid(output).map(|(_, s)| s),
+            Some("S-1-5-21-1-2-3".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_lsaquery_requires_both_lines() {
+        // Missing Domain Sid line
+        let no_sid = "Domain Name: ESSOS\n";
+        assert_eq!(extract_lsaquery_domain_sid(no_sid), None);
+        // Missing Domain Name line
+        let no_name = "Domain Sid: S-1-5-21-1-2-3\n";
+        assert_eq!(extract_lsaquery_domain_sid(no_name), None);
+    }
+
+    #[test]
+    fn extract_lsaquery_requires_adjacency() {
+        // Lines not adjacent — pattern intentionally requires them on
+        // consecutive lines so we don't pair the wrong (flat, sid) when
+        // multiple servers/responses are concatenated.
+        let output = "Domain Name: ESSOS\nUnrelated line here\nDomain Sid: S-1-5-21-1-2-3\n";
+        assert_eq!(extract_lsaquery_domain_sid(output), None);
     }
 }

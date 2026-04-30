@@ -383,35 +383,46 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
     }
     let combined = text_parts.join("\n");
 
-    // Only cache when the output is genuine impacket-lookupsid output — i.e.
-    // it has the canonical `[*] Domain SID is: …` header AND we can trust
-    // that header's SID. Arbitrary recon output (LDAP group enumeration,
-    // BloodHound dumps, etc.) routinely contains foreign-security-principal
-    // SIDs that *look* like domain SIDs but are actually `<sid>-<rid>`
-    // entries from a different forest. Caching a regex-truncated FSP SID
-    // against the task's payload domain misforges every downstream golden
-    // / inter-realm ticket — caused op-20260429-164553 to forge a TGT for
-    // sevenkingdoms.local with a bogus ExtraSid that the parent KDC
-    // rejected with rpc_s_access_denied.
-    let sid = match ares_core::parsing::LOOKUPSID_HEADER_RE
+    // Only cache when the output is genuine LSARPC SID-discovery output — i.e.
+    // it has either the impacket-lookupsid `[*] Domain SID is: …` header or
+    // the rpcclient `lsaquery` `Domain Name / Domain Sid` pair. Arbitrary recon
+    // output (LDAP group enumeration, BloodHound dumps, etc.) routinely contains
+    // foreign-security-principal SIDs that *look* like domain SIDs but are
+    // actually `<sid>-<rid>` entries from a different forest. Caching a
+    // regex-truncated FSP SID against the task's payload domain misforges
+    // every downstream golden / inter-realm ticket — caused op-20260429-164553
+    // to forge a TGT for sevenkingdoms.local with a bogus ExtraSid that the
+    // parent KDC rejected with rpc_s_access_denied.
+    //
+    // lsaquery is the primary unauth path for cross-forest target SID discovery
+    // — it routinely succeeds against null sessions where impacket-lookupsid
+    // gets STATUS_ACCESS_DENIED. op-20260429-181500 discovered essos's SID via
+    // lsaquery but failed to cache it (only lookupsid was wired up), so the
+    // subsequent forge_inter_realm_and_dump fired with has_target_sid=false
+    // and produced no krbtgt extraction.
+    let lookupsid_sid = ares_core::parsing::LOOKUPSID_HEADER_RE
         .captures(&combined)
-        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
-    {
-        Some(s) => s,
-        None => return,
+        .and_then(|c| c.get(1).map(|m| m.as_str().to_string()));
+    let lsaquery_pair = ares_core::parsing::extract_lsaquery_domain_sid(&combined);
+    let (sid, lsaquery_flat) = match (lookupsid_sid, lsaquery_pair) {
+        (Some(s), _) => (s, None),
+        (None, Some((flat, s))) => (s, Some(flat)),
+        (None, None) => return,
     };
 
     // Resolve the FQDN this SID belongs to. Anchor preference order:
-    // 1. Flat name parsed from the output (e.g. `500: ESSOS\Administrator …`),
-    //    matched against known domain FQDNs — authoritative when present.
+    // 1. Flat name parsed from the output — authoritative when present. For
+    //    impacket-lookupsid we get it from the RID lines (e.g. `500: ESSOS\…`);
+    //    for rpcclient lsaquery we get it from `Domain Name: ESSOS`.
     // 2. Payload's `domain` field — used only when output has no flat name AND
     //    the field is a valid FQDN. The payload's domain is the *task* target,
     //    not necessarily the domain that produced the SID; trusting it blindly
     //    misattributed essos.local's SID to north.sevenkingdoms.local in
     //    op-20260429-112418.
     // 3. State's primary domain — last resort, only when nothing else applies.
-    let parsed_flat =
-        ares_core::parsing::extract_domain_sid_and_flat_name(&combined).map(|(flat, _)| flat);
+    let parsed_flat = lsaquery_flat.or_else(|| {
+        ares_core::parsing::extract_domain_sid_and_flat_name(&combined).map(|(flat, _)| flat)
+    });
     let domain = {
         let state = dispatcher.state.read().await;
         if let Some(flat) = parsed_flat.as_deref() {
