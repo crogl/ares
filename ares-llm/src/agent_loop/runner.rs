@@ -758,6 +758,7 @@ pub async fn run_agent_loop(
 
 /// Centralized exit path: writes the terminal `outcome` record to the
 /// session log and assembles the `AgentLoopOutcome`.
+#[allow(clippy::too_many_arguments)]
 fn finish(
     session_log: &SessionLog,
     steps: u32,

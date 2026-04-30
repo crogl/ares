@@ -4,6 +4,7 @@
 //! produced by running the corresponding CLI tool as a subprocess.
 
 use std::io::Write;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -141,6 +142,25 @@ pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
     cmd.execute().await
 }
 
+/// Standalone-relay BUSY response. Standalone `ntlmrelayx_to_*` tools share
+/// the host-wide port 445 (and SOCKS 1080) with `relay_and_coerce`; a second
+/// invocation while one is already in flight crashes with
+/// `OSError [Errno 98] Address already in use`. We acquire the same loopback
+/// sentinel the composite path uses and refuse to race when contended.
+fn relay_busy_output(tool: &str) -> ToolOutput {
+    ToolOutput {
+        stdout: format!(
+            "RELAY_BIND_BUSY\n{tool}: another relay/coerce invocation is active \
+             on this host (loopback port {RELAY_LOCK_PORT} held). Refusing to \
+             race for ntlmrelayx port 445; retry after the in-flight relay \
+             completes."
+        ),
+        stderr: String::new(),
+        exit_code: Some(0),
+        success: false,
+    }
+}
+
 /// Relay captured NTLM authentication to LDAPS for delegation abuse.
 ///
 /// Required args: `dc_ip`
@@ -148,6 +168,11 @@ pub async fn dfscoerce(args: &Value) -> Result<ToolOutput> {
 pub async fn ntlmrelayx_to_ldaps(args: &Value) -> Result<ToolOutput> {
     let dc_ip = required_str(args, "dc_ip")?;
     let delegate_access = optional_bool(args, "delegate_access").unwrap_or(false);
+
+    let _lock = match try_acquire_relay_lock() {
+        Some(l) => l,
+        None => return Ok(relay_busy_output("ntlmrelayx_to_ldaps")),
+    };
 
     let target_url = format!("ldaps://{dc_ip}");
 
@@ -166,6 +191,11 @@ pub async fn ntlmrelayx_to_ldaps(args: &Value) -> Result<ToolOutput> {
 pub async fn ntlmrelayx_to_adcs(args: &Value) -> Result<ToolOutput> {
     let ca_host = required_str(args, "ca_host")?;
     let template = optional_str(args, "template");
+
+    let _lock = match try_acquire_relay_lock() {
+        Some(l) => l,
+        None => return Ok(relay_busy_output("ntlmrelayx_to_adcs")),
+    };
 
     let target_url = format!("http://{ca_host}/certsrv/certfnsh.asp");
 
@@ -186,6 +216,11 @@ pub async fn ntlmrelayx_to_smb(args: &Value) -> Result<ToolOutput> {
     let target_ip = required_str(args, "target_ip")?;
     let socks = optional_bool(args, "socks").unwrap_or(false);
     let interactive = optional_bool(args, "interactive").unwrap_or(false);
+
+    let _lock = match try_acquire_relay_lock() {
+        Some(l) => l,
+        None => return Ok(relay_busy_output("ntlmrelayx_to_smb")),
+    };
 
     CommandBuilder::new("impacket-ntlmrelayx")
         .flag("-t", target_ip)
@@ -340,6 +375,11 @@ struct RunOptions {
     post_capture_settle: Duration,
     relay_kill_timeout: Duration,
     keep_workdir_on_capture: bool,
+    /// Whether to acquire the host-wide TCP-port mutex before spawning the
+    /// relay. Production sets this to `true` to serialize concurrent
+    /// invocations across worker processes; unit tests set `false` so they
+    /// can run in parallel without fighting over the loopback sentinel port.
+    acquire_host_lock: bool,
 }
 
 impl RunOptions {
@@ -353,6 +393,7 @@ impl RunOptions {
             post_capture_settle: Duration::from_secs(5),
             relay_kill_timeout: Duration::from_secs(5),
             keep_workdir_on_capture: true,
+            acquire_host_lock: true,
         }
     }
 }
@@ -541,6 +582,45 @@ pub async fn relay_and_coerce(args: &Value) -> Result<ToolOutput> {
     run_relay_and_coerce(cfg, &RealCoerceProcs, RunOptions::production()).await
 }
 
+/// Host-wide TCP-port mutex. ntlmrelayx binds 0.0.0.0:445 (and 80) globally;
+/// two relay invocations racing on the same host produce
+/// `OSError [Errno 98] Address already in use` and the loser silently fails
+/// to relay anything. The orchestrator dispatches `relay_and_coerce` from
+/// multiple workers (separate processes), so an intra-process Mutex is not
+/// enough — we need cross-process serialization.
+///
+/// Trick: bind a TCP listener to a fixed loopback port (41445). The kernel
+/// guarantees only one process can hold the port at a time, and releases it
+/// automatically when the listener is dropped or the process dies. No file
+/// cleanup required, no stale-lock races. Hold the returned listener for the
+/// lifetime of the relay; drop it (implicitly) to release.
+const RELAY_LOCK_PORT: u16 = 41445;
+
+#[cfg(test)]
+thread_local! {
+    /// When set on a test thread, [`try_acquire_relay_lock`] uses the real
+    /// host-wide port instead of bypassing it. The contention test sets this
+    /// so its assertion that a held port returns `None` still works; all other
+    /// tests leave it false so they don't fight over the single port.
+    static USE_REAL_RELAY_LOCK_IN_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+fn try_acquire_relay_lock() -> Option<TcpListener> {
+    #[cfg(test)]
+    {
+        // Default test behavior: bind to an ephemeral loopback port so tests
+        // never contend on the single host-wide sentinel. Tests that need to
+        // exercise contention semantics opt in via USE_REAL_RELAY_LOCK_IN_TEST.
+        if !USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.get()) {
+            return TcpListener::bind("127.0.0.1:0").ok();
+        }
+    }
+    use std::net::SocketAddr;
+    let addr: SocketAddr = ([127, 0, 0, 1], RELAY_LOCK_PORT).into();
+    TcpListener::bind(addr).ok()
+}
+
 async fn run_relay_and_coerce<P: CoerceProcs>(
     cfg: RelayCoerceConfig,
     procs: &P,
@@ -562,6 +642,37 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
             procs.list_local_ips().join(", "),
         );
     }
+
+    // Acquire the host-wide relay lock BEFORE any teardown of stale listeners.
+    // If another relay_and_coerce invocation is in flight on this host, refuse
+    // immediately with RELAY_BIND_BUSY rather than racing it for port 445 and
+    // both losing — the dispatcher's dedup will retry on the next tick.
+    //
+    // Must come before `cleanup_stale_listeners`; otherwise we'd pkill the
+    // in-flight peer's ntlmrelayx and corrupt its capture mid-flight.
+    //
+    // The listener is held in `_relay_lock` so the kernel keeps the port bound
+    // for the whole function body. Drop on return automatically releases it.
+    let _relay_lock = if opts.acquire_host_lock {
+        match try_acquire_relay_lock() {
+            Some(l) => Some(l),
+            None => {
+                return Ok(ToolOutput {
+                    stdout: format!(
+                        "RELAY_BIND_BUSY\nAnother relay_and_coerce is active on this \
+                         host (loopback port {RELAY_LOCK_PORT} held). Refusing to race \
+                         for ntlmrelayx port 445; retry after the in-flight relay \
+                         completes."
+                    ),
+                    stderr: String::new(),
+                    exit_code: Some(0),
+                    success: false,
+                });
+            }
+        }
+    } else {
+        None
+    };
 
     let tempdir = tempfile::Builder::new()
         .prefix("ares_relay_")
@@ -1407,6 +1518,9 @@ mod tests {
             post_capture_settle: Duration::from_millis(0),
             relay_kill_timeout: Duration::from_millis(15),
             keep_workdir_on_capture: false,
+            // Tests run in parallel and would otherwise fight over the
+            // single host-wide loopback sentinel port.
+            acquire_host_lock: false,
         }
     }
 
@@ -1449,6 +1563,58 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("not a local interface IP"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn run_host_lock_contention_returns_busy_marker() {
+        // Hold the sentinel port ourselves to simulate another in-flight
+        // relay_and_coerce already running on this host.
+        let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
+            .expect("bind sentinel port for test");
+        super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
+        struct ResetFlag;
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(false));
+            }
+        }
+        let _reset = ResetFlag;
+        let mut opts = fast_opts();
+        opts.acquire_host_lock = true;
+        let fake = FakeCoerceProcs::new();
+        let out = super::run_relay_and_coerce(cfg_unauth(), &fake, opts)
+            .await
+            .unwrap();
+        assert!(!out.success);
+        assert!(
+            out.stdout.contains("RELAY_BIND_BUSY"),
+            "expected RELAY_BIND_BUSY, got: {}",
+            out.stdout
+        );
+        // No phases or relay spawn should fire when the lock is contended.
+        assert!(fake.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn ntlmrelayx_to_smb_returns_busy_when_lock_held() {
+        let _holder = std::net::TcpListener::bind(("127.0.0.1", super::RELAY_LOCK_PORT))
+            .expect("bind sentinel port for test");
+        super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(true));
+        struct ResetFlag;
+        impl Drop for ResetFlag {
+            fn drop(&mut self) {
+                super::USE_REAL_RELAY_LOCK_IN_TEST.with(|c| c.set(false));
+            }
+        }
+        let _reset = ResetFlag;
+        let args = json!({"target_ip": "192.168.58.1"});
+        let out = super::ntlmrelayx_to_smb(&args).await.unwrap();
+        assert!(!out.success, "expected BUSY non-success, got success");
+        assert!(
+            out.stdout.contains("RELAY_BIND_BUSY"),
+            "expected RELAY_BIND_BUSY in stdout, got: {}",
+            out.stdout
+        );
     }
 
     #[tokio::test]
