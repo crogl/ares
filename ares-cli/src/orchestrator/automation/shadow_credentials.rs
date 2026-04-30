@@ -82,29 +82,14 @@ pub async fn auto_shadow_credentials(
                         .unwrap_or("")
                         .to_string();
 
-                    // Find credential for the source user
-                    let credential = state
-                        .credentials
-                        .iter()
-                        .find(|c| {
-                            c.username.to_lowercase() == source_user.to_lowercase()
-                                && (domain.is_empty()
-                                    || c.domain.to_lowercase() == domain.to_lowercase())
-                        })
-                        .cloned();
-
-                    // Also check for NTLM hash as fallback
+                    // Find credential for the source user. The source user's
+                    // own domain may differ from the vuln's target `domain`
+                    // (cross-forest ACL edges like petyer.baelish@sk →
+                    // jorah.mormont@essos), so we cannot domain-restrict the
+                    // lookup against the target.
+                    let credential = state.find_source_credential(&source_user, &domain);
                     let hash = if credential.is_none() {
-                        state
-                            .hashes
-                            .iter()
-                            .find(|h| {
-                                h.username.to_lowercase() == source_user.to_lowercase()
-                                    && h.hash_type.to_uppercase() == "NTLM"
-                                    && (domain.is_empty()
-                                        || h.domain.to_lowercase() == domain.to_lowercase())
-                            })
-                            .cloned()
+                        state.find_source_hash(&source_user, &domain)
                     } else {
                         None
                     };

@@ -117,7 +117,7 @@ async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &st
     let target_l = target_domain.to_lowercase();
     // (set_name, prefix) pairs — must stay in sync with the auto_*_enum
     // dedup-key formats in their respective modules.
-    let prefixes = [
+    let mut prefixes: Vec<(&str, String)> = vec![
         (DEDUP_CROSS_FOREST_ENUM, format!("xforest:{target_l}:")),
         (
             DEDUP_FOREIGN_GROUP_ENUM,
@@ -125,6 +125,30 @@ async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &st
         ),
         (DEDUP_ACL_DISCOVERY, format!("acl_disc:{target_l}:")),
     ];
+
+    // ADCS dedup keys are `{host}:cred:{user@dom}` / `{host}:hash:{user@dom}`,
+    // keyed on the CA host (IP or hostname) — not the target domain. So for
+    // each known host that belongs to `target_domain`, add a `{host}:` prefix.
+    // This lets a freshly-acquired cross-forest credential re-attempt
+    // certipy_find against an essos CA that was previously locked by a wrong
+    // initial cred.
+    {
+        let s = dispatcher.state.read().await;
+        let suffix = format!(".{target_l}");
+        for h in s.hosts.iter() {
+            let hostname = h.hostname.to_lowercase();
+            let belongs =
+                !hostname.is_empty() && (hostname == target_l || hostname.ends_with(&suffix));
+            if !belongs {
+                continue;
+            }
+            if !h.ip.is_empty() {
+                prefixes.push((DEDUP_ADCS_SERVERS, format!("{}:", h.ip)));
+            }
+            prefixes.push((DEDUP_ADCS_SERVERS, format!("{hostname}:")));
+        }
+    }
+
     let cleared: Vec<(&str, Vec<String>)> = {
         let mut s = dispatcher.state.write().await;
         prefixes

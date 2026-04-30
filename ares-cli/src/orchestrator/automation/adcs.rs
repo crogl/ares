@@ -20,7 +20,10 @@ fn extract_domain_from_fqdn(fqdn: &str) -> Option<String> {
 /// Work item for ADCS enumeration.
 struct AdcsWork {
     host_ip: String,
-    /// Auth-typed dedup key (e.g., "192.168.58.10:cred" or "192.168.58.10:hash")
+    /// Auth-and-identity dedup key
+    /// (e.g. `"192.168.58.10:cred:jdoe@contoso.local"` or `"…:hash:admin@…"`).
+    /// Including the credential identity prevents one wrong-domain attempt
+    /// from permanently locking a CA host against later, possibly-correct creds.
     dedup_key: String,
     dc_ip: Option<String>,
     domain: String,
@@ -28,6 +31,28 @@ struct AdcsWork {
     /// NTLM hash for pass-the-hash authentication (when no cleartext cred available).
     ntlm_hash: Option<String>,
     ntlm_hash_username: Option<String>,
+}
+
+/// Dedup key for a cred-based certipy_find attempt.
+/// Format: `{host}:cred:{username}@{domain}` (lowercased identity).
+pub(crate) fn dedup_key_cred(host: &str, cred: &ares_core::models::Credential) -> String {
+    format!(
+        "{}:cred:{}@{}",
+        host,
+        cred.username.to_lowercase(),
+        cred.domain.to_lowercase()
+    )
+}
+
+/// Dedup key for a hash-based certipy_find attempt.
+/// Format: `{host}:hash:{username}@{domain}` (lowercased identity).
+pub(crate) fn dedup_key_hash(host: &str, hash: &ares_core::models::Hash) -> String {
+    format!(
+        "{}:hash:{}@{}",
+        host,
+        hash.username.to_lowercase(),
+        hash.domain.to_lowercase()
+    )
 }
 
 /// Collect ADCS enumeration work items from current state.
@@ -45,10 +70,6 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
         .filter(|s| s.name.to_lowercase() == "certenroll")
         .filter_map(|s| {
             let host_lower = s.host.to_lowercase();
-            // Use separate dedup keys for cred vs hash attempts so a failed
-            // password-based attempt doesn't permanently block the hash-based path.
-            let dedup_key_cred = format!("{}:cred", s.host);
-            let dedup_key_hash = format!("{}:hash", s.host);
 
             let domain = state
                 .hosts
@@ -91,73 +112,84 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // cred. certipy_find is read-only LDAP enumeration that works cross-domain
             // via forest trusts, so restricting to same-domain blocks discovery when
             // early creds come from a different domain than the CA host.
-            let cred = if !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_cred) {
-                let domain_lower = domain.to_lowercase();
-                // First try same-domain
-                state
+            //
+            // The dedup key includes the candidate credential's identity, so a
+            // failed first attempt with one cred does not block a later, possibly
+            // correct cred against the same CA host.
+            let domain_lower = domain.to_lowercase();
+            let cred = {
+                let mut candidates: Vec<&ares_core::models::Credential> = state
                     .credentials
                     .iter()
-                    .find(|c| {
+                    .filter(|c| {
                         !c.password.is_empty()
                             && c.domain.to_lowercase() == domain_lower
                             && !state.is_delegation_account(&c.username)
                             && !state.is_credential_quarantined(&c.username, &c.domain)
                     })
-                    // Fall back to any non-quarantined cred (cross-domain via trust)
-                    .or_else(|| {
-                        state.credentials.iter().find(|c| {
-                            !c.password.is_empty()
-                                && !state.is_delegation_account(&c.username)
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
-                        })
-                    })
+                    .collect();
+                candidates.extend(state.credentials.iter().filter(|c| {
+                    !c.password.is_empty()
+                        && c.domain.to_lowercase() != domain_lower
+                        && !state.is_delegation_account(&c.username)
+                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                }));
+                candidates
+                    .into_iter()
+                    .find(|c| !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_cred(&s.host, c)))
+                    .cloned()
+            };
+
+            // Look for NTLM hash (PTH) only if cred path is exhausted (no
+            // unprocessed cred candidate exists). Same identity-aware dedup.
+            let hash_pick = if cred.is_none() {
+                let pred_admin_same = |h: &&ares_core::models::Hash| {
+                    h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                        && h.username.to_lowercase() == "administrator"
+                };
+                let pred_any_same = |h: &&ares_core::models::Hash| {
+                    h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
+                        && !state.is_delegation_account(&h.username)
+                };
+                let pred_admin_xdom = |h: &&ares_core::models::Hash| {
+                    h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && h.username.to_lowercase() == "administrator"
+                };
+                let pred_any_xdom = |h: &&ares_core::models::Hash| {
+                    h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && !state.is_delegation_account(&h.username)
+                };
+
+                let mut candidates: Vec<&ares_core::models::Hash> = Vec::new();
+                candidates.extend(state.hashes.iter().filter(pred_admin_same));
+                candidates.extend(state.hashes.iter().filter(pred_any_same).filter(|h| {
+                    h.username.to_lowercase() != "administrator"
+                        || (h.domain.to_lowercase() != domain_lower && !h.domain.is_empty())
+                }));
+                candidates.extend(
+                    state.hashes.iter().filter(pred_admin_xdom).filter(|h| {
+                        h.domain.to_lowercase() != domain_lower && !h.domain.is_empty()
+                    }),
+                );
+                candidates.extend(
+                    state
+                        .hashes
+                        .iter()
+                        .filter(pred_any_xdom)
+                        .filter(|h| h.username.to_lowercase() != "administrator"),
+                );
+                candidates
+                    .into_iter()
+                    .find(|h| !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash(&s.host, h)))
                     .cloned()
             } else {
                 None
             };
-
-            // Look for NTLM hash (PTH) — fires independently of cred attempt
-            let (ntlm_hash, ntlm_hash_username) = if cred.is_none()
-                && !state.is_processed(DEDUP_ADCS_SERVERS, &dedup_key_hash)
-            {
-                // Prefer Administrator hash for same domain, then any same-domain hash,
-                // then any Administrator hash (cross-domain), then any hash at all.
-                // certipy_find is read-only LDAP enum — cross-domain hashes work via trust.
-                let domain_lower = domain.to_lowercase();
-                state
-                    .hashes
-                    .iter()
-                    .find(|h| {
-                        h.hash_type.to_lowercase() == "ntlm"
-                            && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                            && h.username.to_lowercase() == "administrator"
-                    })
-                    .or_else(|| {
-                        // Fall back to any NTLM hash for this domain
-                        state.hashes.iter().find(|h| {
-                            h.hash_type.to_lowercase() == "ntlm"
-                                && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
-                                && !state.is_delegation_account(&h.username)
-                        })
-                    })
-                    .or_else(|| {
-                        // Cross-domain: any Administrator hash
-                        state.hashes.iter().find(|h| {
-                            h.hash_type.to_lowercase() == "ntlm"
-                                && h.username.to_lowercase() == "administrator"
-                        })
-                    })
-                    .or_else(|| {
-                        // Cross-domain: any NTLM hash
-                        state.hashes.iter().find(|h| {
-                            h.hash_type.to_lowercase() == "ntlm"
-                                && !state.is_delegation_account(&h.username)
-                        })
-                    })
-                    .map(|h| (Some(h.hash_value.clone()), Some(h.username.clone())))
-                    .unwrap_or((None, None))
-            } else {
-                (None, None)
+            let (ntlm_hash, ntlm_hash_username) = match &hash_pick {
+                Some(h) => (Some(h.hash_value.clone()), Some(h.username.clone())),
+                None => (None, None),
             };
 
             // Need at least a credential or an NTLM hash
@@ -165,10 +197,10 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                 return None;
             }
 
-            let dedup_key = if ntlm_hash.is_some() {
-                dedup_key_hash
-            } else {
-                dedup_key_cred
+            let dedup_key = match (&cred, &hash_pick) {
+                (Some(c), _) => dedup_key_cred(&s.host, c),
+                (None, Some(h)) => dedup_key_hash(&s.host, h),
+                (None, None) => return None,
             };
 
             Some(AdcsWork {
@@ -368,11 +400,10 @@ mod tests {
             .hosts
             .push(make_host("192.168.58.50", "ca01.contoso.local", false));
         state.domains.push("contoso.local".into());
-        state
-            .credentials
-            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.mark_processed(DEDUP_ADCS_SERVERS, "192.168.58.50:cred".into());
-        state.mark_processed(DEDUP_ADCS_SERVERS, "192.168.58.50:hash".into());
+        let cred = make_credential("admin", "P@ssw0rd!", "contoso.local"); // pragma: allowlist secret
+        state.credentials.push(cred.clone());
+        // Mark the identity-aware dedup key for the only candidate cred.
+        state.mark_processed(DEDUP_ADCS_SERVERS, dedup_key_cred("192.168.58.50", &cred));
         let work = collect_adcs_work(&state);
         assert!(work.is_empty());
     }

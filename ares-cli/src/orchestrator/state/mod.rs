@@ -75,6 +75,7 @@ pub const DEDUP_SMBCLIENT_ENUM: &str = "smbclient_enum";
 pub const DEDUP_ACL_DISCOVERY: &str = "acl_discovery";
 pub const DEDUP_CROSS_FOREST_ENUM: &str = "cross_forest_enum";
 pub const DEDUP_CROSS_REALM_LATERAL: &str = "cross_realm_lateral";
+pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -141,6 +142,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_ACL_DISCOVERY,
     DEDUP_CROSS_FOREST_ENUM,
     DEDUP_CROSS_REALM_LATERAL,
+    DEDUP_GOLDEN_CERT,
 ];
 
 #[cfg(test)]

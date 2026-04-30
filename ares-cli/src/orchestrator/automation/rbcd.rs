@@ -99,28 +99,14 @@ pub async fn auto_rbcd_exploitation(
                         .unwrap_or("")
                         .to_string();
 
-                    // Find credential for the source user
-                    let credential = state
-                        .credentials
-                        .iter()
-                        .find(|c| {
-                            c.username.to_lowercase() == source_user.to_lowercase()
-                                && (domain.is_empty()
-                                    || c.domain.to_lowercase() == domain.to_lowercase())
-                        })
-                        .cloned();
-
+                    // Find credential for the source user. Cross-forest ACL
+                    // edges (e.g. tyron.lannister@sk → braavos$@essos) put the
+                    // source user in a different domain than the vuln's `domain`
+                    // field (which is the target's domain), so we cannot
+                    // domain-restrict against the target.
+                    let credential = state.find_source_credential(&source_user, &domain);
                     let hash = if credential.is_none() {
-                        state
-                            .hashes
-                            .iter()
-                            .find(|h| {
-                                h.username.to_lowercase() == source_user.to_lowercase()
-                                    && h.hash_type.to_uppercase() == "NTLM"
-                                    && (domain.is_empty()
-                                        || h.domain.to_lowercase() == domain.to_lowercase())
-                            })
-                            .cloned()
+                        state.find_source_hash(&source_user, &domain)
                     } else {
                         None
                     };

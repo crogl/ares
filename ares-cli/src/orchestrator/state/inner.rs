@@ -289,6 +289,131 @@ impl StateInner {
         None
     }
 
+    /// Find a credential for the SOURCE user (the principal performing the
+    /// action), regardless of which TARGET domain the action is aimed at.
+    ///
+    /// Cross-forest ACL/MSSQL/ADCS exploitation has the source user living in
+    /// their own domain (e.g. `petyer.baelish@sevenkingdoms.local`) while a
+    /// vuln's `domain` field points at the target (e.g. `essos.local`).
+    /// Same-domain matching against the target therefore drops legitimate
+    /// cross-forest work.
+    ///
+    /// Selection priority:
+    ///   1. Cred whose domain matches the explicit `@domain` suffix of
+    ///      `source_user`, if present.
+    ///   2. Cred whose domain == `target_domain` (same-domain case).
+    ///   3. Cred from a domain in a trust relationship with `target_domain`
+    ///      (forest sibling, child↔parent, or trusted_domains entry).
+    ///   4. Any non-empty, non-quarantined cred with matching username.
+    pub fn find_source_credential(
+        &self,
+        source_user: &str,
+        target_domain: &str,
+    ) -> Option<ares_core::models::Credential> {
+        let (name, explicit_dom) = parse_principal(source_user);
+        let name_l = name.to_lowercase();
+        let target_l = target_domain.to_lowercase();
+        let target_forest = self.forest_root_of(&target_l);
+
+        let usable = |c: &ares_core::models::Credential| -> bool {
+            !c.password.is_empty()
+                && !self.is_credential_quarantined(&c.username, &c.domain)
+                && c.username.to_lowercase() == name_l
+        };
+
+        if let Some(ref d) = explicit_dom {
+            if let Some(c) = self
+                .credentials
+                .iter()
+                .find(|c| usable(c) && c.domain.to_lowercase() == *d)
+            {
+                return Some(c.clone());
+            }
+        }
+
+        if let Some(c) = self
+            .credentials
+            .iter()
+            .find(|c| usable(c) && c.domain.to_lowercase() == target_l)
+        {
+            return Some(c.clone());
+        }
+
+        if let Some(c) = self.credentials.iter().find(|c| {
+            if !usable(c) {
+                return false;
+            }
+            let dom = c.domain.to_lowercase();
+            if dom == target_l {
+                return false;
+            }
+            let cred_forest = self.forest_root_of(&dom);
+            cred_forest == target_forest
+                || self.trusted_domains.contains_key(&target_forest)
+                || self.trusted_domains.contains_key(&cred_forest)
+        }) {
+            return Some(c.clone());
+        }
+
+        self.credentials.iter().find(|c| usable(c)).cloned()
+    }
+
+    /// NTLM-hash variant of [`find_source_credential`] with the same priority
+    /// order. Restricts to NTLM hashes (the only type usable for PTH).
+    pub fn find_source_hash(
+        &self,
+        source_user: &str,
+        target_domain: &str,
+    ) -> Option<ares_core::models::Hash> {
+        let (name, explicit_dom) = parse_principal(source_user);
+        let name_l = name.to_lowercase();
+        let target_l = target_domain.to_lowercase();
+        let target_forest = self.forest_root_of(&target_l);
+
+        let usable = |h: &ares_core::models::Hash| -> bool {
+            !h.hash_value.is_empty()
+                && h.hash_type.eq_ignore_ascii_case("NTLM")
+                && !self.is_credential_quarantined(&h.username, &h.domain)
+                && h.username.to_lowercase() == name_l
+        };
+
+        if let Some(ref d) = explicit_dom {
+            if let Some(h) = self
+                .hashes
+                .iter()
+                .find(|h| usable(h) && h.domain.to_lowercase() == *d)
+            {
+                return Some(h.clone());
+            }
+        }
+
+        if let Some(h) = self
+            .hashes
+            .iter()
+            .find(|h| usable(h) && h.domain.to_lowercase() == target_l)
+        {
+            return Some(h.clone());
+        }
+
+        if let Some(h) = self.hashes.iter().find(|h| {
+            if !usable(h) {
+                return false;
+            }
+            let dom = h.domain.to_lowercase();
+            if dom == target_l {
+                return false;
+            }
+            let cred_forest = self.forest_root_of(&dom);
+            cred_forest == target_forest
+                || self.trusted_domains.contains_key(&target_forest)
+                || self.trusted_domains.contains_key(&cred_forest)
+        }) {
+            return Some(h.clone());
+        }
+
+        self.hashes.iter().find(|h| usable(h)).cloned()
+    }
+
     /// Get the forest root for a domain.
     /// If the domain is a child (e.g. `child.contoso.local`), the forest
     /// root is the parent (e.g. `contoso.local`). Otherwise returns self.
@@ -380,6 +505,16 @@ impl StateInner {
             &self.domain_controllers,
         )
         .is_empty()
+    }
+}
+
+/// Parse a principal string of form `name` or `name@domain.fqdn`.
+/// Returns `(name, Some(domain_lower))` for the @-form, `(name, None)` for bare names.
+fn parse_principal(s: &str) -> (&str, Option<String>) {
+    if let Some((name, dom)) = s.split_once('@') {
+        (name, Some(dom.to_lowercase()))
+    } else {
+        (s, None)
     }
 }
 
@@ -576,6 +711,7 @@ mod tests {
             DEDUP_ACL_DISCOVERY,
             DEDUP_CROSS_FOREST_ENUM,
             DEDUP_CROSS_REALM_LATERAL,
+            DEDUP_GOLDEN_CERT,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

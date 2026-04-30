@@ -241,9 +241,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "certipy_ca".into(),
-            description: "Manage a Certificate Authority using Certipy. Can add yourself as a \
-                CA officer (ManageCA right required) or issue a pending certificate request."
-                .into(),
+            description:
+                "Manage a Certificate Authority using Certipy. Can add yourself as a \
+                CA officer (ManageCA right required), issue a pending certificate request, or \
+                back up the CA's private key + certificate (requires SYSTEM/local admin on the \
+                CA host — produces a PFX usable for offline certificate forgery via certipy_forge)."
+                    .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -274,9 +277,47 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "issue_request": {
                         "type": "integer",
                         "description": "Issue (approve) a pending certificate request by its request ID."
+                    },
+                    "backup": {
+                        "type": "boolean",
+                        "description": "Back up the CA private key + certificate to a PFX. Requires SYSTEM or local admin on the CA host (use the credential of an account with that access). Output PFX is the input to certipy_forge for offline Golden Certificate forgery."
                     }
                 },
                 "required": ["domain", "username", "password", "dc_ip", "ca"]
+            }),
+        },
+        ToolDefinition {
+            name: "certipy_forge".into(),
+            description: "Forge a certificate offline using a CA's backed-up private key (Golden \
+                Certificate). Use after certipy_ca with backup=true to produce a PFX for any UPN \
+                in the CA's domain — bypasses normal enrollment, no DC interaction. The forged \
+                PFX feeds certipy_auth to obtain the target user's NT hash via PKINIT."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "ca_pfx": {
+                        "type": "string",
+                        "description": "Path to the CA's backed-up PFX file (produced by certipy_ca with backup=true)."
+                    },
+                    "upn": {
+                        "type": "string",
+                        "description": "User Principal Name to forge the certificate for (e.g. 'administrator@contoso.local'). Used as the certificate subject for PKINIT authentication."
+                    },
+                    "subject": {
+                        "type": "string",
+                        "description": "Optional certificate subject (Distinguished Name). Defaults to a sensible value derived from the UPN."
+                    },
+                    "template": {
+                        "type": "string",
+                        "description": "Optional certificate template name to mimic. Defaults to a generic client-auth template."
+                    },
+                    "out": {
+                        "type": "string",
+                        "description": "Output filename for the forged PFX. Auto-generated if omitted (forged_<upn>_<timestamp>.pfx)."
+                    }
+                },
+                "required": ["ca_pfx", "upn"]
             }),
         },
         ToolDefinition {
