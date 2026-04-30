@@ -97,7 +97,45 @@ pub async fn auto_sid_enumeration(
         };
 
         for item in work {
-            let payload = json!({
+            // Cross-forest authenticated RPC/LDAP from the source forest's
+            // credential typically returns ACCESS_DENIED — but `rpcclient
+            // -U "" -N -c lsaquery` over a null session usually succeeds
+            // against DCs that allow anonymous LSA queries (most legacy
+            // configurations). The agent loop won't try the null-session
+            // path on its own when handed a credential, so we explicitly
+            // instruct it to fall through. The result-processor's
+            // `extract_lsaquery_domain_sid` regex captures the resulting
+            // `Domain Name: / Domain Sid:` block and caches it against the
+            // domain, which unblocks `forge_inter_realm_and_dump`.
+            let cred_is_cross_forest = !item
+                .credential
+                .domain
+                .to_lowercase()
+                .ends_with(&item.domain.to_lowercase())
+                && !item
+                    .domain
+                    .to_lowercase()
+                    .ends_with(&item.credential.domain.to_lowercase())
+                && item.credential.domain.to_lowercase() != item.domain.to_lowercase();
+            let instructions = if cred_is_cross_forest {
+                Some(format!(
+                    "Resolve the domain SID and RID-500 account name for {dom} ({dc}). \
+                     The provided credential is from a different forest and authenticated \
+                     RPC/LDAP from outside this forest typically fails with ACCESS_DENIED. \
+                     Run `rpcclient -U \"\" -N {dc} -c \"lsaquery\"` first (null/anonymous \
+                     session — no credential needed) to capture the `Domain Name:` and \
+                     `Domain Sid:` lines. Then run `impacket-lookupsid` with the provided \
+                     credential as a secondary attempt for RID-500 mapping. Report both \
+                     outputs verbatim via task_complete tool_outputs so the parser can \
+                     extract the SID.",
+                    dom = item.domain,
+                    dc = item.dc_ip,
+                ))
+            } else {
+                None
+            };
+
+            let mut payload = json!({
                 "technique": "sid_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -107,6 +145,9 @@ pub async fn auto_sid_enumeration(
                     "domain": item.credential.domain,
                 },
             });
+            if let Some(text) = instructions {
+                payload["instructions"] = json!(text);
+            }
 
             let priority = dispatcher.effective_priority("sid_enumeration");
             match dispatcher
