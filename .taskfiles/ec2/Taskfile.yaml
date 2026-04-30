@@ -966,6 +966,7 @@ tasks:
       SECRETS_ID: '{{.SECRETS_ID | default "ares/api-keys"}}'
       LLM_MODEL: '{{.LLM_MODEL | default ""}}'
       FLUSH_REDIS: '{{.FLUSH_REDIS | default "true"}}'
+      OPERATION_ID: '{{.OPERATION_ID | default ""}}'
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
@@ -981,7 +982,11 @@ tasks:
           exit 1
         fi
 
-        OP_ID="op-$(date -u +%Y%m%d-%H%M%S)"
+        if [ -n "{{.OPERATION_ID}}" ]; then
+          OP_ID="{{.OPERATION_ID}}"
+        else
+          OP_ID="op-$(date -u +%Y%m%d-%H%M%S)"
+        fi
         echo -e "{{.INFO}} Operation ID: $OP_ID"
 
         # Build target IPs JSON array

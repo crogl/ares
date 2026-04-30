@@ -137,6 +137,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
             lateral::mssql_linked_enable_xpcmdshell(arguments).await
         }
         "mssql_linked_xpcmdshell" => lateral::mssql_linked_xpcmdshell(arguments).await,
+        "mssql_openquery" => lateral::mssql_openquery(arguments).await,
         "mssql_ntlm_coerce" => lateral::mssql_ntlm_coerce(arguments).await,
 
         // ── Privilege Escalation ────────────────────────────────────

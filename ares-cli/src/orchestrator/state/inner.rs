@@ -575,6 +575,7 @@ mod tests {
             DEDUP_SMBCLIENT_ENUM,
             DEDUP_ACL_DISCOVERY,
             DEDUP_CROSS_FOREST_ENUM,
+            DEDUP_CROSS_REALM_LATERAL,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

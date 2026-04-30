@@ -102,6 +102,42 @@ impl OrchestratorCallbackHandler {
             attack_step: 0,
         };
 
+        // Pre-check cross-realm so the LLM gets a clear "dead-end" message
+        // rather than a misleading "queued" when request_lateral silently rejects.
+        let target_realm = {
+            let state = self.state.read().await;
+            state
+                .hosts
+                .iter()
+                .find(|h| h.ip == target_ip)
+                .and_then(|h| h.hostname.split_once('.').map(|(_, d)| d.to_lowercase()))
+        };
+        if let Some(td) = target_realm {
+            let cd = domain.to_lowercase();
+            if !cd.is_empty()
+                && cd != td
+                && !td.ends_with(&format!(".{cd}"))
+                && !cd.ends_with(&format!(".{td}"))
+            {
+                warn!(
+                    target_ip = target_ip,
+                    target_realm = %td,
+                    cred_domain = %cd,
+                    cred_user = username,
+                    technique = technique,
+                    "Rejecting cross-realm lateral from LLM — returning dead-end message"
+                );
+                return Ok(CallbackResult::Continue(format!(
+                    "REJECTED: cross-realm lateral movement ({cd} cred → {td} target at {target_ip}) \
+                     will not work. Windows strips ExtraSid RID<1000 across forests, and same-realm \
+                     auth is required for SMB/WMI/PSExec. DO NOT retry this combination with any \
+                     {technique}/pth_*/smbexec/wmiexec/psexec variant. Instead: dispatch \
+                     forest_trust_escalation, exploit ESC8/MSSQL/ACL paths to acquire a \
+                     {td}-realm credential, or pivot via FSP membership."
+                )));
+            }
+        }
+
         let task_id = dispatcher
             .request_lateral(target_ip, &cred, technique)
             .await?;

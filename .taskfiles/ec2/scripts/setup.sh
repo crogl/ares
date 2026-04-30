@@ -29,6 +29,38 @@ if [ -f /etc/systemd/system/ares-worker@.service ]; then
 	rm -f /etc/systemd/system/ares-worker@.service
 fi
 
+echo "=== Creating system-ares.slice with global memory cap ==="
+cat >/etc/systemd/system/system-ares.slice <<'SLICE_EOF'
+[Unit]
+Description=Ares system slice (orchestrator + workers)
+Before=slices.target
+
+[Slice]
+MemoryMax=12G
+MemoryHigh=10G
+TasksMax=8192
+SLICE_EOF
+
+echo "=== Ensuring 4G swap file (OOM cushion) ==="
+if [ ! -f /swapfile ] || [ "$(stat -c%s /swapfile 2>/dev/null || echo 0)" -lt 4000000000 ]; then
+	swapoff /swapfile 2>/dev/null || true
+	rm -f /swapfile
+	fallocate -l 4G /swapfile || dd if=/dev/zero of=/swapfile bs=1M count=4096
+	chmod 600 /swapfile
+	mkswap /swapfile
+	swapon /swapfile
+	if ! grep -q '^/swapfile' /etc/fstab; then
+		echo '/swapfile none swap sw 0 0' >>/etc/fstab
+	fi
+fi
+
+echo "=== Tuning OOM behavior (oom_kill_allocating_task, swappiness) ==="
+cat >/etc/sysctl.d/90-ares.conf <<'SYSCTL_EOF'
+vm.oom_kill_allocating_task = 1
+vm.swappiness = 10
+SYSCTL_EOF
+sysctl -p /etc/sysctl.d/90-ares.conf >/dev/null
+
 echo "=== Creating systemd worker template unit ==="
 cat >/etc/systemd/system/ares@.service <<'UNIT_EOF'
 [Unit]
@@ -54,8 +86,9 @@ StandardError=append:/var/log/ares/%i.log
 # Without these limits, runaway tool processes can OOM the entire system and
 # take down the SSM agent (see: Apr 2026 incident).
 Delegate=yes
-MemoryHigh=2G
-MemoryMax=3G
+Slice=system-ares.slice
+MemoryHigh=1500M
+MemoryMax=2G
 TasksMax=256
 
 [Install]

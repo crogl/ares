@@ -4,7 +4,7 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::{debug, info};
 
-use crate::orchestrator::state::DEDUP_SCANNED_TARGETS;
+use crate::orchestrator::state::{DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
 
 use super::Dispatcher;
 
@@ -230,6 +230,29 @@ impl Dispatcher {
         credential: &ares_core::models::Credential,
         technique: &str,
     ) -> Result<Option<String>> {
+        // Stable key shared with the cross-realm guard below so a rejection
+        // permanently suppresses retries from credential_expansion and the LLM.
+        let cross_realm_key = format!(
+            "{}|{}|{}|{}",
+            credential.domain.to_lowercase(),
+            credential.username.to_lowercase(),
+            target_ip,
+            technique
+        );
+
+        {
+            let state = self.state.read().await;
+            if state.is_processed(DEDUP_CROSS_REALM_LATERAL, &cross_realm_key) {
+                debug!(
+                    target_ip = target_ip,
+                    cred_user = %credential.username,
+                    technique = technique,
+                    "Skipping lateral — already rejected as cross-realm dead-end"
+                );
+                return Ok(None);
+            }
+        }
+
         // Resolve target's realm from state.hosts (FQDN suffix).
         let target_domain = {
             let state = self.state.read().await;
@@ -254,6 +277,14 @@ impl Dispatcher {
                     technique = %technique,
                     "Refusing cross-realm lateral movement — use forest_trust_escalation or get a same-realm credential first"
                 );
+                {
+                    let mut state = self.state.write().await;
+                    state.mark_processed(DEDUP_CROSS_REALM_LATERAL, cross_realm_key.clone());
+                }
+                let _ = self
+                    .state
+                    .persist_dedup(&self.queue, DEDUP_CROSS_REALM_LATERAL, &cross_realm_key)
+                    .await;
                 return Ok(None);
             }
         }

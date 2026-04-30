@@ -194,8 +194,12 @@ pub fn definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "mssql_exec_linked".into(),
-            description: "Execute SQL queries on a linked MSSQL server via OPENQUERY. \
-                Enables lateral movement through SQL Server linked server chains."
+            description: "Execute SQL queries on a linked MSSQL server via `EXEC ('...') AT \
+                [link]` (RPC OUT). The hop runs as the connecting user's mapped credential, \
+                which fails on cross-forest links without Kerberos delegation. For cross-forest \
+                pivots: pass `impersonate_user='sa'` to wrap the hop in EXECUTE AS LOGIN \
+                (uses the local SeImpersonate path), or use `mssql_openquery` to ride the \
+                linked server's stored login mapping."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -228,6 +232,58 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Use Windows authentication instead of SQL auth",
                         "default": true
+                    },
+                    "impersonate_user": {
+                        "type": "string",
+                        "description": "Optional source-side login to impersonate before the hop (EXECUTE AS LOGIN). Use 'sa' to break out of double-hop limits when the local connection has IMPERSONATE on sa."
+                    }
+                },
+                "required": ["target", "username", "password", "linked_server", "query"]
+            }),
+        },
+        ToolDefinition {
+            name: "mssql_openquery".into(),
+            description: "Query a linked MSSQL server via OPENQUERY using the linked server's \
+                configured remote login (sp_addlinkedsrvlogin). Bypasses Kerberos double-hop \
+                — use this when `mssql_exec_linked` fails on cross-forest links because the \
+                connecting principal can't delegate, but the linked server has a stored \
+                credential mapping (RPC OUT + sp_addlinkedsrvlogin)."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "MSSQL server IP or hostname (entry point)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Username for authentication"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for authentication"
+                    },
+                    "linked_server": {
+                        "type": "string",
+                        "description": "Name of the linked server to query"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "SQL query string passed inside OPENQUERY (single quotes auto-escaped)"
+                    },
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain name for Windows authentication"
+                    },
+                    "windows_auth": {
+                        "type": "boolean",
+                        "description": "Use Windows authentication instead of SQL auth",
+                        "default": true
+                    },
+                    "impersonate_user": {
+                        "type": "string",
+                        "description": "Optional source-side login to impersonate before OPENQUERY (e.g. 'sa') for IMPERSONATE-based escalation."
                     }
                 },
                 "required": ["target", "username", "password", "linked_server", "query"]
@@ -236,7 +292,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "mssql_linked_enable_xpcmdshell".into(),
             description: "Enable xp_cmdshell on a linked MSSQL server. Required before \
-                executing OS commands on the linked server."
+                executing OS commands on the linked server. Pass `impersonate_user='sa'` \
+                for cross-forest hops where the connecting principal lacks delegation."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -265,6 +322,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Use Windows authentication instead of SQL auth",
                         "default": true
+                    },
+                    "impersonate_user": {
+                        "type": "string",
+                        "description": "Optional source-side login to impersonate (EXECUTE AS LOGIN) before the hop."
                     }
                 },
                 "required": ["target", "username", "password", "linked_server"]
@@ -273,7 +334,9 @@ pub fn definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "mssql_linked_xpcmdshell".into(),
             description: "Execute an OS command via xp_cmdshell on a linked MSSQL server. \
-                Requires xp_cmdshell to be enabled on the linked server first."
+                Requires xp_cmdshell to be enabled on the linked server first. Pass \
+                `impersonate_user='sa'` for cross-forest hops where the connecting \
+                principal can't double-hop."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -306,6 +369,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "type": "boolean",
                         "description": "Use Windows authentication instead of SQL auth",
                         "default": true
+                    },
+                    "impersonate_user": {
+                        "type": "string",
+                        "description": "Optional source-side login to impersonate (EXECUTE AS LOGIN) before the hop."
                     }
                 },
                 "required": ["target", "username", "password", "linked_server", "command"]

@@ -30,7 +30,7 @@ if [ -n "$_blue_model" ] && [ "$_blue_model" = "${_blue_model#__}" ]; then
 fi
 export ARES_DEPLOYMENT='__ARES_DEPLOYMENT__'
 export ARES_CONFIG=/etc/ares/config.yaml
-export ARES_MAX_CONCURRENT_TASKS=16
+export ARES_MAX_CONCURRENT_TASKS=8
 _otel_endpoint='__OTEL_TRACES_ENDPOINT__'
 if [ -n "$_otel_endpoint" ] && [ "$_otel_endpoint" = "${_otel_endpoint#__}" ]; then
   export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="$_otel_endpoint"
@@ -80,4 +80,6 @@ exec systemd-run \
   --property=StandardError=append:/var/log/ares/orchestrator.log \
   --property=OOMScoreAdjust=-500 \
   --property=TasksMax=4096 \
+  --property=MemoryHigh=8G \
+  --property=MemoryMax=10G \
   /usr/local/bin/ares orchestrator
