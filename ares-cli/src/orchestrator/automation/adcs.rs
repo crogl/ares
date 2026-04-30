@@ -108,15 +108,22 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             // domain_controllers doesn't have an entry.
             let dc_ip = state.resolve_dc_ip(&domain);
 
-            // Prefer same-domain cleartext cred; fall back to any trusted-domain
-            // cred. certipy_find is read-only LDAP enumeration that works cross-domain
-            // via forest trusts, so restricting to same-domain blocks discovery when
-            // early creds come from a different domain than the CA host.
+            // certipy_find authenticates via LDAP bind to the target DC.
+            // NTLM/Kerberos bind succeeds within the same forest (same domain or
+            // parent/child/sibling) but fails 52e across a forest trust because
+            // the source principal does not exist in the target's domain and
+            // impacket cannot follow Kerberos cross-realm referrals.
+            //
+            // Restrict cred selection to the same forest as the target. If no
+            // same-forest cred exists, skip dispatch — other automations
+            // (foreign_group_enum, mssql_linked_server, golden_cert) handle
+            // the cross-forest foothold path that yields a same-forest cred.
             //
             // The dedup key includes the candidate credential's identity, so a
             // failed first attempt with one cred does not block a later, possibly
             // correct cred against the same CA host.
             let domain_lower = domain.to_lowercase();
+            let target_forest = state.forest_root_of(&domain_lower);
             let cred = {
                 let mut candidates: Vec<&ares_core::models::Credential> = state
                     .credentials
@@ -129,8 +136,10 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                     })
                     .collect();
                 candidates.extend(state.credentials.iter().filter(|c| {
+                    let cd = c.domain.to_lowercase();
                     !c.password.is_empty()
-                        && c.domain.to_lowercase() != domain_lower
+                        && cd != domain_lower
+                        && state.forest_root_of(&cd) == target_forest
                         && !state.is_delegation_account(&c.username)
                         && !state.is_credential_quarantined(&c.username, &c.domain)
                 }));
@@ -153,12 +162,18 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                         && (h.domain.to_lowercase() == domain_lower || h.domain.is_empty())
                         && !state.is_delegation_account(&h.username)
                 };
+                let same_forest = |h: &&ares_core::models::Hash| -> bool {
+                    let hd = h.domain.to_lowercase();
+                    !hd.is_empty() && state.forest_root_of(&hd) == target_forest
+                };
                 let pred_admin_xdom = |h: &&ares_core::models::Hash| {
                     h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && same_forest(h)
                         && h.username.to_lowercase() == "administrator"
                 };
                 let pred_any_xdom = |h: &&ares_core::models::Hash| {
                     h.hash_type.eq_ignore_ascii_case("ntlm")
+                        && same_forest(h)
                         && !state.is_delegation_account(&h.username)
                 };
 
@@ -492,13 +507,53 @@ mod tests {
     }
 
     #[test]
-    fn collect_quarantined_same_domain_falls_back_to_cross_domain() {
+    fn collect_skips_cross_forest_cred_for_ca_host() {
+        // contoso.local CA, only fabrikam.local cred (different forest).
+        // certipy_find LDAP bind across forest trust fails 52e — skip dispatch.
         let mut state = StateInner::new("test-op".into());
         state.shares.push(make_share("192.168.58.50", "CertEnroll"));
         state
             .hosts
             .push(make_host("192.168.58.50", "ca01.contoso.local", false));
         state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
+        state
+            .credentials
+            .push(make_credential("foreigner", "P@ss!", "fabrikam.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert!(
+            work.is_empty(),
+            "should not dispatch ADCS enum with cross-forest cred"
+        );
+    }
+
+    #[test]
+    fn collect_uses_child_domain_cred_for_parent_ca() {
+        // child cred → parent CA: same forest, LDAP bind succeeds.
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state.domains.push("dev.contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("childuser", "P@ss!", "dev.contoso.local")); // pragma: allowlist secret
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "childuser");
+    }
+
+    #[test]
+    fn collect_quarantined_same_domain_does_not_fall_back_cross_forest() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state.domains.push("fabrikam.local".into());
         state
             .credentials
             .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
@@ -506,14 +561,31 @@ mod tests {
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
         state.quarantine_credential("baduser", "contoso.local");
-        // Same-domain cred quarantined → falls back to cross-domain cred
-        // (certipy_find is read-only LDAP enum that works via forest trusts)
         let work = collect_adcs_work(&state);
-        assert_eq!(
-            work.len(),
-            1,
-            "should fall back to cross-domain cred for certipy_find"
+        assert!(
+            work.is_empty(),
+            "cross-forest LDAP bind fails 52e — must not dispatch with fabrikam cred"
         );
+    }
+
+    #[test]
+    fn collect_quarantined_same_domain_falls_back_to_sibling_in_same_forest() {
+        let mut state = StateInner::new("test-op".into());
+        state.shares.push(make_share("192.168.58.50", "CertEnroll"));
+        state
+            .hosts
+            .push(make_host("192.168.58.50", "ca01.contoso.local", false));
+        state.domains.push("contoso.local".into());
+        state.domains.push("dev.contoso.local".into());
+        state
+            .credentials
+            .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .credentials
+            .push(make_credential("gooduser", "Pass!456", "dev.contoso.local")); // pragma: allowlist secret
+        state.quarantine_credential("baduser", "contoso.local");
+        let work = collect_adcs_work(&state);
+        assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "gooduser");
     }
 

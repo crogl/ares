@@ -417,7 +417,7 @@ impl StateInner {
     /// Get the forest root for a domain.
     /// If the domain is a child (e.g. `child.contoso.local`), the forest
     /// root is the parent (e.g. `contoso.local`). Otherwise returns self.
-    fn forest_root_of(&self, domain: &str) -> String {
+    pub fn forest_root_of(&self, domain: &str) -> String {
         let d = domain.to_lowercase();
         // Check if this domain is a child of any known domain
         for known in self.domains.iter() {
