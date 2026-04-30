@@ -219,12 +219,44 @@ impl Dispatcher {
     }
 
     /// Submit a lateral movement task.
+    ///
+    /// Refuses to dispatch when the credential's realm differs from the target
+    /// host's realm and no trust path is known — wrong-realm NTLM/Kerberos auth
+    /// against a foreign DC just returns ACCESS_DENIED and burns LLM tokens
+    /// (see the swarm of NORTH\catelyn → braavos.essos.local failures).
     pub async fn request_lateral(
         &self,
         target_ip: &str,
         credential: &ares_core::models::Credential,
         technique: &str,
     ) -> Result<Option<String>> {
+        // Resolve target's realm from state.hosts (FQDN suffix).
+        let target_domain = {
+            let state = self.state.read().await;
+            state
+                .hosts
+                .iter()
+                .find(|h| h.ip == target_ip)
+                .and_then(|h| h.hostname.split_once('.').map(|(_, d)| d.to_lowercase()))
+        };
+        if let Some(td) = target_domain {
+            let cd = credential.domain.to_lowercase();
+            if !cd.is_empty()
+                && cd != td
+                && !td.ends_with(&format!(".{cd}"))
+                && !cd.ends_with(&format!(".{td}"))
+            {
+                tracing::warn!(
+                    target_ip = %target_ip,
+                    target_domain = %td,
+                    cred_domain = %cd,
+                    cred_user = %credential.username,
+                    technique = %technique,
+                    "Refusing cross-realm lateral movement — use forest_trust_escalation or get a same-realm credential first"
+                );
+                return Ok(None);
+            }
+        }
         let payload = json!({
             "technique": technique,
             "target_ip": target_ip,

@@ -75,6 +75,13 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                 })
                 .or_else(|| state.domains.first().cloned())?;
 
+            // Skip domains we already own — DA on a domain means we don't
+            // need to escalate via its CA. (We may still need ADCS against an
+            // un-owned domain via cross-trust, so this is per-domain not global.)
+            if state.dominated_domains.contains(&domain) {
+                return None;
+            }
+
             // Look up DC IP for this domain (certipy needs LDAP on a DC, not the CA host).
             // Uses resolve_dc_ip() which falls back to scanning hosts list when
             // domain_controllers doesn't have an entry.

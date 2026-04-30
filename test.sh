@@ -5,16 +5,21 @@ EC2_NAME="${EC2_NAME:-kali-ares}"
 TARGET="${TARGET:-dreadgoad}"
 BLUE_ENABLED="${BLUE_ENABLED:-1}"
 
+echo "=== Stopping workers + any running operation ==="
+task ec2:stop EC2_NAME="${EC2_NAME}" 2>/dev/null || true
+task ec2:stop-op EC2_NAME="${EC2_NAME}" LATEST=true 2>/dev/null || true
+
+echo ""
 echo "=== Deploying binaries to ${EC2_NAME} ==="
 task -y ec2:deploy EC2_NAME="${EC2_NAME}"
 
 echo ""
-echo "=== Stopping any running operation ==="
-task ec2:stop-op EC2_NAME="${EC2_NAME}" LATEST=true 2>/dev/null || true
-
-echo ""
 echo "=== Wiping Redis ==="
 task ec2:exec EC2_NAME="${EC2_NAME}" CMD="redis-cli FLUSHALL"
+
+echo ""
+echo "=== Starting workers on fresh Redis with new binary ==="
+task ec2:start EC2_NAME="${EC2_NAME}"
 
 echo ""
 echo "=== Launching operation against ${TARGET} (blue=${BLUE_ENABLED}) ==="

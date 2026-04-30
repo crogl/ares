@@ -21,6 +21,14 @@ fi
 echo "=== Creating directories ==="
 mkdir -p /var/log/ares /etc/ares
 
+echo "=== Removing legacy ares-worker@ unit (renamed in PR #226) ==="
+if [ -f /etc/systemd/system/ares-worker@.service ]; then
+	for role in recon credential_access cracker acl privesc lateral coercion; do
+		systemctl disable --now "ares-worker@${role}.service" 2>/dev/null || true
+	done
+	rm -f /etc/systemd/system/ares-worker@.service
+fi
+
 echo "=== Creating systemd worker template unit ==="
 cat >/etc/systemd/system/ares@.service <<'UNIT_EOF'
 [Unit]
@@ -42,9 +50,18 @@ RestartSec=5
 StandardOutput=append:/var/log/ares/%i.log
 StandardError=append:/var/log/ares/%i.log
 
+# Contain child processes (netexec, hashcat, nmap, etc.) within this cgroup.
+# Without these limits, runaway tool processes can OOM the entire system and
+# take down the SSM agent (see: Apr 2026 incident).
+Delegate=yes
+MemoryHigh=2G
+MemoryMax=3G
+TasksMax=256
+
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
+systemctl daemon-reload
 
 echo "=== Installing cracking tools ==="
 if ! command -v hashcat >/dev/null 2>&1 || ! command -v john >/dev/null 2>&1; then

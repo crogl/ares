@@ -16,9 +16,12 @@ impl SharedState {
     /// Add a credential to state and Redis (with dedup).
     ///
     /// Sanitizes the credential before storage (strips "Password:" prefix, trailing
-    /// metadata, normalizes domains, rejects noise). When the credential's domain is
-    /// a valid FQDN (contains a dot), it is automatically added to `state.domains`
-    /// (matches Python's `add_credential()` behavior).
+    /// metadata, normalizes domains, rejects noise). The credential's `domain`
+    /// field is stored as-is on the credential, but is NEVER promoted into the
+    /// canonical `state.domains` registry — that registry is reserved for
+    /// authoritative recon (LDAP root DSE, DC enumeration, trust queries) so an
+    /// LLM-supplied typo like `north.sevenkingdomain.com` cannot pollute the
+    /// global view.
     pub async fn publish_credential(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -38,58 +41,33 @@ impl SharedState {
             let state = self.inner.read().await;
             state.operation_id.clone()
         };
-        let reader = RedisStateReader::new(operation_id.clone());
+        let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         let added = reader.add_credential(&mut conn, &cred).await?;
         if added {
-            // Auto-extract domain from credential (matches Python add_credential).
-            // Strip NetExec's `contoso.local0`/`contoso.local0.` artifact so we don't
-            // pollute the canonical `domains` set with phantom suffixes.
+            // Warn (don't promote) when the credential's domain is unknown — this
+            // is how we surface LLM hallucinations without letting them mutate
+            // canonical state. Use NetExec-artifact-stripped form for the check.
             let cred_domain = strip_netexec_artifact(&cred.domain.to_lowercase()).to_string();
-            if cred_domain.contains('.') {
-                let mut state = self.inner.write().await;
-                // If `cred_domain` matches a known host's FQDN, the parser
-                // captured the host FQDN as the credential's AD domain. Strip
-                // the leading label to recover the actual domain
-                // (e.g. `WIN-XXX.c26h.local` → `c26h.local`).
-                let matches_host_fqdn = state
-                    .hosts
+            let mut state = self.inner.write().await;
+            if cred_domain.contains('.')
+                && !state
+                    .domains
                     .iter()
-                    .any(|h| h.hostname.eq_ignore_ascii_case(&cred_domain));
-                let normalized = if matches_host_fqdn {
-                    cred_domain
-                        .split_once('.')
-                        .map(|(_, rest)| rest.to_string())
-                        .filter(|d| d.contains('.'))
-                        .unwrap_or_else(|| cred_domain.clone())
-                } else {
-                    cred_domain.clone()
-                };
-
-                if normalized.contains('.') && !state.domains.contains(&normalized) {
-                    state.domains.push(normalized.clone());
-                    let domain_key = format!(
-                        "{}:{}:{}",
-                        state::KEY_PREFIX,
-                        operation_id,
-                        state::KEY_DOMAINS,
-                    );
-                    let _: Result<(), _> =
-                        redis::AsyncCommands::sadd(&mut conn, &domain_key, &normalized).await;
-                    let _: Result<(), _> =
-                        redis::AsyncCommands::expire(&mut conn, &domain_key, 86400i64).await;
-                    tracing::info!(
-                        domain = %normalized,
-                        raw_cred_domain = %cred_domain,
-                        username = %cred.username,
-                        "Auto-extracted domain from credential"
-                    );
-                }
-                state.credentials.push(cred);
-            } else {
-                let mut state = self.inner.write().await;
-                state.credentials.push(cred);
+                    .any(|d| d.eq_ignore_ascii_case(&cred_domain))
+                && !state
+                    .domain_controllers
+                    .keys()
+                    .any(|d| d.eq_ignore_ascii_case(&cred_domain))
+            {
+                tracing::warn!(
+                    domain = %cred_domain,
+                    username = %cred.username,
+                    source = %cred.source,
+                    "Credential references unknown domain — not promoting to state.domains (authoritative recon required)"
+                );
             }
+            state.credentials.push(cred);
         }
         Ok(added)
     }
@@ -387,15 +365,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_credential_auto_extracts_domain() {
+    async fn publish_credential_does_not_pollute_state_domains() {
+        // LLM-supplied domains must never be promoted into the canonical
+        // `state.domains` registry — otherwise a typo like
+        // `north.sevenkingdomain.com` corrupts every downstream tick loop.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let cred = make_cred("alice", "P@ssw0rd!", "contoso.local");
+        let cred = make_cred("alice", "P@ssw0rd!", "north.sevenkingdomain.com");
         state.publish_credential(&q, cred).await.unwrap();
 
         let s = state.inner.read().await;
-        assert!(s.domains.contains(&"contoso.local".to_string()));
+        assert!(
+            s.domains.is_empty(),
+            "state.domains must remain untouched by credential ingestion, got {:?}",
+            s.domains
+        );
+        assert_eq!(s.credentials.len(), 1);
     }
 
     #[tokio::test]

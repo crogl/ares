@@ -47,6 +47,18 @@ fn collect_lsassy_work(state: &StateInner) -> Vec<LsassyWork> {
             .map(|i| host.hostname[i + 1..].to_lowercase())
             .unwrap_or_default();
 
+        // Skip when the host's domain is dominated AND every forest is fully
+        // owned. We still want LSASS dumps from owned hosts in a not-yet-fully-
+        // dominated lab (session creds may unlock cross-realm pivots), but once
+        // we have everything there is no point grinding more memory.
+        if !domain.is_empty()
+            && state.dominated_domains.contains(&domain)
+            && state.has_domain_admin
+            && state.all_forests_dominated()
+        {
+            continue;
+        }
+
         // Find a credential for this host's domain
         let cred = state
             .credentials
