@@ -113,9 +113,14 @@
       changed_when: true
 
   roles:
-    # AWS infrastructure agents
+    # AWS infrastructure agents — skipped on non-AWS clouds because they
+    # require the EC2 instance metadata service (cloudwatch-agent's
+    # `fetch-config -m ec2` hits 169.254.169.254 and aborts the build
+    # on Azure).
     - role: dreadnode.nimbus_range.aws_ssm_agent
+      when: cloud_provider | default('aws') == 'aws'
     - role: dreadnode.nimbus_range.aws_cloudwatch_agent
+      when: cloud_provider | default('aws') == 'aws'
 
     # Base Ares requirements
     - role: dreadnode.nimbus_range.base
