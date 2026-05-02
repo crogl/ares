@@ -14,6 +14,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::dispatcher::Dispatcher;
 
 /// Dedup key prefix for RBCD attacks.
@@ -91,6 +92,14 @@ pub async fn auto_rbcd_exploitation(
                         .or_else(|| vuln.details.get("victim"))
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string())?;
+                    if is_ghost_machine_account(&target_computer) {
+                        debug!(
+                            vuln_id = %vuln.vuln_id,
+                            target = %target_computer,
+                            "RBCD skipped: ghost machine account target"
+                        );
+                        return None;
+                    }
 
                     let domain = vuln
                         .details
@@ -280,6 +289,11 @@ mod tests {
         assert!(!is_rbcd_candidate("genericwrite", Some("Group")));
         assert!(!is_rbcd_candidate("esc1", None));
         assert!(!is_rbcd_candidate("shadow_credentials", Some("Computer")));
+    }
+
+    #[test]
+    fn ghost_machine_target_detected() {
+        assert!(is_ghost_machine_account("WIN-DPPJMLU3XS6$"));
     }
 
     #[test]

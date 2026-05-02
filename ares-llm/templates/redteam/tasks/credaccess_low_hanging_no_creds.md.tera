@@ -12,11 +12,15 @@ Task ID: {{ task_id }}
    Read the lockout threshold (e.g. "Account Lockout Threshold: 5"). You must
    pass it as `lockout_threshold` to every password_spray call below. If the
    policy says 0 / "Never", lockout is disabled — pass 0.
+   **NOTE: `password_policy` requires authenticated bind. With NO credentials,
+   skip directly to step 3 with `acknowledge_no_policy=true`.**
 
-3. password_spray - one call per password. The tool keeps a 1-attempt safety
-   buffer below `lockout_threshold` and refuses to run when the budget is gone.
-   **Increment `attempts_used_per_account` by 1 after each spray** so successive
-   sprays stop before locking accounts:
+3. password_spray - one call per candidate password. Pass `password='X'` to
+   spray a single value, or `use_common_passwords=true` for the built-in list.
+   The tool keeps a 1-attempt safety buffer below `lockout_threshold` and
+   refuses to run when the budget is gone.
+   **Increment `attempts_used_per_account` by 1 after each spray** so
+   successive sprays stop before locking accounts:
 
    password_spray(target=DC_IP, domain=DOMAIN, password='Password1',
                   lockout_threshold=THRESHOLD, attempts_used_per_account=0)
@@ -29,9 +33,12 @@ Task ID: {{ task_id }}
    password_spray(target=DC_IP, domain=DOMAIN, password='Spring2026',
                   lockout_threshold=THRESHOLD, attempts_used_per_account=4)
 
+   **No-creds fallback** (when `password_policy` failed):
+   password_spray(target=DC_IP, domain=DOMAIN, password='Password1',
+                  acknowledge_no_policy=true)
+
    If a spray returns a "lockout budget exhausted" refusal, STOP — do not retry
-   until the AD observation window resets. Only set `acknowledge_no_policy=true`
-   if password_policy itself failed and the engagement allows lockouts.
+   until the AD observation window resets.
 
 These are the FIRST techniques to run when you have no credentials.
 Report any credentials found immediately.

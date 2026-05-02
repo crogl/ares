@@ -8,6 +8,7 @@ use ares_core::state::{self, RedisStateReader};
 
 use redis::aio::ConnectionLike;
 
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::state::{SharedState, KEY_VULN_QUEUE};
 use crate::orchestrator::task_queue::TaskQueueCore;
 
@@ -101,6 +102,16 @@ impl SharedState {
         mut vuln: VulnerabilityInfo,
         strategy: Option<&crate::orchestrator::strategy::Strategy>,
     ) -> Result<bool> {
+        if should_drop_ghost_acl_vulnerability(&vuln) {
+            tracing::debug!(
+                vuln_id = %vuln.vuln_id,
+                vuln_type = %vuln.vuln_type,
+                target = %vuln.target,
+                "Dropping ghost-machine ACL vulnerability"
+            );
+            return Ok(false);
+        }
+
         // Apply strategy weight override if provided
         if let Some(strategy_cfg) = strategy {
             let effective = strategy_cfg.effective_priority(&vuln.vuln_type);
@@ -335,6 +346,42 @@ fn are_in_same_forest(a: &str, b: &str) -> bool {
     a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
 }
 
+fn should_drop_ghost_acl_vulnerability(vuln: &VulnerabilityInfo) -> bool {
+    if !is_acl_style_vulnerability(&vuln.vuln_type) {
+        return false;
+    }
+
+    ghost_machine_target(vuln)
+}
+
+fn is_acl_style_vulnerability(vuln_type: &str) -> bool {
+    let vtype = vuln_type.trim().to_lowercase();
+    matches!(
+        vtype.as_str(),
+        "genericall"
+            | "genericwrite"
+            | "writedacl"
+            | "writeowner"
+            | "writeproperty"
+            | "allextendedrights"
+            | "self_membership"
+            | "write_membership"
+            | "genericall_computer"
+            | "genericwrite_computer"
+    ) || vtype.contains("forcechangepassword")
+}
+
+fn ghost_machine_target(vuln: &VulnerabilityInfo) -> bool {
+    if is_ghost_machine_account(&vuln.target) {
+        return true;
+    }
+
+    ["target", "target_computer", "target_account"]
+        .into_iter()
+        .filter_map(|key| vuln.details.get(key).and_then(|v| v.as_str()))
+        .any(is_ghost_machine_account)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -367,6 +414,24 @@ mod tests {
             discovered_by: "test".to_string(),
             discovered_at: Utc::now(),
             details: HashMap::new(),
+            recommended_agent: "exploit".to_string(),
+            priority: 50,
+        }
+    }
+
+    fn make_vuln_with_details(
+        vuln_id: &str,
+        vuln_type: &str,
+        target: &str,
+        details: HashMap<String, serde_json::Value>,
+    ) -> VulnerabilityInfo {
+        VulnerabilityInfo {
+            vuln_id: vuln_id.to_string(),
+            vuln_type: vuln_type.to_string(),
+            target: target.to_string(),
+            discovered_by: "test".to_string(),
+            discovered_at: Utc::now(),
+            details,
             recommended_agent: "exploit".to_string(),
             priority: 50,
         }
@@ -502,6 +567,47 @@ mod tests {
 
         let s = state.inner.read().await;
         assert_eq!(s.discovered_vulnerabilities.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_rejects_ghost_acl_target() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let vuln = make_vuln("VULN-ACL-001", "allextendedrights", "WIN-DPPJMLU3XS6$");
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(!added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_rejects_ghost_acl_target_in_details() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let mut details = HashMap::new();
+        details.insert("target".to_string(), serde_json::json!("WIN-DPPJMLU3XS6$"));
+        let vuln = make_vuln_with_details("VULN-ACL-002", "genericall", "placeholder", details);
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(!added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.is_empty());
+    }
+
+    #[tokio::test]
+    async fn publish_vulnerability_keeps_real_acl_machine_target() {
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let vuln = make_vuln("VULN-ACL-003", "genericall", "KINGSLANDING$");
+        let added = state.publish_vulnerability(&q, vuln).await.unwrap();
+        assert!(added);
+
+        let s = state.inner.read().await;
+        assert!(s.discovered_vulnerabilities.contains_key("VULN-ACL-003"));
     }
 
     #[tokio::test]

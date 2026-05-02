@@ -2,9 +2,13 @@
 //! to both in-memory state and Redis.
 
 mod credentials;
+mod domains;
 mod entities;
 mod hosts;
+mod kerberos;
 mod milestones;
+
+pub use domains::DomainPublishOutcome;
 
 use regex::Regex;
 use std::sync::LazyLock;
@@ -128,10 +132,86 @@ pub(super) fn strip_netexec_artifact(s: &str) -> &str {
     }
 }
 
-/// Check if a hostname is an AWS internal PTR name.
-pub(super) fn is_aws_hostname(hostname: &str) -> bool {
-    let lower = hostname.to_lowercase();
-    lower.starts_with("ip-") && lower.contains("compute.internal")
+/// Check if a label matches a known default-OS auto-generated hostname
+/// (Windows OOBE, Win10/11 OOBE, AWS EC2 default). These appear on hosts
+/// that haven't been renamed or domain-joined; they are never valid AD
+/// domain labels.
+///
+/// Matches:
+/// - `WIN-XXXXXXXX` (Win Server / older Win, 8–15 alphanumeric tail)
+/// - `DESKTOP-XXXXXXX` / `LAPTOP-XXXXXXX` (Win10/11 OOBE, exactly 7 alphanumerics)
+/// - `ip-A-B-C-D` (AWS EC2 default)
+pub(super) fn is_default_os_label(label: &str) -> bool {
+    let lower = label.to_lowercase();
+    if let Some(suffix) = lower.strip_prefix("win-") {
+        let len = suffix.len();
+        return (8..=15).contains(&len) && suffix.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if let Some(suffix) = lower
+        .strip_prefix("desktop-")
+        .or_else(|| lower.strip_prefix("laptop-"))
+    {
+        return suffix.len() == 7 && suffix.chars().all(|c| c.is_ascii_alphanumeric());
+    }
+    if let Some(rest) = lower.strip_prefix("ip-") {
+        let octets: Vec<&str> = rest.split('-').collect();
+        if octets.len() == 4
+            && octets
+                .iter()
+                .all(|o| !o.is_empty() && o.chars().all(|c| c.is_ascii_digit()))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Single predicate for "this multi-label DNS name could plausibly be a real
+/// AD-style FQDN." Used both as a pre-filter on candidate domains
+/// (`publish_candidate_domain`) and as a hostname-normalization gate on
+/// `Host.hostname` (`publish_host`, `register_dc`) — every cloud / mDNS /
+/// default-OS / bare-TLD rejection lives here so call sites don't have to
+/// know the rules.
+///
+/// Rejects shapes that are *never* AD domains across OS families:
+/// - Empty / whitespace, or single-label (`local`, `workgroup`)
+/// - Pure mDNS link-local TLDs (`localhost`, `localdomain`)
+/// - Cloud / hypervisor internal suffixes (AWS `compute.internal`,
+///   `amazonaws.com`; Azure `internal.cloudapp.net`; GCP `c.<project>.internal`)
+/// - Any label (in any position) matching a known default-OS auto-name
+///   (`WIN-XXXX`, `DESKTOP-XXXX`, `LAPTOP-XXXX`, `ip-A-B-C-D`) — an unrenamed
+///   host can't be trusted as a source of AD domain truth even if its suffix
+///   looks plausible.
+pub(super) fn looks_like_real_domain(name: &str) -> bool {
+    let trimmed = name.trim().trim_end_matches('.').to_lowercase();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let labels: Vec<&str> = trimmed.split('.').collect();
+    if labels.len() < 2 {
+        return false;
+    }
+    if matches!(trimmed.as_str(), "localhost" | "localdomain") {
+        return false;
+    }
+    if labels
+        .last()
+        .map(|l| matches!(*l, "localhost" | "localdomain"))
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if trimmed.contains("compute.internal")
+        || trimmed.ends_with(".amazonaws.com")
+        || trimmed.ends_with(".internal.cloudapp.net")
+        || (trimmed.starts_with("c.") && trimmed.ends_with(".internal"))
+    {
+        return false;
+    }
+    if labels.iter().any(|l| is_default_os_label(l)) {
+        return false;
+    }
+    true
 }
 
 #[cfg(test)]
@@ -288,26 +368,84 @@ mod tests {
         assert!(sanitize_credential(cred, &HashMap::new()).is_none());
     }
 
-    // --- is_aws_hostname ---
+    // --- is_default_os_label ---
 
     #[test]
-    fn aws_hostname_detected() {
-        assert!(is_aws_hostname("ip-10-0-0-1.ec2.compute.internal"));
+    fn default_os_label_detects_windows_oobe() {
+        assert!(is_default_os_label("WIN-HVTT4F8YN5N"));
+        assert!(is_default_os_label("win-hvtt4f8yn5n"));
+        assert!(is_default_os_label("WIN-ABCDEFGH"));
     }
 
     #[test]
-    fn aws_hostname_case_insensitive() {
-        assert!(is_aws_hostname("IP-10-0-0-1.EC2.COMPUTE.INTERNAL"));
+    fn default_os_label_detects_win10_11_oobe() {
+        assert!(is_default_os_label("DESKTOP-ABC1234"));
+        assert!(is_default_os_label("desktop-abc1234"));
+        assert!(is_default_os_label("LAPTOP-XYZ7890"));
+        // Wrong tail length (Win10/11 OOBE is exactly 7).
+        assert!(!is_default_os_label("DESKTOP-ABCDEFGH"));
+        assert!(!is_default_os_label("DESKTOP-ABC"));
     }
 
     #[test]
-    fn non_aws_hostname_rejected() {
-        assert!(!is_aws_hostname("webserver01.contoso.local"));
+    fn default_os_label_detects_aws_default() {
+        assert!(is_default_os_label("ip-10-0-1-50"));
+        assert!(is_default_os_label("ip-192-168-1-1"));
+        // Not 4 octets:
+        assert!(!is_default_os_label("ip-10-0-1"));
+        // Non-numeric:
+        assert!(!is_default_os_label("ip-foo-bar-baz-qux"));
     }
 
     #[test]
-    fn ip_prefix_without_compute_internal_rejected() {
-        assert!(!is_aws_hostname("ip-missing-suffix.local"));
+    fn default_os_label_rejects_legitimate_names() {
+        assert!(!is_default_os_label("dc01"));
+        assert!(!is_default_os_label("contoso"));
+        assert!(!is_default_os_label("local"));
+        // Too short
+        assert!(!is_default_os_label("WIN-ABC"));
+        // Too long
+        assert!(!is_default_os_label("WIN-ABCDEFGHIJKLMNOP"));
+        // Wrong prefix
+        assert!(!is_default_os_label("LIN-ABCDEFGH"));
+        // Contains non-alphanumerics
+        assert!(!is_default_os_label("WIN-HVTT4F8.YN5N"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_accepts_typical_ad() {
+        assert!(looks_like_real_domain("contoso.local"));
+        assert!(looks_like_real_domain("child.contoso.local"));
+        assert!(looks_like_real_domain("eu.contoso.local"));
+        assert!(looks_like_real_domain("contoso.com"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_bare_tld_and_mdns() {
+        assert!(!looks_like_real_domain("local"));
+        assert!(!looks_like_real_domain(""));
+        assert!(!looks_like_real_domain("localhost"));
+        assert!(!looks_like_real_domain("foo.localhost"));
+        assert!(!looks_like_real_domain("foo.localdomain"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_cloud_internals() {
+        assert!(!looks_like_real_domain("us-west-2.compute.internal"));
+        assert!(!looks_like_real_domain("eu-west-1.amazonaws.com"));
+        assert!(!looks_like_real_domain("vm123.internal.cloudapp.net"));
+        assert!(!looks_like_real_domain("c.myproject.internal"));
+    }
+
+    #[test]
+    fn looks_like_real_domain_rejects_default_os_labels_anywhere() {
+        assert!(!looks_like_real_domain("win-hvtt4f8yn5n.ttb0.local"));
+        assert!(!looks_like_real_domain("desktop-abc1234.workgroup.local"));
+        assert!(!looks_like_real_domain("ip-10-0-0-1.something.com"));
+        assert!(!looks_like_real_domain("dc01.win-abc12345.contoso.local"));
+        assert!(!looks_like_real_domain(
+            "ip-10-0-0-1.us-west-2.compute.internal"
+        ));
     }
 
     // --- strip_netexec_artifact ---

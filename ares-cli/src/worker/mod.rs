@@ -7,6 +7,7 @@
 #[cfg(feature = "blue")]
 mod blue_task_loop;
 mod config;
+pub mod credential_resolver;
 mod heartbeat;
 mod hosts;
 mod task_loop;

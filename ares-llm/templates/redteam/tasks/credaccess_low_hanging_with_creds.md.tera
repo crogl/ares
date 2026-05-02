@@ -2,14 +2,14 @@ Perform LOW HANGING FRUIT credential harvesting:
 Domain: {{ domain }}
 DC IP: {{ dc_ip_display }}
 Username: {{ user_display }}
-Password: {{ password }}
+Auth: password (auto-resolved at dispatch — do NOT pass password/hash/ticket fields)
 Task ID: {{ task_id }}
 
-**EXECUTE IN THIS ORDER:**
-1. gpp_password_finder(target=DC_IP, username=USER, password=PASS, domain=DOMAIN)
-2. sysvol_script_search(target=DC_IP, username=USER, password=PASS, domain=DOMAIN)
-3. ldap_search_descriptions(...) - check for passwords in LDAP descriptions
-4. username_as_password(...) - check for user=password accounts
+**EXECUTE IN THIS ORDER (worker injects credentials at dispatch):**
+1. gpp_password_finder(target=DC_IP, username=USER, domain=DOMAIN)
+2. sysvol_script_search(target=DC_IP, username=USER, domain=DOMAIN)
+3. ldap_search_descriptions(target=DC_IP, username=USER, domain=DOMAIN) - check for passwords in LDAP descriptions
+4. username_as_password(target=DC_IP, domain=DOMAIN) - check for user=password accounts
 
 These are HIGH SUCCESS RATE techniques that find hardcoded credentials.
 Report any credentials found immediately.

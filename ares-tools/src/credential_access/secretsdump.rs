@@ -24,6 +24,17 @@ pub async fn secretsdump(args: &Value) -> Result<ToolOutput> {
 
     let timeout_secs = timeout_minutes.map(|m| (m * 60) as u64).unwrap_or(180);
 
+    if !use_kerberos && password.is_none() && hash.is_none() {
+        anyhow::bail!(
+            "secretsdump requires password, hash, or no_pass+ticket_path. \
+             None were provided for {username}@{} on {target} — credentials \
+             must be present in operation state for the (username, domain) pair, \
+             or the LLM must call this with no_pass=true and a valid Kerberos ticket. \
+             Refusing to run because impacket would call getpass() and crash on no-TTY.",
+            domain.unwrap_or("(no domain)")
+        );
+    }
+
     let (auth_string, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
 

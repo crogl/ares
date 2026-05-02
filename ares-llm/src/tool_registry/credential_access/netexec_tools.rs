@@ -53,7 +53,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password to spray"
+                        "description": "Single candidate password to spray across all users (e.g. 'Welcome1'). Either this OR `use_common_passwords` must be set."
+                    },
+                    "use_common_passwords": {
+                        "type": "boolean",
+                        "description": "If true, spray a built-in list of common passwords instead of a single candidate. Mutually exclusive with `password`."
                     },
                     "domain": {
                         "type": "string",
@@ -76,7 +80,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Override that allows spraying without lockout_threshold. Use only when password_policy cannot be retrieved; lockouts are likely."
                     }
                 },
-                "required": ["target", "password", "domain"]
+                "required": ["target", "domain"]
             }),
         },
         ToolDefinition {

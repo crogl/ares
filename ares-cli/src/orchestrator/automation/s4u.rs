@@ -99,15 +99,23 @@ pub async fn auto_s4u_exploitation(
                             // Don't increment failure count beyond what dispatch already counted.
                             // The cooldown timer is already set from dispatch time.
                         }
-                    } else {
-                        // Success or non-revocation error — reset failure count so
-                        // subsequent dispatches aren't permanently blocked by the
-                        // S4U_MAX_FAILURES threshold.
+                    } else if should_reset_failure_count(result) {
+                        // Only reset the failure count on actual success.
+                        // Generic failures (wrong SPN, delegation edge is
+                        // stale, service rejects S4U, etc.) must keep their
+                        // accumulated count so deterministic dead-ends
+                        // eventually stop retrying.
                         if let Some(vid) = task_vuln_map.remove(&tid) {
                             if let Some(entry) = dispatch_tracker.get_mut(&vid) {
                                 entry.1 = 0;
                             }
                         }
+                    } else {
+                        // Non-lockout, non-success failure: preserve the
+                        // existing failure count that was incremented on
+                        // dispatch. Remove the task mapping so future result
+                        // scans do not reprocess it.
+                        task_vuln_map.remove(&tid);
                     }
                 }
             }
@@ -362,6 +370,11 @@ fn has_lockout_error(result: &ares_core::models::TaskResult) -> bool {
     result_matches_patterns(result, LOCKOUT_PATTERNS)
 }
 
+/// Only a successful S4U task should clear the accumulated failure count.
+fn should_reset_failure_count(result: &ares_core::models::TaskResult) -> bool {
+    result.success
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -561,5 +574,29 @@ mod tests {
             None,
         );
         assert!(!has_lockout_error(&tr));
+    }
+
+    #[test]
+    fn successful_task_resets_failure_count() {
+        let tr = TaskResult {
+            task_id: "t-ok".to_string(),
+            success: true,
+            result: Some(json!({"summary": "ticket obtained"})),
+            error: None,
+            completed_at: Utc::now(),
+        };
+        assert!(should_reset_failure_count(&tr));
+    }
+
+    #[test]
+    fn generic_failure_does_not_reset_failure_count() {
+        let tr = TaskResult {
+            task_id: "t-fail".to_string(),
+            success: false,
+            result: Some(json!({"summary": "S4U failed: KRB_AP_ERR_MODIFIED"})),
+            error: None,
+            completed_at: Utc::now(),
+        };
+        assert!(!should_reset_failure_count(&tr));
     }
 }

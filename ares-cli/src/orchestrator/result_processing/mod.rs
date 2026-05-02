@@ -523,19 +523,33 @@ async fn extract_from_raw_text(
     // Structured discoveries from tool-call parsers are already handled by
     // extract_discoveries() via the "discoveries" key — this pass is a secondary
     // safety net for raw tool stdout that parsers may have missed.
-    let mut text_parts: Vec<&str> = Vec::new();
+    // Each item is either an object {name, arguments, output} (preferred — see
+    // `dispatcher::submission`) or a bare string (legacy / blue-team paths).
+    // Bare strings carry no tool context, so extractors fall back to untyped
+    // behavior; the structured form lets extractors gate on tool name + args
+    // (e.g. skip credential regex for hash-auth invocations of nxc).
+    let mut tool_outputs: Vec<output_extraction::ToolOutputCtx> = Vec::new();
 
     if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
         for item in arr {
             if let Some(s) = item.as_str() {
-                text_parts.push(s);
-            } else if let Some(s) = item.get("output").and_then(|v| v.as_str()) {
-                text_parts.push(s);
+                tool_outputs.push(output_extraction::ToolOutputCtx {
+                    arguments: None,
+                    output: s,
+                });
+            } else if let Some(obj) = item.as_object() {
+                let Some(s) = obj.get("output").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                tool_outputs.push(output_extraction::ToolOutputCtx {
+                    arguments: obj.get("arguments"),
+                    output: s,
+                });
             }
         }
     }
 
-    if text_parts.is_empty() {
+    if tool_outputs.is_empty() {
         return;
     }
 
@@ -544,8 +558,8 @@ async fn extract_from_raw_text(
     // context across unrelated tool calls — a joined string caused false
     // credential attribution (e.g. john.smith:Summer2025 from stale context).
     let mut extracted = output_extraction::TextExtractions::default();
-    for part in &text_parts {
-        let partial = output_extraction::extract_from_output_text(part, default_domain);
+    for ctx in &tool_outputs {
+        let partial = output_extraction::extract_from_output_text(ctx, default_domain);
         extracted.credentials.extend(partial.credentials);
         extracted.hashes.extend(partial.hashes);
         extracted.hosts.extend(partial.hosts);
@@ -646,9 +660,9 @@ async fn extract_from_raw_text(
     // immediate high-priority secretsdump.
     // Check each tool output independently (joining is safe here — Pwn3d! is a
     // standalone marker with no stateful context to leak).
-    for part in &text_parts {
-        if part.contains("Pwn3d!") {
-            detect_and_upgrade_admin_credentials(part, dispatcher).await;
+    for ctx in &tool_outputs {
+        if ctx.output.contains("Pwn3d!") {
+            detect_and_upgrade_admin_credentials(ctx.output, dispatcher).await;
         }
     }
 

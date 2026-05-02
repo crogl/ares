@@ -257,7 +257,13 @@ fn credaccess_low_hanging_fruit_with_creds() {
     assert!(prompt.contains("LOW HANGING FRUIT credential harvesting"));
     assert!(prompt.contains("gpp_password_finder"));
     assert!(prompt.contains("sysvol_script_search"));
-    assert!(prompt.contains("P@ss1"));
+    // Worker auto-resolves credentials at dispatch — the password value must
+    // never appear in the LLM-facing prompt.
+    assert!(
+        !prompt.contains("P@ss1"),
+        "password value leaked into prompt:\n{prompt}"
+    );
+    assert!(prompt.contains("auto-resolved at dispatch"));
 }
 
 #[test]
@@ -334,7 +340,14 @@ fn credaccess_technique_enforcement_with_creds() {
     assert!(prompt.contains("secretsdump(target="));
     assert!(prompt.contains("kerberoast(domain="));
     assert!(prompt.contains("laps_dump(target="));
-    assert!(prompt.contains("P@ss1"));
+    // Password must never appear in LLM-facing prompts. The schema strip plus
+    // worker resolver inject the credential at dispatch.
+    assert!(
+        !prompt.contains("P@ss1"),
+        "password value leaked into prompt:\n{prompt}"
+    );
+    assert!(!prompt.contains("password='"));
+    assert!(prompt.contains("Auth: password (auto-resolved at dispatch"));
 }
 
 #[test]
@@ -348,7 +361,12 @@ fn credaccess_technique_enforcement_with_hash() {
     });
     let prompt = generate_task_prompt("credential_access", "t-8", &payload, None).unwrap();
     assert!(prompt.contains("MANDATORY TECHNIQUE EXECUTION"));
-    assert!(prompt.contains("hashes="));
+    // Hash values are auto-resolved by the worker — the prompt must not echo
+    // the hash, and signatures must not include `hashes=` / `nthash=` params.
+    assert!(!prompt.contains("aad3b435b51404eeaad3b435b51404ee"));
+    assert!(!prompt.contains("hashes="));
+    assert!(!prompt.contains("nthash="));
+    assert!(prompt.contains("Auth: nthash (auto-resolved at dispatch"));
     assert!(prompt.contains("secretsdump"));
 }
 
@@ -461,7 +479,12 @@ fn exploit_constrained_delegation_with_state() {
     assert!(prompt.contains("secretsdump_kerberos"));
     assert!(prompt.contains("psexec_kerberos"));
     assert!(prompt.contains("cifs/dc01.contoso.local"));
-    assert!(prompt.contains("SqlPass1"));
+    // Password must never appear in LLM-facing prompts — auto-resolved at dispatch.
+    assert!(
+        !prompt.contains("SqlPass1"),
+        "password value leaked into prompt:\n{prompt}"
+    );
+    assert!(!prompt.contains("password='"));
     assert!(prompt.contains("dc01.contoso.local"));
 }
 
@@ -618,7 +641,14 @@ fn exploit_child_to_parent_offers_extra_sid_via_child_krbtgt() {
     // at the parent's Enterprise Admins SID (RID 519).
     assert!(prompt.contains("INTRA-FOREST CHILD→PARENT"));
     assert!(prompt.contains("generate_golden_ticket"));
-    assert!(prompt.contains("8c6d94541dbc90f085e86828428d2cbf"));
+    // krbtgt hash value must never appear — auto-resolved by the worker at dispatch.
+    assert!(
+        !prompt.contains("8c6d94541dbc90f085e86828428d2cbf"),
+        "krbtgt hash leaked into prompt:\n{prompt}"
+    );
+    assert!(!prompt.contains("krbtgt_hash='"));
+    // Domain SIDs are non-secret identifiers and CAN appear; ExtraSid still
+    // shows the RID-519 form so the LLM understands what to compute.
     assert!(prompt.contains("S-1-5-21-4444-5555-6666-519"));
     // Followed by secretsdump_kerberos on the parent DC.
     assert!(prompt.contains("secretsdump_kerberos"));

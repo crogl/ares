@@ -128,7 +128,7 @@ pub async fn run_agent_loop(
     let mut tool_calls_dispatched: u32 = 0;
     let mut all_discoveries: Vec<serde_json::Value> = Vec::new();
     let mut all_llm_findings: Vec<serde_json::Value> = Vec::new();
-    let mut all_tool_outputs: Vec<String> = Vec::new();
+    let mut all_tool_outputs: Vec<crate::ToolOutput> = Vec::new();
 
     // Dynamic tool filtering: track unavailable tools and per-tool call counts
     // to prevent infinite retry loops on missing binaries and runaway tool calls.
@@ -410,8 +410,17 @@ pub async fn run_agent_loop(
 
                     let output =
                         truncate_tool_output(&dr.output, config.context.max_tool_output_chars);
-                    // Collect raw tool output for secondary regex extraction
-                    all_tool_outputs.push(dr.output.clone());
+                    // Collect raw tool output (with tool name + args) for secondary
+                    // regex extraction. Tool-aware extractors use the args to skip
+                    // patterns that would misclassify echoed inputs (e.g. nxc -H
+                    // echoes the hash on the same `[+] DOMAIN\user:secret` line that
+                    // password-auth would emit, so the secret must not be ingested
+                    // as a credential when args carry hash flags).
+                    all_tool_outputs.push(crate::ToolOutput {
+                        name: call.name.clone(),
+                        arguments: call.arguments.clone(),
+                        output: dr.output.clone(),
+                    });
                     let tr = ChatMessage::tool_result(&call.id, &output);
                     if session_log.enabled() {
                         session_log.record_message(steps, &tr);
@@ -767,7 +776,7 @@ fn finish(
     tool_calls_dispatched: u32,
     discoveries: Vec<serde_json::Value>,
     llm_findings: Vec<serde_json::Value>,
-    tool_outputs: Vec<String>,
+    tool_outputs: Vec<crate::ToolOutput>,
 ) -> AgentLoopOutcome {
     if session_log.enabled() {
         let (label, detail) = describe_reason(&reason);

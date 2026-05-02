@@ -64,7 +64,13 @@ impl ToolOutput {
 /// Dispatch a tool call by name, executing the corresponding CLI command.
 ///
 /// Returns the tool output or an error if the tool is unknown or execution fails.
+///
+/// Validates that no credential argument carries a placeholder value before
+/// dispatching — a defense-in-depth backstop for the worker credential
+/// resolver that catches anything missed upstream (schema strip, prompt
+/// sanitization, worker resolver). See [`credentials::validate_arguments`].
 pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> {
+    credentials::validate_arguments(tool_name, arguments)?;
     match tool_name {
         // ── Reconnaissance ──────────────────────────────────────────
         "nmap_scan" => recon::nmap_scan(arguments).await,

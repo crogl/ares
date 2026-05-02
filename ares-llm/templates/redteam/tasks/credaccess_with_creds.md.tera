@@ -4,7 +4,7 @@ Domain: {{ domain }}
 DC IP: {{ dc_ip_display }}
 Targets: {{ targets_display }}
 Username: {{ user_display }}
-Credential: {{ cred_display }}
+Auth: {{ cred_capability }} (auto-resolved at dispatch — do NOT pass password/hash/ticket fields)
 Task ID: {{ task_id }}
 
 **CRITICAL: YOU MUST EXECUTE THESE TECHNIQUES IN ORDER:**

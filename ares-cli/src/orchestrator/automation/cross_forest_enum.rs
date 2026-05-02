@@ -41,6 +41,14 @@ fn cross_forest_dedup_key(domain: &str, username: &str, cred_domain: &str) -> St
     )
 }
 
+fn bind_domain_for_cross_forest(cred_domain: &str, target_domain: &str) -> Option<String> {
+    if cred_domain.trim().is_empty() || cred_domain.eq_ignore_ascii_case(target_domain) {
+        None
+    } else {
+        Some(cred_domain.to_string())
+    }
+}
+
 /// Collect cross-forest enumeration work items from the current state.
 ///
 /// Returns an empty vec when there are fewer than 2 domains, no credentials,
@@ -154,7 +162,7 @@ pub async fn auto_cross_forest_enum(
 
         for item in work {
             // Dispatch user enumeration
-            let user_payload = json!({
+            let mut user_payload = json!({
                 "technique": "ldap_user_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -185,6 +193,11 @@ pub async fn auto_cross_forest_enum(
                     "vuln_type='asrep_roastable', and users with SPNs as vuln_type='kerberoastable'."
                 ),
             });
+            if let Some(bind_domain) =
+                bind_domain_for_cross_forest(&item.credential.domain, &item.domain)
+            {
+                user_payload["bind_domain"] = json!(bind_domain);
+            }
 
             let priority = dispatcher.effective_priority("cross_forest_enum");
             match dispatcher
@@ -213,7 +226,7 @@ pub async fn auto_cross_forest_enum(
             }
 
             // Also dispatch group enumeration for the same domain
-            let group_payload = json!({
+            let mut group_payload = json!({
                 "technique": "ldap_group_enumeration",
                 "target_ip": item.dc_ip,
                 "domain": item.domain,
@@ -241,6 +254,11 @@ pub async fn auto_cross_forest_enum(
                     "\"source\": \"ldap_group_enumeration\", \"memberOf\": [\"Group1\", \"Group2\"]}"
                 ),
             });
+            if let Some(bind_domain) =
+                bind_domain_for_cross_forest(&item.credential.domain, &item.domain)
+            {
+                group_payload["bind_domain"] = json!(bind_domain);
+            }
 
             let group_priority = dispatcher.effective_priority("group_enumeration");
             if let Ok(Some(task_id)) = dispatcher
@@ -322,6 +340,27 @@ mod tests {
     #[test]
     fn dedup_set_name() {
         assert_eq!(DEDUP_CROSS_FOREST_ENUM, "cross_forest_enum");
+    }
+
+    #[test]
+    fn bind_domain_added_for_foreign_forest() {
+        assert_eq!(
+            bind_domain_for_cross_forest("contoso.local", "fabrikam.local"),
+            Some("contoso.local".to_string())
+        );
+    }
+
+    #[test]
+    fn bind_domain_omitted_for_same_domain() {
+        assert_eq!(
+            bind_domain_for_cross_forest("contoso.local", "contoso.local"),
+            None
+        );
+    }
+
+    #[test]
+    fn bind_domain_omitted_when_credential_domain_empty() {
+        assert_eq!(bind_domain_for_cross_forest("", "fabrikam.local"), None);
     }
 
     #[test]

@@ -248,9 +248,35 @@ pub(crate) async fn check_golden_ticket_completion(
     if let Some(d) = payload.get("domain").and_then(|v| v.as_str()) {
         domain = d.to_string();
     }
-    if domain.is_empty() {
+    // Require a krbtgt hash to actually exist for the chosen domain before
+    // marking GT — `Saving ticket in *.ccache` also appears in inter-realm
+    // forge output where no target krbtgt was ever obtained, so without this
+    // gate we'd publish a false-positive GT for the source/first domain.
+    {
         let state = dispatcher.state.read().await;
-        domain = state.domains.first().cloned().unwrap_or_default();
+        let has_krbtgt = |d: &str| -> bool {
+            let lower = d.to_lowercase();
+            state.hashes.iter().any(|h| {
+                h.username.eq_ignore_ascii_case("krbtgt") && h.domain.to_lowercase() == lower
+            })
+        };
+        if domain.is_empty() {
+            domain = state
+                .domains
+                .iter()
+                .find(|d| has_krbtgt(d))
+                .cloned()
+                .unwrap_or_default();
+        } else if !has_krbtgt(&domain) {
+            warn!(
+                domain = %domain,
+                "Suppressing golden_ticket marker — no krbtgt hash present for domain (likely inter-realm forge output)"
+            );
+            return;
+        }
+    }
+    if domain.is_empty() {
+        return;
     }
     if let Err(e) = dispatcher
         .state

@@ -504,6 +504,91 @@ impl TrustInfo {
     }
 }
 
+/// Strength of evidence that a candidate string is a real AD domain.
+///
+/// Production AD discovery tools (BloodHound, NetExec, runZero) never trust a
+/// hostname suffix alone — they require positive AD evidence (DC self-report,
+/// authenticated bind, SRV record) before promoting a string to "authoritative
+/// domain." This enum lets us tag the source of each candidate so the promotion
+/// rules can stay consistent across discovery paths.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DomainEvidence {
+    /// Configured in the operation target — authoritative starting point.
+    TargetConfig,
+    /// A DC self-reported the domain name (CLDAP NetLogon `DnsDomainName`,
+    /// Kerberos AS-REP `crealm`, anonymous LDAP RootDSE `defaultNamingContext`).
+    DcSelfReport,
+    /// Captured from authenticated AD enumeration — successful LDAP bind,
+    /// secretsdump, SMB session info from a verified auth.
+    AuthenticatedAd,
+    /// DNS SRV record `_ldap._tcp.dc._msdcs.<domain>` resolves.
+    DnsSrv,
+    /// Inferred from a host FQDN suffix (e.g. `srv01.contoso.local` →
+    /// `contoso.local`). Lowest tier — must be corroborated before promotion.
+    HostnameInference,
+}
+
+impl DomainEvidence {
+    /// Whether this evidence is sufficient to promote a candidate to
+    /// authoritative state without further corroboration.
+    pub fn is_authoritative(self) -> bool {
+        matches!(
+            self,
+            Self::TargetConfig | Self::DcSelfReport | Self::AuthenticatedAd | Self::DnsSrv
+        )
+    }
+}
+
+/// A domain name discovered during an operation, with provenance.
+///
+/// Held in `state.candidate_domains` until either (a) the evidence is
+/// authoritative on its own, (b) a probe (DNS SRV / CLDAP) corroborates it,
+/// or (c) it matches a domain already promoted via another path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateDomain {
+    /// Lowercase FQDN.
+    pub fqdn: String,
+    pub evidence: DomainEvidence,
+    /// IP of the host that produced this candidate (when applicable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host_ip: Option<String>,
+    pub discovered_at: DateTime<Utc>,
+    /// Set once a probe has run. `confirmed = false` after probing means the
+    /// probe rejected it; we keep the record so we don't re-probe.
+    #[serde(default)]
+    pub probed: bool,
+    #[serde(default)]
+    pub confirmed: bool,
+    /// Timestamp of the most recent probe attempt. Used to retry transient
+    /// probe failures without hammering DNS every loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_probed_at: Option<DateTime<Utc>>,
+    /// Count of transient probe attempts. Useful for visibility/backoff.
+    #[serde(default)]
+    pub probe_failures: u32,
+}
+
+impl CandidateDomain {
+    pub fn new(fqdn: impl Into<String>, evidence: DomainEvidence) -> Self {
+        Self {
+            fqdn: fqdn.into().to_lowercase(),
+            evidence,
+            source_host_ip: None,
+            discovered_at: Utc::now(),
+            probed: false,
+            confirmed: evidence.is_authoritative(),
+            last_probed_at: None,
+            probe_failures: 0,
+        }
+    }
+
+    pub fn with_source(mut self, ip: impl Into<String>) -> Self {
+        self.source_host_ip = Some(ip.into());
+        self
+    }
+}
+
 /// Discovered SMB share.
 ///
 /// Matches Python: `class Share(Model)`
@@ -516,4 +601,36 @@ pub struct Share {
     pub permissions: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+}
+
+/// A forged Kerberos inter-realm ticket produced by `create_inter_realm_ticket`.
+///
+/// Stored in Redis (`ares:op:{id}:kerberos_tickets` HASH keyed by
+/// `{source_domain}:{target_domain}:{username}`) so downstream tools can pick
+/// up the ccache path when no NTLM bind works for the target forest.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct KerberosTicket {
+    /// The domain whose krbtgt trust key was used to forge (source forest).
+    pub source_domain: String,
+    /// The foreign forest the ticket is valid for.
+    pub target_domain: String,
+    /// Username encoded in the ticket (typically `Administrator`).
+    pub username: String,
+    /// Absolute path to the `.ccache` file on the worker filesystem.
+    pub ticket_path: String,
+    /// When the ticket was forged (UTC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forged_at: Option<DateTime<Utc>>,
+}
+
+impl KerberosTicket {
+    /// Redis HASH field key: `{source}:{target}:{username}`.
+    pub fn dedup_key(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            self.source_domain.to_lowercase(),
+            self.target_domain.to_lowercase(),
+            self.username.to_lowercase()
+        )
+    }
 }

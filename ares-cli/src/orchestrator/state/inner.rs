@@ -25,6 +25,10 @@ pub struct StateInner {
     pub users: Vec<User>,
     pub shares: Vec<Share>,
     pub domains: Vec<String>,
+    /// Domains discovered with evidence weaker than authoritative (typically
+    /// inferred from a host FQDN). Held here until the probe confirms or a
+    /// stronger source promotes them. Keyed by lowercase FQDN.
+    pub candidate_domains: HashMap<String, CandidateDomain>,
 
     // Vulnerability tracking
     pub discovered_vulnerabilities: HashMap<String, VulnerabilityInfo>,
@@ -69,6 +73,16 @@ pub struct StateInner {
     // KDC_ERR_CLIENT_REVOKED are quarantined to avoid burning auth budget.
     pub quarantined_credentials: HashMap<String, DateTime<Utc>>,
 
+    // Per-trust counter: how many times the cross-forest forge dispatch
+    // has been deferred waiting for the AES256 trust key to upsert.
+    // secretsdump runs twice (NTLM-only first, then AES-equipped) and
+    // Win2016+ targets reject RC4-only inter-realm tickets. Bound this
+    // so we don't defer indefinitely if AES never arrives.
+    pub forge_aes_defers: HashMap<String, u32>,
+
+    // Forged inter-realm Kerberos tickets (source→target forest, cached path)
+    pub kerberos_tickets: Vec<ares_core::models::KerberosTicket>,
+
     // Completion flag (set externally to signal operation should wrap up)
     pub completed: bool,
 
@@ -94,6 +108,7 @@ impl StateInner {
             users: Vec::new(),
             shares: Vec::new(),
             domains: Vec::new(),
+            candidate_domains: HashMap::new(),
             discovered_vulnerabilities: HashMap::new(),
             exploited_vulnerabilities: HashSet::new(),
             domain_controllers: HashMap::new(),
@@ -112,6 +127,8 @@ impl StateInner {
             pending_tasks: HashMap::new(),
             completed_tasks: HashMap::new(),
             quarantined_credentials: HashMap::new(),
+            forge_aes_defers: HashMap::new(),
+            kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,
         }
@@ -712,6 +729,7 @@ mod tests {
             DEDUP_CROSS_FOREST_ENUM,
             DEDUP_CROSS_REALM_LATERAL,
             DEDUP_GOLDEN_CERT,
+            DEDUP_MSSQL_RETRY,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

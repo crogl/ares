@@ -1,3 +1,116 @@
+use anyhow::Result;
+use serde_json::Value;
+
+/// Argument keys that hold secret material. Mirrors `CREDENTIAL_KEYS` in
+/// `ares-cli/src/worker/credential_resolver.rs` — keep in sync.
+///
+/// The LLM must never supply values for these keys; the worker resolver
+/// injects them from operation state and strips placeholders. This list is
+/// used by [`validate_arguments`] to fail dispatch loudly if a placeholder
+/// somehow survives upstream stripping.
+pub const CREDENTIAL_KEYS: &[&str] = &[
+    "password",
+    "hash",
+    "hashes",
+    "nt_hash",
+    "nthash",
+    "ntlm_hash",
+    "lm_hash",
+    "aes_key",
+    "aesKey",
+    "aes256_key",
+    "ticket_path",
+    "krbtgt_hash",
+    "child_krbtgt_hash",
+    "parent_krbtgt_hash",
+    "trust_key",
+    "trust_aes_key",
+    "trust_hash",
+    "admin_hash",
+    "domain_sid",
+    "source_sid",
+    "target_sid",
+    "extra_sid",
+    "kerberos_keys",
+    "dpapi_key",
+    "pfx_password",
+    "coerce_password",
+    "coerce_hash",
+];
+
+/// Validate that no credential argument carries a placeholder/literal value.
+///
+/// Defense-in-depth backstop for the worker credential resolver. The schema
+/// strip in `ares-llm` keeps credential fields out of LLM tool calls, and
+/// the worker resolver injects real values from operation state and strips
+/// placeholders. If a placeholder still reaches dispatch, something upstream
+/// is wrong — fail loudly rather than send `password='[TGT]'` to a subprocess.
+pub fn validate_arguments(tool_name: &str, arguments: &Value) -> Result<()> {
+    let Some(obj) = arguments.as_object() else {
+        return Ok(());
+    };
+    for &key in CREDENTIAL_KEYS {
+        if let Some(v) = obj.get(key) {
+            if is_placeholder_value(v) {
+                anyhow::bail!(
+                    "tool '{tool_name}' argument '{key}' has placeholder value {v} — \
+                     credentials must be resolved from operation state, not invented \
+                     by the LLM. Check the worker credential resolver and prompt templates."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_placeholder_value(v: &Value) -> bool {
+    match v {
+        Value::Null => true,
+        Value::String(s) => is_placeholder_str(s),
+        _ => false,
+    }
+}
+
+fn is_placeholder_str(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if (t.starts_with('[') && t.ends_with(']')) || (t.starts_with('<') && t.ends_with('>')) {
+        return true;
+    }
+    let lower = t.to_ascii_lowercase();
+    matches!(
+        lower.as_str(),
+        "n/a"
+            | "na"
+            | "null"
+            | "none"
+            | "nil"
+            | "unknown"
+            | "tbd"
+            | "todo"
+            | "password"
+            | "hash"
+            | "ntlm"
+            | "nthash"
+            | "tgt"
+            | "ticket"
+            | "ccache"
+            | "aes"
+            | "aes_key"
+            | "trust_key"
+            | "domain_sid"
+            | "krbtgt_hash"
+            | "placeholder"
+            | "<value>"
+            | "<password>"
+            | "<hash>"
+            | "<tgt>"
+            | "<pwd>"
+    )
+}
+
 /// Build an impacket-style authentication target string.
 ///
 /// Format: `domain/username:password@target` or `username@target` (for hash auth).
@@ -265,5 +378,86 @@ mod tests {
         let (key, val) = kerberos_env("/tmp/krb5cc_admin");
         assert_eq!(key, "KRB5CCNAME");
         assert_eq!(val, "/tmp/krb5cc_admin");
+    }
+
+    #[test]
+    fn validate_arguments_passes_real_credentials() {
+        let args = serde_json::json!({
+            "target": "192.168.58.10",
+            "username": "admin",
+            "password": "P@ssw0rd!",
+            "hash": "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0",
+            "krbtgt_hash": "aad3b435b51404eeaad3b435b51404ee",
+            "ticket_path": "/tmp/admin.ccache",
+            "domain_sid": "S-1-5-21-1234-5678-9012",
+        });
+        validate_arguments("secretsdump", &args).expect("real values must pass");
+    }
+
+    #[test]
+    fn validate_arguments_rejects_bracketed_placeholder() {
+        let args = serde_json::json!({
+            "target": "dc01",
+            "password": "[TGT]",
+        });
+        let err = validate_arguments("nmap_scan", &args).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("password"), "{msg}");
+        assert!(msg.contains("[TGT]"), "{msg}");
+        assert!(msg.contains("nmap_scan"), "{msg}");
+    }
+
+    #[test]
+    fn validate_arguments_rejects_angle_placeholder() {
+        let args = serde_json::json!({
+            "hash": "<parent_administrator_NTLM_hash>",
+        });
+        let err = validate_arguments("generate_golden_ticket", &args).unwrap_err();
+        assert!(err.to_string().contains("hash"));
+    }
+
+    #[test]
+    fn validate_arguments_rejects_n_a_string() {
+        let args = serde_json::json!({"password": "N/A"});
+        assert!(validate_arguments("psexec", &args).is_err());
+    }
+
+    #[test]
+    fn validate_arguments_rejects_null_value() {
+        let args = serde_json::json!({"trust_key": null});
+        assert!(validate_arguments("create_inter_realm_ticket", &args).is_err());
+    }
+
+    #[test]
+    fn validate_arguments_rejects_bare_word_placeholder() {
+        let args = serde_json::json!({"krbtgt_hash": "HASH"});
+        assert!(validate_arguments("generate_golden_ticket", &args).is_err());
+    }
+
+    #[test]
+    fn validate_arguments_rejects_empty_string() {
+        let args = serde_json::json!({"password": ""});
+        assert!(validate_arguments("psexec", &args).is_err());
+    }
+
+    #[test]
+    fn validate_arguments_ignores_non_credential_keys() {
+        let args = serde_json::json!({
+            "target": "<placeholder>",
+            "command": "[whoami]",
+        });
+        validate_arguments("psexec", &args).expect("non-credential keys are not validated");
+    }
+
+    #[test]
+    fn validate_arguments_handles_non_object_arguments() {
+        let args = serde_json::json!("just a string");
+        validate_arguments("any_tool", &args).expect("non-object arguments pass through");
+    }
+
+    #[test]
+    fn validate_arguments_handles_missing_credential_keys() {
+        let args = serde_json::json!({"target": "192.168.58.10"});
+        validate_arguments("nmap_scan", &args).expect("absent keys are not validated");
     }
 }

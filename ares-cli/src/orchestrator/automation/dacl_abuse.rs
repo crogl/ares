@@ -16,6 +16,7 @@ use serde_json::json;
 use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
+use crate::dedup::is_ghost_machine_account;
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
 
@@ -115,7 +116,11 @@ fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             || vtype.contains("writeowner")
             || vtype.contains("genericall")
             || vtype.contains("self_membership")
-            || vtype.contains("write_membership");
+            || vtype.contains("write_membership")
+            || vtype.contains("writeproperty")
+            || vtype.contains("allextendedrights")
+            || vtype.contains("addmember")
+            || vtype.contains("addself");
 
         if !is_acl_vuln {
             continue;
@@ -127,6 +132,22 @@ fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
 
         let dedup_key = format!("dacl:{}", vuln.vuln_id);
         if state.is_processed(DEDUP_DACL_ABUSE, &dedup_key) {
+            continue;
+        }
+
+        let target_name = vuln
+            .details
+            .get("target")
+            .or_else(|| vuln.details.get("target_user"))
+            .or_else(|| vuln.details.get("to"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if is_ghost_machine_account(target_name) {
+            debug!(
+                vuln_id = %vuln.vuln_id,
+                target = %target_name,
+                "Skipping ACL abuse for ghost machine account target"
+            );
             continue;
         }
 
@@ -150,7 +171,12 @@ fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
             continue;
         }
 
-        // Find matching credential
+        // Find matching credential.
+        //
+        // BloodHound often emits ACL edges with SID principals (e.g. for
+        // well-known groups like Enterprise Admins). When `source` is a SID,
+        // resolve to any privileged credential in the source's domain so the
+        // ACL chain can still be exercised.
         let cred = state
             .credentials
             .iter()
@@ -159,7 +185,8 @@ fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
                     && (source_domain.is_empty()
                         || c.domain.to_lowercase() == source_domain.to_lowercase())
             })
-            .cloned();
+            .cloned()
+            .or_else(|| resolve_sid_principal(state, source_user, source_domain));
 
         if let Some(cred) = cred {
             let target_user = vuln
@@ -177,11 +204,22 @@ fn collect_dacl_work(state: &StateInner) -> Vec<DaclWork> {
                 .cloned()
                 .unwrap_or_default();
 
+            // When BloodHound emitted the source as a raw SID and we resolved
+            // it via `resolve_sid_principal`, surface the resolved credential's
+            // SAM account name as `source_user` — not the SID. Tool schemas
+            // require a username for credential injection by `(user, domain)`,
+            // and the LLM otherwise echoes the SID as the auth principal.
+            let dispatched_source_user = if source_user.starts_with("S-1-5-21-") {
+                cred.username.clone()
+            } else {
+                source_user.to_string()
+            };
+
             items.push(DaclWork {
                 dedup_key,
                 vuln_id: vuln.vuln_id.clone(),
                 vuln_type: vtype,
-                source_user: source_user.to_string(),
+                source_user: dispatched_source_user,
                 target_user,
                 domain: cred.domain.clone(),
                 dc_ip,
@@ -202,6 +240,75 @@ struct DaclWork {
     domain: String,
     dc_ip: String,
     credential: ares_core::models::Credential,
+}
+
+/// RIDs of well-known privileged groups whose membership is owned by privileged
+/// credentials in the same domain. Resolving a SID-typed source to "any DA-cred
+/// in this domain" is correct for these RIDs because the abuse only requires
+/// *a* member of the group, not a specific principal.
+fn is_privileged_well_known_rid(rid: u32) -> bool {
+    matches!(
+        rid,
+        512 // Domain Admins
+            | 518 // Schema Admins
+            | 519 // Enterprise Admins
+            | 520 // Group Policy Creator Owners
+            | 526 // Key Admins
+            | 527 // Enterprise Key Admins
+    )
+}
+
+/// When the ACL edge source is a SID (typically a well-known group), resolve
+/// it to a credential of an actual member.
+///
+/// Strategy:
+///   1. Parse `S-1-5-21-X-Y-Z-RID` and extract the domain SID prefix and RID.
+///   2. Reverse-look up the domain via `state.domain_sids` (or fall back to
+///      `source_domain` from the vuln details).
+///   3. For privileged well-known RIDs, return any `is_admin` credential in
+///      that domain. As a last resort, return any credential in the domain.
+fn resolve_sid_principal(
+    state: &StateInner,
+    source: &str,
+    source_domain: &str,
+) -> Option<ares_core::models::Credential> {
+    if !source.starts_with("S-1-5-21-") {
+        return None;
+    }
+    let (prefix, rid_str) = source.rsplit_once('-')?;
+    let rid: u32 = rid_str.parse().ok()?;
+
+    let resolved_domain = state
+        .domain_sids
+        .iter()
+        .find(|(_, sid)| sid.eq_ignore_ascii_case(prefix))
+        .map(|(d, _)| d.to_lowercase())
+        .or_else(|| {
+            if source_domain.is_empty() {
+                None
+            } else {
+                Some(source_domain.to_lowercase())
+            }
+        })?;
+
+    if !is_privileged_well_known_rid(rid) {
+        return None;
+    }
+
+    let admin = state
+        .credentials
+        .iter()
+        .find(|c| c.is_admin && c.domain.to_lowercase() == resolved_domain)
+        .cloned();
+    if admin.is_some() {
+        return admin;
+    }
+
+    state
+        .credentials
+        .iter()
+        .find(|c| c.domain.to_lowercase() == resolved_domain)
+        .cloned()
 }
 
 #[cfg(test)]
@@ -229,6 +336,10 @@ mod tests {
             "GenericAll",
             "self_membership",
             "write_membership",
+            "WriteProperty",
+            "AllExtendedRights",
+            "AddMember",
+            "AddSelf",
             "SomePrefix_forcechangepassword_suffix",
         ];
         for t in &positives {
@@ -239,7 +350,11 @@ mod tests {
                 || vtype.contains("writeowner")
                 || vtype.contains("genericall")
                 || vtype.contains("self_membership")
-                || vtype.contains("write_membership");
+                || vtype.contains("write_membership")
+                || vtype.contains("writeproperty")
+                || vtype.contains("allextendedrights")
+                || vtype.contains("addmember")
+                || vtype.contains("addself");
             assert!(is_acl_vuln, "{t} should match as ACL vuln");
         }
     }
@@ -360,6 +475,11 @@ mod tests {
             .and_then(|v| v.as_str())
             .unwrap_or("");
         assert_eq!(target3, "v3");
+    }
+
+    #[test]
+    fn ghost_machine_targets_rejected() {
+        assert!(is_ghost_machine_account("WIN-DPPJMLU3XS6$"));
     }
 
     #[test]
@@ -657,6 +777,65 @@ mod tests {
         let work = collect_dacl_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].vuln_type, "self_membership");
+    }
+
+    #[tokio::test]
+    async fn collect_sid_source_resolves_via_domain_admin() {
+        // BloodHound emits ACL edges where the source is a SID for a
+        // well-known group (e.g. Enterprise Admins ending in -519). The
+        // resolver should pick any DA-marked credential in the same domain.
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            let mut da = make_credential("admin", "contoso.local");
+            da.is_admin = true;
+            state.credentials.push(da);
+            state.domain_sids.insert(
+                "contoso.local".to_string(),
+                "S-1-5-21-111-222-333".to_string(),
+            );
+            let details = acl_details("S-1-5-21-111-222-333-519", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-sid-001", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].credential.username, "admin");
+        assert_eq!(work[0].vuln_type, "genericall");
+        // source_user must be the resolved cred's SAM, not the raw SID — the
+        // credential_resolver looks up password by `(username, domain)`, and
+        // a SID never matches a credential record.
+        assert_eq!(work[0].source_user, "admin");
+    }
+
+    #[tokio::test]
+    async fn collect_sid_source_non_privileged_rid_skipped() {
+        // Only well-known privileged RIDs are auto-resolved; an arbitrary
+        // user SID (RID >= 1000) requires an exact match.
+        let shared = SharedState::new("test".into());
+        {
+            let mut state = shared.write().await;
+            let mut da = make_credential("admin", "contoso.local");
+            da.is_admin = true;
+            state.credentials.push(da);
+            state.domain_sids.insert(
+                "contoso.local".to_string(),
+                "S-1-5-21-111-222-333".to_string(),
+            );
+            let details = acl_details("S-1-5-21-111-222-333-1105", "victim", "contoso.local");
+            let vuln = make_vuln("vuln-sid-002", "GenericAll", details);
+            state
+                .discovered_vulnerabilities
+                .insert(vuln.vuln_id.clone(), vuln);
+        }
+
+        let state = shared.read().await;
+        let work = collect_dacl_work(&state);
+        assert!(work.is_empty());
     }
 
     #[tokio::test]

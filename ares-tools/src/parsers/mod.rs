@@ -283,12 +283,15 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             }
         }
         "password_policy" => {
-            // Extract password policy details as a vulnerability/info finding.
-            // netexec smb --pass-pol output includes lockout threshold, min length, etc.
+            // Password policy is informational metadata, not an exploitable vuln —
+            // surfacing it as `vulnerabilities[]` makes the orchestrator route it to
+            // the exploit agent, which has no spray tool and dead-ends every time.
+            // The lockout/min-length details inform spray cadence elsewhere; we
+            // expose them under a dedicated key so consumers can read without the
+            // exploit-routing side effect.
             let domain = params.get("domain").and_then(|v| v.as_str()).unwrap_or("");
             let target = params.get("target").and_then(|v| v.as_str()).unwrap_or("");
             if !output.is_empty() && !domain.is_empty() {
-                // Parse lockout threshold from the output
                 let lockout_threshold = output
                     .lines()
                     .find(|l| l.to_lowercase().contains("account lockout threshold"))
@@ -306,16 +309,7 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
                 if let Some(ref ml) = min_length {
                     details.insert("min_password_length".into(), json!(ml));
                 }
-                details.insert(
-                    "description".into(),
-                    json!(format!("Password policy enumerated for {domain}")),
-                );
-                discoveries["vulnerabilities"] = json!([{
-                    "vuln_id": format!("password_policy_{}", domain.replace('.', "_")),
-                    "vuln_type": "password_policy",
-                    "target": target,
-                    "details": details,
-                }]);
+                discoveries["password_policies"] = json!([details]);
             }
         }
         "evil_winrm" => {

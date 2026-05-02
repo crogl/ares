@@ -44,12 +44,16 @@ pub(crate) fn generate_recon_prompt(
         ctx.insert("instructions", instructions);
     }
 
-    // NTLM hash for pass-the-hash authentication
-    if let Some(ntlm_hash) = payload["ntlm_hash"].as_str() {
-        ctx.insert("ntlm_hash", ntlm_hash);
-    }
+    // Surface the principal that owns a usable NTLM hash so the LLM can
+    // reference it by name. The hash value itself is never inserted — the
+    // worker injects the hash at dispatch from operation state.
     if let Some(hash_username) = payload["hash_username"].as_str() {
-        ctx.insert("hash_username", hash_username);
+        if !hash_username.is_empty() {
+            ctx.insert("hash_username", hash_username);
+            ctx.insert("has_ntlm_hash", &true);
+        }
+    } else if payload["ntlm_hash"].as_str().is_some() {
+        ctx.insert("has_ntlm_hash", &true);
     }
 
     insert_state_context(&mut ctx, state, "recon", payload["target_ip"].as_str());

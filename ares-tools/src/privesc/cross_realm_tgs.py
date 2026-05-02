@@ -30,6 +30,11 @@ def main() -> int:
     p.add_argument("--source-realm", required=True, help="realm where the TGT was issued")
     p.add_argument("--target-realm", required=True, help="realm of the SPN")
     p.add_argument("--target-kdc", required=True, help="target realm KDC IP/host to send TGS-REQ to")
+    p.add_argument(
+        "--append",
+        action="store_true",
+        help="if --out-ccache exists, load it and merge the new TGS into it (preserves the inter-realm TGT and any prior service tickets)",
+    )
     args = p.parse_args()
 
     src_realm = args.source_realm.upper()
@@ -65,9 +70,20 @@ def main() -> int:
         tgt["sessionKey"],
     )
 
-    out = CCache()
-    out.fromTGS(tgs, tgt_session_key, new_session_key)
-    out.saveFile(args.out_ccache)
+    import os
+    if args.append and os.path.exists(args.out_ccache):
+        out = CCache.loadFile(args.out_ccache) or CCache()
+        scratch = CCache()
+        scratch.fromTGS(tgs, tgt_session_key, new_session_key)
+        for cred in scratch.credentials:
+            out.credentials.append(cred)
+        if out.principal is None and scratch.principal is not None:
+            out.principal = scratch.principal
+        out.saveFile(args.out_ccache)
+    else:
+        out = CCache()
+        out.fromTGS(tgs, tgt_session_key, new_session_key)
+        out.saveFile(args.out_ccache)
     print(f"[+] wrote TGS to {args.out_ccache}", file=sys.stderr)
     return 0
 

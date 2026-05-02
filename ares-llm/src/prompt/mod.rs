@@ -75,6 +75,7 @@ pub fn generate_task_prompt(
             privesc::generate_privesc_enumeration_prompt(task_id, payload, state)
         }
         "acl_analysis" => acl::generate_acl_analysis_prompt(task_id, payload, state),
+        "acl_chain_step" => acl::generate_acl_chain_step_prompt(task_id, payload, state),
         "command" => command::generate_command_prompt(task_id, payload),
         _ => return None,
     };

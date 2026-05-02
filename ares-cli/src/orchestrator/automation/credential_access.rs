@@ -516,6 +516,7 @@ pub async fn auto_credential_access(
                 "target_ip": dc_ip,
                 "domain": domain,
                 "use_common_passwords": true,
+                "acknowledge_no_policy": true,
             });
 
             // Mark as processed BEFORE submitting to prevent duplicate deferred entries.

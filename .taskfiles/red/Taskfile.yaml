@@ -883,6 +883,7 @@ tasks:
               -e "s|__DREADNODE_PROJECT__|{{.DREADNODE_PROJECT}}|" \
               -e "s|__GRAFANA_TOKEN__|${GRAFANA_SERVICE_ACCOUNT_TOKEN:-}|" \
               -e "s|__GRAFANA_URL__|{{.GRAFANA_URL}}|" \
+              -e "s|__LOKI_URL__|{{.LOKI_URL}}|" \
               -e "s|__ARES_LLM_MODEL__|{{.MODEL}}|" \
               -e "s|__ARES_BLUE_ENABLED__|{{.BLUE_ENABLED}}|" \
               -e "s|__ARES_BLUE_LLM_MODEL__|{{.BLUE_LLM_MODEL}}|" \

@@ -7,7 +7,7 @@
 use std::sync::{Arc, OnceLock};
 
 use anyhow::Result;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use ares_llm::prompt::templates;
 use ares_llm::prompt::StateSnapshot;
@@ -31,6 +31,9 @@ pub struct LlmTaskRunner {
     /// Sorted technique priorities from strategy (technique, weight).
     /// Passed to the system prompt template to render a dynamic priority table.
     technique_priorities: Vec<(String, i32)>,
+    /// Orchestrator's relay/listener IP. Surfaced to the LLM in the system
+    /// prompt so it doesn't hallucinate a subnet-gateway IP for coercion args.
+    listener_ip: Option<String>,
     /// Deferred callback handler — set after construction to break the
     /// `LlmTaskRunner → Dispatcher → LlmTaskRunner` circular dependency.
     callback_handler: OnceLock<Arc<dyn CallbackHandler>>,
@@ -44,6 +47,7 @@ impl LlmTaskRunner {
         state: SharedState,
         temperature: Option<f32>,
         technique_priorities: Vec<(String, i32)>,
+        listener_ip: Option<String>,
     ) -> Self {
         // Layer env-var overrides (ARES_AGENT_*, ARES_CONTEXT_*, ARES_BUDGET_*,
         // ARES_SESSION_LOG_*) on top of compiled defaults so operators can
@@ -55,6 +59,7 @@ impl LlmTaskRunner {
             state,
             config,
             technique_priorities,
+            listener_ip,
             callback_handler: OnceLock::new(),
         }
     }
@@ -91,7 +96,12 @@ impl LlmTaskRunner {
         let snapshot = self.state.snapshot().await;
 
         // 2. Build system prompt from agent template
-        let system_prompt = build_system_prompt(role, &snapshot, &self.technique_priorities)?;
+        let system_prompt = build_system_prompt(
+            role,
+            &snapshot,
+            &self.technique_priorities,
+            self.listener_ip.as_deref(),
+        )?;
 
         // 3. Build task prompt from Tera template + payload
         let task_prompt = build_task_prompt(task_type, task_id, payload, &snapshot)?;
@@ -162,6 +172,7 @@ fn build_system_prompt(
     role: AgentRole,
     snapshot: &StateSnapshot,
     technique_priorities: &[(String, i32)],
+    listener_ip: Option<&str>,
 ) -> Result<String> {
     // Get capabilities from the tool definitions for this role
     let tools = tool_registry::tools_for_role(role);
@@ -188,7 +199,7 @@ fn build_system_prompt(
     } else {
         Some(technique_priorities)
     };
-    let system_instructions = templates::render_system_instructions(None, priorities)?;
+    let system_instructions = templates::render_system_instructions(None, priorities, listener_ip)?;
 
     // Render agent-specific instructions
     let agent_instructions = templates::render_agent_instructions(
@@ -273,10 +284,10 @@ fn log_outcome(task_id: &str, outcome: &AgentLoopOutcome) {
             );
         }
         LoopEndReason::EndTurn { content } => {
-            debug!(
+            warn!(
                 task_id = task_id,
                 steps = outcome.steps,
-                "LLM agent ended turn: {content}"
+                "LLM agent ended turn without task_complete: {content}"
             );
         }
         LoopEndReason::MaxTokens => {
@@ -379,7 +390,7 @@ mod tests {
             AgentRole::Coercion,
             AgentRole::Orchestrator,
         ] {
-            let result = build_system_prompt(*role, &snapshot, &[]);
+            let result = build_system_prompt(*role, &snapshot, &[], None);
             assert!(result.is_ok(), "Failed for role: {:?}", role);
             let prompt = result.unwrap();
             assert!(!prompt.is_empty(), "Empty prompt for role: {:?}", role);

@@ -3,7 +3,7 @@
 use anyhow::Result;
 use redis::AsyncCommands;
 
-use ares_core::models::Host;
+use ares_core::models::{DomainEvidence, Host};
 use ares_core::state::{self, RedisStateReader};
 
 use redis::aio::ConnectionLike;
@@ -11,15 +11,16 @@ use redis::aio::ConnectionLike;
 use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueueCore;
 
-use super::{is_aws_hostname, strip_netexec_artifact};
+use super::{looks_like_real_domain, strip_netexec_artifact};
 
 impl SharedState {
     /// Add a host to state and Redis.
     ///
     /// Merges data when a host with the same IP already exists: upgrades DC
-    /// status, fills in hostname, and keeps the richer service list.
-    /// AWS internal hostnames (e.g. `ip-10-1-2-150.us-west-2.compute.internal`)
-    /// are stripped to allow real AD FQDNs to take precedence.
+    /// status, fills in hostname, and keeps the richer service list. Hostnames
+    /// that can't be a real AD FQDN — cloud PTRs, default-OS auto-names,
+    /// mDNS, bare TLDs — are cleared via `looks_like_real_domain` so a real
+    /// FQDN can take precedence later.
     ///
     /// When the hostname is a valid AD FQDN (e.g. `dc01.contoso.local`), the
     /// domain suffix is automatically extracted and added to `state.domains`
@@ -29,45 +30,35 @@ impl SharedState {
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         host: Host,
     ) -> Result<bool> {
-        // Normalize hostname: strip trailing artifacts and AWS internal names.
         // NetExec sometimes appends "0." to domain names (e.g.
-        // "dc01.contoso.local0." → "dc01.contoso.local"). Strip both forms.
+        // "dc01.contoso.local0." → "dc01.contoso.local"). Strip that, then
+        // drop any multi-label hostname that fails the unified shape filter.
         let mut host = host;
         host.hostname = strip_netexec_artifact(&host.hostname).to_lowercase();
-        if is_aws_hostname(&host.hostname) {
+        if host.hostname.contains('.') && !looks_like_real_domain(&host.hostname) {
             host.hostname = String::new();
         }
 
-        // Auto-extract domain from FQDN hostname (matches Python add_host)
-        // e.g. "dc02.child.contoso.local" → "child.contoso.local"
-        if !host.hostname.is_empty()
-            && host.hostname.contains('.')
-            && !is_aws_hostname(&host.hostname)
-        {
+        // Auto-extract domain from FQDN hostname (matches Python add_host).
+        // e.g. "dc02.child.contoso.local" → "child.contoso.local". Routed
+        // through the candidate-domain pipeline: a hostname split alone is
+        // weak evidence and won't reach `state.domains` unless a stronger
+        // source (target config, DC self-report, probe) confirms it.
+        if looks_like_real_domain(&host.hostname) {
             let hostname_clean = host.hostname.trim_end_matches('.');
             let parts: Vec<&str> = hostname_clean.split('.').collect();
             if parts.len() >= 3 {
                 let domain = parts[1..].join(".").to_lowercase();
-                // Reject AWS/cloud domains
-                if !domain.contains("compute.internal") && !domain.contains("amazonaws.com") {
-                    let op_id = self.inner.read().await.operation_id.clone();
-                    let mut state = self.inner.write().await;
-                    if !state.domains.contains(&domain) {
-                        state.domains.push(domain.clone());
-                        let domain_key =
-                            format!("{}:{}:{}", state::KEY_PREFIX, op_id, state::KEY_DOMAINS,);
-                        let mut conn = queue.connection();
-                        let _: Result<(), _> =
-                            redis::AsyncCommands::sadd(&mut conn, &domain_key, &domain).await;
-                        let _: Result<(), _> =
-                            redis::AsyncCommands::expire(&mut conn, &domain_key, 86400i64).await;
-                        tracing::info!(
-                            hostname = %host.hostname,
-                            domain = %domain,
-                            "Auto-extracted domain from host FQDN"
-                        );
-                    }
-                }
+                // A DC FQDN is the DC self-reporting its own domain — strong
+                // enough to bypass the candidate hold.
+                let evidence = if host.is_dc || host.detect_dc() {
+                    DomainEvidence::DcSelfReport
+                } else {
+                    DomainEvidence::HostnameInference
+                };
+                let _ = self
+                    .publish_candidate_domain(queue, &domain, evidence, Some(host.ip.clone()))
+                    .await;
 
                 // Auto-populate netbios_to_fqdn map so CLI can resolve short names.
                 // e.g. "dc02.child.contoso.local" → DC02 → dc02.child.contoso.local
@@ -111,8 +102,9 @@ impl SharedState {
                     existing.is_dc = true;
                     changed = true;
                 }
-                // Strip AWS hostname from existing entry too
-                if is_aws_hostname(&existing.hostname) {
+                // Drop unusable hostnames on the existing entry too so a
+                // later real FQDN merge can replace them.
+                if existing.hostname.contains('.') && !looks_like_real_domain(&existing.hostname) {
                     existing.hostname = String::new();
                     changed = true;
                 }
@@ -264,12 +256,14 @@ impl SharedState {
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         host: &Host,
     ) -> Result<()> {
-        // Require at least 3 dot-separated parts (e.g. dc03.contoso.local)
-        // so 2-part hostnames like "HOSTNAME.local" don't yield "local" as the domain.
-        let raw_domain = if !host.hostname.is_empty() {
+        // `looks_like_real_domain` enforces the unified hostname-shape rules
+        // (cloud PTRs, default-OS auto-names, mDNS, bare TLDs). After it
+        // passes, also require ≥3 dot-separated parts so 2-label names like
+        // `DC01.local` don't yield `local` as the AD domain.
+        let derived = if looks_like_real_domain(&host.hostname) {
             let parts: Vec<&str> = host.hostname.split('.').collect();
             if parts.len() >= 3 {
-                parts[1..].join(".")
+                parts[1..].join(".").to_lowercase()
             } else {
                 String::new()
             }
@@ -277,21 +271,33 @@ impl SharedState {
             String::new()
         };
 
-        // If we can't derive a domain from the hostname, fall back to the
-        // sole known domain. This unblocks automation for DCs discovered
-        // before their FQDN is resolved.
-        //
-        // Only fall back when exactly one domain is in state. With ≥2
-        // domains, "first" is a guess that mis-maps DCs to the wrong domain
-        // (e.g. registering a parent DC under the child domain), and that
-        // bad mapping survives later cleanup — `register_dc` only purges
-        // stale entries by IP, so a subsequent correct registration with a
-        // *different* IP can't dislodge the wrong (domain, ip) pair. Skip
-        // and let the next FQDN-bearing discovery populate the entry.
-        let raw_domain = if raw_domain.is_empty()
-            || raw_domain.contains("compute.internal")
-            || raw_domain.contains("amazonaws.com")
-        {
+        // The DC's own FQDN is a self-report — strongest evidence we have
+        // short of a CLDAP probe. Push it through `publish_candidate_domain`
+        // so cloud / default-OS shapes are filtered consistently with other
+        // discovery paths.
+        let mut domain = String::new();
+        if !derived.is_empty() {
+            let outcome = self
+                .publish_candidate_domain(
+                    queue,
+                    derived.clone(),
+                    DomainEvidence::DcSelfReport,
+                    Some(host.ip.clone()),
+                )
+                .await?;
+            if matches!(outcome, super::DomainPublishOutcome::Promoted) {
+                domain = derived;
+            }
+        }
+
+        // If the FQDN was unusable (missing, rejected, or short), fall back to
+        // the sole known authoritative domain. With ≥2 domains, "first" is a
+        // guess that mis-maps DCs to the wrong domain — that bad mapping
+        // survives later cleanup since `register_dc` only purges stale entries
+        // by IP, so a subsequent correct registration with a *different* IP
+        // can't dislodge the wrong (domain, ip) pair. Skip and let the next
+        // FQDN-bearing discovery populate the entry.
+        if domain.is_empty() {
             let state = self.inner.read().await;
             if state.domains.len() == 1 {
                 let fallback = state.domains[0].clone();
@@ -299,23 +305,20 @@ impl SharedState {
                     ip = %host.ip,
                     hostname = %host.hostname,
                     fallback_domain = %fallback,
-                    "DC registration: using fallback domain (no FQDN available)"
+                    "DC registration: using fallback domain (no usable FQDN)"
                 );
-                fallback
+                domain = fallback;
             } else {
                 tracing::debug!(
                     ip = %host.ip,
                     hostname = %host.hostname,
                     known_domains = state.domains.len(),
-                    "Skipping DC registration: no FQDN and ambiguous fallback domain"
+                    "Skipping DC registration: no usable FQDN and ambiguous fallback domain"
                 );
                 return Ok(());
             }
-        } else {
-            raw_domain
-        };
+        }
 
-        let domain = raw_domain;
         let domain_lower = domain.to_lowercase();
 
         let mut conn = queue.connection();
@@ -340,30 +343,17 @@ impl SharedState {
                 );
                 let _: () = conn.hdel(&dc_key, stale).await?;
             }
-            // Remove stale entries from state (done below under write lock)
         }
 
         let _: () = conn.hset(&dc_key, &domain_lower, &host.ip).await?;
 
-        // Add domain to state and Redis, correct stale mappings
         let mut state = self.inner.write().await;
-
-        // Remove stale domain → IP mappings for this IP
         state
             .domain_controllers
             .retain(|d, ip| !(ip == &host.ip && *d != domain_lower));
-
-        // Insert or update the mapping
         state
             .domain_controllers
             .insert(domain_lower.clone(), host.ip.clone());
-
-        if !state.domains.contains(&domain_lower) {
-            state.domains.push(domain_lower.clone());
-            let domain_key = format!("{}:{}:{}", state::KEY_PREFIX, op_id, state::KEY_DOMAINS);
-            let _: () = conn.sadd(&domain_key, &domain_lower).await?;
-            let _: () = conn.expire(&domain_key, 86400).await?;
-        }
 
         tracing::info!(
             ip = %host.ip,
@@ -482,11 +472,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn publish_host_extracts_domain_from_fqdn() {
+    async fn publish_host_holds_inferred_domain_as_candidate() {
+        // A non-DC host's FQDN suffix is weak evidence — the suffix should
+        // land in candidate_domains, NOT state.domains, until corroborated.
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
         let host = make_host("192.168.58.5", "srv01.contoso.local", false);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            !s.domains.contains(&"contoso.local".to_string()),
+            "non-DC FQDN must not auto-promote into state.domains"
+        );
+        assert!(
+            s.candidate_domains.contains_key("contoso.local"),
+            "non-DC FQDN should be recorded as a candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_promotes_inferred_domain_when_matches_target() {
+        // If the operation's target.domain matches the inferred suffix, it's
+        // corroborated and promotes immediately.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.target = Some(ares_core::models::Target {
+                ip: "192.168.58.10".into(),
+                hostname: String::new(),
+                domain: "contoso.local".into(),
+                environment: String::new(),
+            });
+        }
+        let host = make_host("192.168.58.5", "srv01.contoso.local", false);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(s.domains.contains(&"contoso.local".to_string()));
+    }
+
+    #[tokio::test]
+    async fn publish_host_promotes_dc_self_report() {
+        // A DC's own FQDN is a self-report — auto-promotes without corroboration.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.1", "dc01.contoso.local", true);
         state.publish_host(&q, host).await.unwrap();
 
         let s = state.inner.read().await;
@@ -790,6 +824,100 @@ mod tests {
 
         let s = state.inner.read().await;
         assert_eq!(s.hosts[0].hostname, "srv01.contoso.local");
+    }
+
+    #[tokio::test]
+    async fn publish_host_rejects_default_windows_hostname_as_domain() {
+        // Regression: a non-domain-joined Windows host with the default
+        // `WIN-XXXX` hostname must NOT have its FQDN auto-extracted as a
+        // bogus AD domain (e.g. `win-hvtt4f8yn5n.ttb0.local`).
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host(
+            "10.1.2.178",
+            "win-hvtt4f8yn5n.win-hvtt4f8yn5n.ttb0.local",
+            false,
+        );
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            !s.domains.iter().any(|d| d.contains("win-")),
+            "default Windows hostname leaked into state.domains: {:?}",
+            s.domains
+        );
+        assert!(
+            !s.candidate_domains
+                .keys()
+                .any(|d| d.contains("win-") || d.contains("ttb0.local")),
+            "default Windows hostname leaked into candidate_domains: {:?}",
+            s.candidate_domains
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_rejects_desktop_oobe_hostname() {
+        // Win10/11 OOBE default `DESKTOP-XXXXXXX` should be filtered too —
+        // generalizes the cross-OS pre-filter beyond `WIN-` server names.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("10.1.2.179", "desktop-abc1234.workgroup.local", false);
+        state.publish_host(&q, host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(s.domains.is_empty());
+        assert!(
+            s.candidate_domains.is_empty(),
+            "desktop-* hostname leaked: {:?}",
+            s.candidate_domains
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_rejects_default_windows_hostname_no_fallback() {
+        // Even if a host is mis-detected as a DC, a default-Windows FQDN
+        // must not be accepted as the AD domain.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("10.1.2.178", "win-hvtt4f8yn5n.ttb0.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(
+            s.domain_controllers.is_empty(),
+            "default Windows FQDN must not register as a DC domain"
+        );
+        assert!(
+            !s.domains.iter().any(|d| d.contains("win-")),
+            "default Windows FQDN leaked into state.domains: {:?}",
+            s.domains
+        );
+    }
+
+    #[tokio::test]
+    async fn register_dc_default_windows_hostname_falls_back_to_known_domain() {
+        // If exactly one real domain is known, a DC discovered with a
+        // default-Windows FQDN should fall back to the real domain.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.domains.push("contoso.local".to_string());
+        }
+
+        let host = make_host("192.168.58.1", "win-hvtt4f8yn5n.ttb0.local", true);
+        state.register_dc(&q, &host).await.unwrap();
+
+        let s = state.inner.read().await;
+        assert_eq!(
+            s.domain_controllers.get("contoso.local"),
+            Some(&"192.168.58.1".to_string()),
+            "expected fallback to the single known real domain"
+        );
+        assert!(!s.domain_controllers.contains_key("ttb0.local"));
     }
 
     #[tokio::test]

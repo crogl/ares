@@ -31,7 +31,7 @@ static GHOST_MACHINE_ACCOUNT_RE: LazyLock<Regex> =
 
 /// True if `username` looks like an auto-generated Windows machine account
 /// (e.g. `WIN-G9FWV8ZNSCL$`) — typically agent-created via NoPAC.
-pub(super) fn is_ghost_machine_account(username: &str) -> bool {
+pub(crate) fn is_ghost_machine_account(username: &str) -> bool {
     GHOST_MACHINE_ACCOUNT_RE.is_match(username.trim())
 }
 

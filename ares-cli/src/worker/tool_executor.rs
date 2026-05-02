@@ -263,7 +263,29 @@ async fn execute_and_respond(
     let di = extract_target_info(&request.arguments);
     let dt = infer_target_type_from_info(&di);
 
-    let response = match ares_tools::dispatch(&request.tool_name, &request.arguments).await {
+    // Resolve credentials from operation state. The LLM never passes secret
+    // material — usernames + domains only. Anything that arrives looking like
+    // a placeholder is stripped, then the resolver fills in real values from
+    // harvested state by `(username, domain)`.
+    let mut resolved_arguments = request.arguments.clone();
+    if let Err(e) = super::credential_resolver::resolve_credentials(
+        conn,
+        request.operation_id.as_deref(),
+        &request.tool_name,
+        &mut resolved_arguments,
+    )
+    .await
+    {
+        warn!(
+            tool = %request.tool_name,
+            call_id = %request.call_id,
+            err = %e,
+            "credential_resolver failed; continuing with original arguments"
+        );
+        resolved_arguments = request.arguments.clone();
+    }
+
+    let response = match ares_tools::dispatch(&request.tool_name, &resolved_arguments).await {
         Ok(output) => {
             // Raw output for structured parsers (need unfiltered data)
             let raw = output.combined_raw();
@@ -279,7 +301,7 @@ async fn execute_and_respond(
             let discoveries = ares_tools::parsers::parse_tool_output(
                 &request.tool_name,
                 &raw,
-                &request.arguments,
+                &resolved_arguments,
             );
             let discoveries = if discoveries.as_object().is_none_or(|o| o.is_empty()) {
                 None

@@ -18,6 +18,7 @@ use crate::orchestrator::state::DISCOVERY_KEY_PREFIX;
 use crate::orchestrator::task_queue::TaskQueue;
 
 mod auth_throttle;
+mod domain_validator;
 mod local;
 mod redis_dispatcher;
 #[cfg(test)]

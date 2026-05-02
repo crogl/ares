@@ -3,7 +3,7 @@
 **Target:** {{ target_ip }}
 {% if domain %}**Domain:** {{ domain }}
 {% endif -%}
-{% if credential_username %}**Credential:** {{ credential_username }}@{{ credential_domain }}{% if credential_password %} / Password: {{ credential_password }}{% endif %}
+{% if credential_username %}**Principal:** {{ credential_username }}@{{ credential_domain }} (auth: {{ credential_auth_type }} — auto-resolved at dispatch, do NOT pass password/hash/ticket fields)
 {% endif -%}
 {% if bind_domain %}**Bind Domain:** {{ bind_domain }} (use bind_domain={{ bind_domain }} in ldap_search when credential domain differs from target domain)
 {% endif -%}
@@ -17,8 +17,8 @@
 - {{ t }}
 {% endfor -%}
 {% endif -%}
-{% if ntlm_hash -%}
-**NTLM Hash (for pass-the-hash):** {{ ntlm_hash }}{% if hash_username %} (user: {{ hash_username }}){% endif %}
+{% if has_ntlm_hash -%}
+**NTLM Hash available** (auto-resolved at dispatch — do NOT pass `nthash`/`hashes` fields){% if hash_username %} for user: {{ hash_username }}{% endif %}
 {% endif -%}
 
 {% if instructions -%}

@@ -1023,6 +1023,10 @@ tasks:
         ANTHROPIC_KEY=$(echo "$SECRETS" | jq -r .ANTHROPIC_API_KEY)
         GRAFANA_URL_VAL=$(echo "$SECRETS" | jq -r '.GRAFANA_URL // empty')
         GRAFANA_TOKEN_VAL=$(echo "$SECRETS" | jq -r '.GRAFANA_SERVICE_ACCOUNT_TOKEN // empty')
+        LOKI_URL_VAL=$(echo "$SECRETS" | jq -r '.LOKI_URL // empty')
+        if [ -z "$LOKI_URL_VAL" ]; then
+          LOKI_URL_VAL="{{.LOKI_URL}}"
+        fi
         DREADNODE_API_KEY=$(echo "$SECRETS" | jq -r '.DREADNODE_API_KEY // empty')
         OTEL_TRACES_ENDPOINT="{{.OTEL_TRACES_ENDPOINT}}"
 
@@ -1039,6 +1043,9 @@ tasks:
           if [ -n "$GRAFANA_TOKEN_VAL" ]; then
             ENV_FILE_CMD="$ENV_FILE_CMD; echo 'GRAFANA_SERVICE_ACCOUNT_TOKEN=${GRAFANA_TOKEN_VAL}' >> /etc/ares/env"
           fi
+        fi
+        if [ -n "$LOKI_URL_VAL" ]; then
+          ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
         # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
@@ -1058,6 +1065,7 @@ tasks:
         export ANTHROPIC_API_KEY='${ANTHROPIC_KEY}'
         export GRAFANA_URL='${GRAFANA_URL_VAL}'
         export GRAFANA_SERVICE_ACCOUNT_TOKEN='${GRAFANA_TOKEN_VAL}'
+        export LOKI_URL='${LOKI_URL_VAL}'
         export ARES_REDIS_URL=redis://127.0.0.1:6379
         {{- if .LLM_MODEL}}
         export ARES_LLM_MODEL='{{.LLM_MODEL}}'

@@ -66,12 +66,13 @@ Your role is to **delegate tasks to specialized worker agents** and coordinate t
    - `dispatch_recon(target_ip="<DC_IP>", domain="contoso.local", techniques=["bloodhound_collect"])`
 
 2. **Dispatch Low-Hanging Fruit** (to CREDENTIAL_ACCESS worker)
-   - `dispatch_credential_access(technique="password_spray", target_ip="DC_IP", domain="contoso.local", username="", password="")`
-   - `dispatch_credential_access(technique="asrep_roast", target_ip="DC_IP", domain="contoso.local", username="", password="")`
+   - `dispatch_credential_access(technique="password_spray", target_ip="DC_IP", domain="contoso.local")`
+   - `dispatch_credential_access(technique="asrep_roast", target_ip="DC_IP", domain="contoso.local")`
 
 3. **Dispatch Credential Expansion** (IMMEDIATELY when creds found)
-   - `dispatch_credential_access(technique="secretsdump", target_ip="DC_IP", domain="contoso.local", username="user", password="pass")`
-   - `dispatch_credential_access(technique="kerberoast", target_ip="DC_IP", domain="contoso.local", username="user", password="pass")`
+   - `dispatch_credential_access(technique="secretsdump", target_ip="DC_IP", domain="contoso.local", username="user")`
+   - `dispatch_credential_access(technique="kerberoast", target_ip="DC_IP", domain="contoso.local", username="user")`
+   - The dispatched worker resolves the credential for `username@domain` from operation state.
 
 4. **Dispatch ADCS Enumeration** (when credentials available)
    - `dispatch_privesc_exploit(vuln_id="adcs_enum")` - Runs certipy_find

@@ -37,6 +37,31 @@ impl SharedState {
             None => return Ok(false),
         };
 
+        // Reject phantom domain misattribution: forest-wide LDAP/GC searches
+        // can return a user from one domain while the parser's `current_domain`
+        // tracker is pointing at another (the query target). When a low-trust
+        // source like `description_field` produces a (user, password) pair
+        // that already exists under a different domain, treat the new entry
+        // as a misattribution and skip it. Otherwise it pollutes
+        // find_trust_credential and yields cross-forest LDAP bind 0x52e.
+        if cred.source == "description_field" && !cred.password.is_empty() {
+            let state = self.inner.read().await;
+            let conflict = state.credentials.iter().any(|c| {
+                c.username.eq_ignore_ascii_case(&cred.username)
+                    && c.password == cred.password
+                    && !c.domain.eq_ignore_ascii_case(&cred.domain)
+            });
+            if conflict {
+                tracing::warn!(
+                    username = %cred.username,
+                    rejected_domain = %cred.domain,
+                    source = %cred.source,
+                    "Rejecting phantom credential — same (user, password) already known under a different domain (likely forest-wide LDAP/GC bleed)"
+                );
+                return Ok(false);
+            }
+        }
+
         let operation_id = {
             let state = self.inner.read().await;
             state.operation_id.clone()
@@ -92,7 +117,33 @@ impl SharedState {
         let reader = RedisStateReader::new(operation_id);
         let mut conn = queue.connection();
         let added = reader.add_hash(&mut conn, &hash).await?;
-        if added {
+        if !added {
+            // Upsert path: redis dedup rejected the row, but if this hash
+            // carries an AES256 key and the in-memory entry doesn't, mirror
+            // the redis upsert performed by add_hash so cross-forest forge
+            // gets AES on the very next 30s tick (Win2016+ rejects RC4-only
+            // inter-realm tickets — losing AES to dedup blocks essos compromise).
+            if hash.aes_key.is_some() {
+                let mut state = self.inner.write().await;
+                if let Some(existing) = state.hashes.iter_mut().find(|h| {
+                    h.username.eq_ignore_ascii_case(&hash.username)
+                        && h.domain.eq_ignore_ascii_case(&hash.domain)
+                        && h.hash_type.eq_ignore_ascii_case(&hash.hash_type)
+                        && h.hash_value == hash.hash_value
+                }) {
+                    if existing.aes_key.is_none() {
+                        existing.aes_key = hash.aes_key.clone();
+                        tracing::info!(
+                            username = %hash.username,
+                            domain = %hash.domain,
+                            "Upserted AES256 key onto existing in-memory hash entry"
+                        );
+                    }
+                }
+            }
+            return Ok(false);
+        }
+        {
             let is_krbtgt = hash.username.to_lowercase() == "krbtgt"
                 && hash.hash_type.to_lowercase().contains("ntlm");
             let hash_domain = hash.domain.clone();
@@ -382,6 +433,48 @@ mod tests {
             s.domains
         );
         assert_eq!(s.credentials.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn publish_credential_rejects_phantom_description_field_dup() {
+        // Forest-wide LDAP/GC searches can return a user from one domain while
+        // the parser's tracked `current_domain` points at another. When that
+        // happens, a description_field cred is published under the wrong
+        // domain — same (user, password) but different domain — and pollutes
+        // find_trust_credential's cross-forest selection. publish_credential
+        // must reject the phantom so cross-forest auth picks a real principal.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let real = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "samwell.tarly".to_string(),
+            password: "Heartsbane".to_string(),
+            domain: "north.sevenkingdoms.local".to_string(),
+            source: "initial".to_string(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(state.publish_credential(&q, real).await.unwrap());
+
+        let phantom = Credential {
+            id: uuid::Uuid::new_v4().to_string(),
+            username: "samwell.tarly".to_string(),
+            password: "Heartsbane".to_string(),
+            domain: "sevenkingdoms.local".to_string(),
+            source: "description_field".to_string(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        };
+        assert!(!state.publish_credential(&q, phantom).await.unwrap());
+
+        let s = state.inner.read().await;
+        assert_eq!(s.credentials.len(), 1);
+        assert_eq!(s.credentials[0].domain, "north.sevenkingdoms.local");
     }
 
     #[tokio::test]

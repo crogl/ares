@@ -374,6 +374,7 @@ async fn run_inner() -> Result<()> {
         shared_state.clone(),
         config.strategy.llm_temperature,
         technique_priorities,
+        config.listener_ip.clone(),
     ));
     info!(
         model = %model_name,
@@ -430,6 +431,17 @@ async fn run_inner() -> Result<()> {
     );
 
     let cost_handle = spawn_cost_summary(queue.clone(), config.clone(), shutdown_rx.clone());
+
+    // Candidate-domain probe worker — verifies hostname-inferred domains
+    // (e.g. `corp.example.com` derived from `host.corp.example.com`) via
+    // `_ldap._tcp.dc._msdcs.<fqdn>` SRV lookups before promoting them.
+    let probe_ctx = state::domain_probe::DomainProbeContext {
+        state: shared_state.clone(),
+        queue: queue.clone(),
+        prober: Arc::new(state::domain_probe::DnsSrvProber::from_system()),
+    };
+    let probe_handle =
+        state::domain_probe::spawn_domain_probe_worker(probe_ctx, shutdown_rx.clone());
 
     // Exploitation workflow
     let exploit_disp = dispatcher.clone();
@@ -697,6 +709,7 @@ async fn run_inner() -> Result<()> {
                 hb_handle,
                 deferred_handle,
                 cost_handle,
+                probe_handle,
                 exploit_handle,
                 disc_handle,
                 refresh_handle,

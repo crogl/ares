@@ -1,12 +1,14 @@
 //! In-process tool dispatcher (no Redis).
 
 use anyhow::Result;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use ares_llm::{ToolCall, ToolExecResult};
 
 use crate::orchestrator::task_queue::TaskQueue;
+use crate::worker::credential_resolver::resolve_credentials;
 
+use super::domain_validator::check_domain_arg;
 use super::{extract_credential_key, push_realtime_discoveries, AuthThrottle};
 
 /// Dispatches tool calls directly via `ares_tools::dispatch` without Redis.
@@ -37,6 +39,11 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         _task_id: &str,
         call: &ToolCall,
     ) -> Result<ToolExecResult> {
+        // Reject calls whose `domain` argument doesn't match a known domain.
+        if let Some(rejection) = check_domain_arg(&self.queue, &self.operation_id, call).await {
+            return Ok(rejection);
+        }
+
         // Rate-limit auth-bearing tools to prevent AD account lockout
         if let Some(cred_key) = extract_credential_key(call) {
             self.auth_throttle.acquire(&cred_key).await;
@@ -44,7 +51,29 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
 
         debug!(tool = %call.name, "Executing tool locally");
 
-        match ares_tools::dispatch(&call.name, &call.arguments).await {
+        // Resolve credentials from operation state. The LLM never passes
+        // secret material — usernames + domains only. Mirrors the worker
+        // tool_executor path so local (in-process) dispatch gets the same
+        // injection.
+        let mut resolved_arguments = call.arguments.clone();
+        let mut conn = self.queue.connection();
+        if let Err(e) = resolve_credentials(
+            &mut conn,
+            Some(self.operation_id.as_str()),
+            &call.name,
+            &mut resolved_arguments,
+        )
+        .await
+        {
+            warn!(
+                tool = %call.name,
+                err = %e,
+                "credential_resolver failed; continuing with original arguments"
+            );
+            resolved_arguments = call.arguments.clone();
+        }
+
+        match ares_tools::dispatch(&call.name, &resolved_arguments).await {
             Ok(output) => {
                 let raw = output.combined_raw();
                 let combined = output.combined();
@@ -56,7 +85,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
 
                 // Parse structured discoveries from raw (unfiltered) output
                 let discoveries =
-                    ares_tools::parsers::parse_tool_output(&call.name, &raw, &call.arguments);
+                    ares_tools::parsers::parse_tool_output(&call.name, &raw, &resolved_arguments);
                 let discoveries = if discoveries.as_object().is_none_or(|o| o.is_empty()) {
                     None
                 } else {
@@ -70,7 +99,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                         &self.operation_id,
                         disc,
                         &call.name,
-                        &call.arguments,
+                        &resolved_arguments,
                     )
                     .await;
                 }

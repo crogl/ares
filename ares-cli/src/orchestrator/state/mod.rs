@@ -8,6 +8,7 @@
 //! arrive. Dedup sets are persisted to Redis so they survive orchestrator restarts.
 
 mod dedup;
+pub mod domain_probe;
 mod inner;
 mod persistence;
 mod publishing;
@@ -76,6 +77,10 @@ pub const DEDUP_ACL_DISCOVERY: &str = "acl_discovery";
 pub const DEDUP_CROSS_FOREST_ENUM: &str = "cross_forest_enum";
 pub const DEDUP_CROSS_REALM_LATERAL: &str = "cross_realm_lateral";
 pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
+/// Per-(vuln_id, credential) dedup for re-dispatching MSSQL exploits when
+/// a new cred for the vuln's domain becomes available after the initial
+/// LLM attempt failed (e.g. cred-timing race in cross-forest pivots).
+pub const DEDUP_MSSQL_RETRY: &str = "mssql_retry";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -143,6 +148,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_CROSS_FOREST_ENUM,
     DEDUP_CROSS_REALM_LATERAL,
     DEDUP_GOLDEN_CERT,
+    DEDUP_MSSQL_RETRY,
 ];
 
 #[cfg(test)]

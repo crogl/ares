@@ -1,4 +1,10 @@
 //! Shared helpers for prompt generation.
+//!
+//! These helpers MUST NOT emit credential values (passwords, hashes, AES keys,
+//! ticket bytes) into prompts. The worker resolves credentials from operation
+//! state at dispatch time; the LLM only ever sees principals (username/domain)
+//! and capability labels ("password", "nthash", "aes256", "ticket"). See
+//! `ares-cli/src/worker/credential_resolver.rs` for the resolution path.
 
 use serde_json::Value;
 use tera::Context;
@@ -6,7 +12,11 @@ use tera::Context;
 use super::state_context::format_state_context;
 use super::StateSnapshot;
 
-/// Extract credential fields from payload into a Tera context.
+/// Insert principal-only credential context into a Tera context.
+/// Surfaces `credential_username`, `credential_domain`, `credential_auth_type`
+/// — never the raw password/hash. Templates that need to brand "we have creds"
+/// vs "we don't" can branch on `credential_username` presence; templates that
+/// need to brand the auth type can branch on `credential_auth_type`.
 pub(crate) fn insert_credential_context(ctx: &mut Context, payload: &Value) {
     if let Some(cred) = payload.get("credential") {
         let user = cred["username"].as_str().unwrap_or("");
@@ -15,13 +25,13 @@ pub(crate) fn insert_credential_context(ctx: &mut Context, payload: &Value) {
             ctx.insert("credential_username", user);
             ctx.insert("credential_domain", cred_domain);
 
-            let password = cred.get("password").and_then(|v| v.as_str()).unwrap_or("");
-            let has_password = !password.is_empty();
-            if has_password {
-                ctx.insert("credential_password", password);
-            }
+            let has_password = cred
+                .get("password")
+                .and_then(|v| v.as_str())
+                .map(|s| !s.is_empty())
+                .unwrap_or(false);
             ctx.insert(
-                "auth_type",
+                "credential_auth_type",
                 if has_password {
                     "password"
                 } else {
@@ -89,10 +99,12 @@ pub(crate) fn payload_techniques(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Extract password from payload — checks nested `credential.password` first,
-/// then flat top-level `password` (matches both dispatcher shapes).
-fn extract_password(payload: &Value) -> Option<&str> {
-    payload
+/// Capability label for a payload's credential.
+///
+/// Returns one of: `"password"`, `"nthash"`, `"none"`. The label is **non-secret**
+/// — it tells the LLM what auth class will be auto-resolved, not the value.
+pub(crate) fn cred_capability_label(payload: &Value, hash_value: Option<&str>) -> &'static str {
+    let has_password = payload
         .get("credential")
         .and_then(|c| c.get("password"))
         .and_then(|v| v.as_str())
@@ -103,28 +115,14 @@ fn extract_password(payload: &Value) -> Option<&str> {
                 .and_then(|v| v.as_str())
                 .filter(|s| !s.is_empty())
         })
-}
-
-/// Build the credential parameter string for technique call sites.
-pub(crate) fn cred_param_str(payload: &Value, hash_value: Option<&str>) -> String {
-    if let Some(pw) = extract_password(payload) {
-        return format!("password='{pw}'");
+        .is_some();
+    if has_password {
+        "password"
+    } else if hash_value.is_some() {
+        "nthash"
+    } else {
+        "none"
     }
-    if let Some(h) = hash_value {
-        return format!("hashes='{h}'");
-    }
-    "password='N/A'".to_string()
-}
-
-/// Build the credential display string.
-pub(crate) fn cred_display_str(payload: &Value, hash_value: Option<&str>) -> String {
-    if let Some(pw) = extract_password(payload) {
-        return pw.to_string();
-    }
-    if let Some(h) = hash_value {
-        return format!("[HASH] {h}");
-    }
-    "N/A".to_string()
 }
 
 #[cfg(test)]
@@ -170,7 +168,6 @@ mod tests {
 
     #[test]
     fn pth_compat_lm_empty_nt_valid() {
-        // Empty LM part with valid NT
         assert!(is_pass_the_hash_compatible(Some(
             ":313b6f423a71d74c0a1b8a2f43b22d4c"
         )));
@@ -198,79 +195,43 @@ mod tests {
     }
 
     #[test]
-    fn cred_param_str_password() {
-        let payload = json!({"password": "P@ss1"});
-        assert_eq!(cred_param_str(&payload, None), "password='P@ss1'");
+    fn cred_capability_password() {
+        let payload = json!({"password": "secret"});
+        assert_eq!(cred_capability_label(&payload, None), "password");
     }
 
     #[test]
-    fn cred_param_str_nested_password() {
-        let payload = json!({"credential": {"username": "admin", "domain": "contoso.local", "password": "Summer2025"}});
-        assert_eq!(cred_param_str(&payload, None), "password='Summer2025'");
+    fn cred_capability_nested_password() {
+        let payload = json!({"credential": {"password": "secret"}});
+        assert_eq!(cred_capability_label(&payload, None), "password");
     }
 
     #[test]
-    fn cred_param_str_nested_takes_precedence() {
-        let payload = json!({"password": "flat", "credential": {"password": "nested"}});
-        assert_eq!(cred_param_str(&payload, None), "password='nested'");
-    }
-
-    #[test]
-    fn cred_param_str_hash() {
+    fn cred_capability_hash_only() {
         let payload = json!({});
-        assert_eq!(
-            cred_param_str(&payload, Some("aabbccdd")),
-            "hashes='aabbccdd'"
-        );
+        assert_eq!(cred_capability_label(&payload, Some("aabb")), "nthash");
     }
 
     #[test]
-    fn cred_param_str_fallback() {
+    fn cred_capability_none() {
         let payload = json!({});
-        assert_eq!(cred_param_str(&payload, None), "password='N/A'");
+        assert_eq!(cred_capability_label(&payload, None), "none");
     }
 
     #[test]
-    fn cred_param_str_empty_password_uses_hash() {
+    fn cred_capability_password_takes_precedence() {
+        let payload = json!({"password": "secret"});
+        assert_eq!(cred_capability_label(&payload, Some("aabb")), "password");
+    }
+
+    #[test]
+    fn cred_capability_empty_password_falls_back_to_hash() {
         let payload = json!({"password": ""});
-        assert_eq!(cred_param_str(&payload, Some("aabb")), "hashes='aabb'");
+        assert_eq!(cred_capability_label(&payload, Some("aabb")), "nthash");
     }
 
     #[test]
-    fn cred_param_str_nested_empty_uses_hash() {
-        let payload = json!({"credential": {"password": ""}});
-        assert_eq!(cred_param_str(&payload, Some("aabb")), "hashes='aabb'");
-    }
-
-    #[test]
-    fn cred_display_str_password() {
-        let payload = json!({"password": "Secret123"});
-        assert_eq!(cred_display_str(&payload, None), "Secret123");
-    }
-
-    #[test]
-    fn cred_display_str_nested_password() {
-        let payload = json!({"credential": {"password": "Summer2025"}});
-        assert_eq!(cred_display_str(&payload, None), "Summer2025");
-    }
-
-    #[test]
-    fn cred_display_str_hash() {
-        let payload = json!({});
-        assert_eq!(
-            cred_display_str(&payload, Some("aabbccdd")),
-            "[HASH] aabbccdd"
-        );
-    }
-
-    #[test]
-    fn cred_display_str_fallback() {
-        let payload = json!({});
-        assert_eq!(cred_display_str(&payload, None), "N/A");
-    }
-
-    #[test]
-    fn insert_credential_context_with_password() {
+    fn insert_credential_context_with_password_does_not_leak_value() {
         let payload = json!({
             "credential": {
                 "username": "admin",
@@ -283,8 +244,11 @@ mod tests {
         let json = ctx.into_json();
         assert_eq!(json["credential_username"], "admin");
         assert_eq!(json["credential_domain"], "contoso.local");
-        assert_eq!(json["credential_password"], "P@ss1");
-        assert_eq!(json["auth_type"], "password");
+        assert_eq!(json["credential_auth_type"], "password");
+        assert!(
+            json.get("credential_password").is_none(),
+            "credential_password must never be exposed to templates"
+        );
     }
 
     #[test]
@@ -298,7 +262,8 @@ mod tests {
         let mut ctx = Context::new();
         insert_credential_context(&mut ctx, &payload);
         let json = ctx.into_json();
-        assert_eq!(json["auth_type"], "hash/ticket");
+        assert_eq!(json["credential_auth_type"], "hash/ticket");
+        assert!(json.get("credential_password").is_none());
     }
 
     #[test]
@@ -308,5 +273,6 @@ mod tests {
         insert_credential_context(&mut ctx, &payload);
         let json = ctx.into_json();
         assert!(json.get("credential_username").is_none());
+        assert!(json.get("credential_password").is_none());
     }
 }

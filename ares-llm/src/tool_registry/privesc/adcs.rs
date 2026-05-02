@@ -131,7 +131,8 @@ pub fn definitions() -> Vec<ToolDefinition> {
             name: "certipy_shadow".into(),
             description: "Exploit Shadow Credentials by adding a Key Credential to a target \
                 account's msDS-KeyCredentialLink attribute via Certipy, then authenticating \
-                with the resulting certificate."
+                with the resulting certificate. Provide either `password` or `hashes` for \
+                authentication."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -146,7 +147,11 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     },
                     "password": {
                         "type": "string",
-                        "description": "Password for authentication"
+                        "description": "Password for authentication. Optional if `hashes` is provided."
+                    },
+                    "hashes": {
+                        "type": "string",
+                        "description": "NTLM hash for pass-the-hash (format: 'lmhash:nthash' or just ':nthash'). Use instead of password."
                     },
                     "dc_ip": {
                         "type": "string",
@@ -157,7 +162,7 @@ pub fn definitions() -> Vec<ToolDefinition> {
                         "description": "Target account to add shadow credentials to"
                     }
                 },
-                "required": ["domain", "username", "password", "dc_ip", "target"]
+                "required": ["domain", "username", "dc_ip", "target"]
             }),
         },
         ToolDefinition {

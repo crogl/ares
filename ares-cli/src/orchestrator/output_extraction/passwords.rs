@@ -92,7 +92,11 @@ fn extract_rpcclient_description_passwords(
     credentials
 }
 
-pub fn extract_plaintext_passwords(output: &str, default_domain: &str) -> Vec<Credential> {
+pub fn extract_plaintext_passwords(
+    ctx: &super::ToolOutputCtx<'_>,
+    default_domain: &str,
+) -> Vec<Credential> {
+    let output = ctx.output;
     let mut credentials = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
@@ -122,29 +126,38 @@ pub fn extract_plaintext_passwords(output: &str, default_domain: &str) -> Vec<Cr
         "(GUEST)",
     ];
 
-    for line in output.lines() {
-        let stripped = line.trim();
-        if !stripped.contains("[+]") {
-            continue;
-        }
-        let upper = stripped.to_uppercase();
-        if FAILURE_MARKERS.iter().any(|m| upper.contains(m)) {
-            continue;
-        }
-        if let Some(caps) = RE_NETEXEC_SUCCESS.captures(stripped) {
-            let domain = caps.get(1).unwrap().as_str().to_string();
-            let user = caps.get(2).unwrap().as_str().to_string();
-            let pass = caps
-                .get(3)
-                .unwrap()
-                .as_str()
-                .trim_end_matches("(Pwn3d!)")
-                .trim()
-                .to_string();
-            if is_valid_credential(&user, &pass) {
-                let key = format!("{}\\{}:{}", domain, user, pass);
-                if seen.insert(key) {
-                    credentials.push(make_credential(&user, &pass, &domain, "netexec_auth"));
+    // Skip the `[+] DOMAIN\user:secret` netexec-auth pattern when the tool was
+    // invoked with hash auth — the "secret" is the supplied NT/LM hash echoed
+    // back, not a discovered plaintext password. Without this gate, every
+    // successful pass-the-hash sweep ingests the hash a second time as a fake
+    // credential row (`jeor.mormont:6dccf1c567c56a40e56691a723a49664`).
+    let skip_netexec_auth = ctx.is_hash_auth();
+
+    if !skip_netexec_auth {
+        for line in output.lines() {
+            let stripped = line.trim();
+            if !stripped.contains("[+]") {
+                continue;
+            }
+            let upper = stripped.to_uppercase();
+            if FAILURE_MARKERS.iter().any(|m| upper.contains(m)) {
+                continue;
+            }
+            if let Some(caps) = RE_NETEXEC_SUCCESS.captures(stripped) {
+                let domain = caps.get(1).unwrap().as_str().to_string();
+                let user = caps.get(2).unwrap().as_str().to_string();
+                let pass = caps
+                    .get(3)
+                    .unwrap()
+                    .as_str()
+                    .trim_end_matches("(Pwn3d!)")
+                    .trim()
+                    .to_string();
+                if is_valid_credential(&user, &pass) {
+                    let key = format!("{}\\{}:{}", domain, user, pass);
+                    if seen.insert(key) {
+                        credentials.push(make_credential(&user, &pass, &domain, "netexec_auth"));
+                    }
                 }
             }
         }

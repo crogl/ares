@@ -45,6 +45,8 @@ const TASK_PRIVESC_ENUMERATION_TEMPLATE: &str =
     include_str!("../../templates/redteam/tasks/privesc_enumeration.md.tera");
 const TASK_ACL_ANALYSIS_TEMPLATE: &str =
     include_str!("../../templates/redteam/tasks/acl_analysis.md.tera");
+const TASK_ACL_CHAIN_STEP_TEMPLATE: &str =
+    include_str!("../../templates/redteam/tasks/acl_chain_step.md.tera");
 const TASK_COMMAND_TEMPLATE: &str = include_str!("../../templates/redteam/tasks/command.md.tera");
 
 const TASK_EXPLOIT_ADCS_ENUMERATE_TEMPLATE: &str =
@@ -144,6 +146,7 @@ pub const TASK_LATERAL: &str = "redteam/tasks/lateral";
 pub const TASK_COERCION: &str = "redteam/tasks/coercion";
 pub const TASK_PRIVESC_ENUMERATION: &str = "redteam/tasks/privesc_enumeration";
 pub const TASK_ACL_ANALYSIS: &str = "redteam/tasks/acl_analysis";
+pub const TASK_ACL_CHAIN_STEP: &str = "redteam/tasks/acl_chain_step";
 pub const TASK_COMMAND: &str = "redteam/tasks/command";
 
 // Exploit task templates
@@ -231,6 +234,7 @@ static TEMPLATES: LazyLock<Tera> = LazyLock::new(|| {
         (TASK_COERCION, TASK_COERCION_TEMPLATE),
         (TASK_PRIVESC_ENUMERATION, TASK_PRIVESC_ENUMERATION_TEMPLATE),
         (TASK_ACL_ANALYSIS, TASK_ACL_ANALYSIS_TEMPLATE),
+        (TASK_ACL_CHAIN_STEP, TASK_ACL_CHAIN_STEP_TEMPLATE),
         (TASK_COMMAND, TASK_COMMAND_TEMPLATE),
         // Exploit task templates
         (
@@ -371,9 +375,12 @@ pub fn render_agent_instructions_with_extras(
 /// - `all_capabilities`: map of role → tool list. Falls back to hardcoded defaults if None.
 /// - `technique_priorities`: sorted list of (technique, weight) pairs for the priority table.
 ///   If provided, renders a dynamic "ATTACK FALLBACK CHAINS" section.
+/// - `listener_ip`: orchestrator's relay/listener IP. Surfaced to the LLM so it
+///   doesn't hallucinate a subnet-gateway IP for `listener_ip`/`attacker_ip` args.
 pub fn render_system_instructions(
     all_capabilities: Option<&HashMap<String, Vec<String>>>,
     technique_priorities: Option<&[(String, i32)]>,
+    listener_ip: Option<&str>,
 ) -> Result<String> {
     let mut ctx = Context::new();
     if let Some(caps) = all_capabilities {
@@ -381,6 +388,9 @@ pub fn render_system_instructions(
     }
     if let Some(priorities) = technique_priorities {
         ctx.insert("technique_priorities", priorities);
+    }
+    if let Some(ip) = listener_ip {
+        ctx.insert("listener_ip", ip);
     }
 
     TEMPLATES
@@ -517,14 +527,14 @@ mod tests {
         caps.insert("privesc".to_string(), vec!["certipy".to_string()]);
         caps.insert("lateral".to_string(), vec!["psexec".to_string()]);
 
-        let result = render_system_instructions(Some(&caps), None).unwrap();
+        let result = render_system_instructions(Some(&caps), None, None).unwrap();
         assert!(result.contains("RECON"));
         assert!(result.contains("nmap_scan"));
     }
 
     #[test]
     fn render_system_instructions_without_capabilities() {
-        let result = render_system_instructions(None, None).unwrap();
+        let result = render_system_instructions(None, None, None).unwrap();
         // Falls back to hardcoded defaults
         assert!(result.contains("nmap, netexec, rpcclient"));
         // Hardcoded fallback table
@@ -541,7 +551,7 @@ mod tests {
             ("esc1".to_string(), 5),
             ("acl_abuse".to_string(), 6),
         ];
-        let result = render_system_instructions(None, Some(&priorities)).unwrap();
+        let result = render_system_instructions(None, Some(&priorities), None).unwrap();
         // Dynamic table rendered
         assert!(
             result.contains("operator strategy"),
@@ -554,6 +564,28 @@ mod tests {
         assert!(
             !result.contains("certipy_request → certipy_auth → secretsdump"),
             "Hardcoded table should not appear when priorities are provided"
+        );
+    }
+
+    #[test]
+    fn render_system_instructions_with_listener_ip() {
+        let result = render_system_instructions(None, None, Some("10.1.2.178")).unwrap();
+        assert!(
+            result.contains("10.1.2.178"),
+            "Listener IP should be substituted into prompt"
+        );
+        assert!(
+            result.contains("OPERATOR INFRASTRUCTURE"),
+            "Listener IP section should render when value is provided"
+        );
+    }
+
+    #[test]
+    fn render_system_instructions_omits_listener_section_when_unset() {
+        let result = render_system_instructions(None, None, None).unwrap();
+        assert!(
+            !result.contains("OPERATOR INFRASTRUCTURE"),
+            "Listener IP section should be hidden when no IP provided"
         );
     }
 

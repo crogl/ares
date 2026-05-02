@@ -137,12 +137,16 @@ fn parse_lsassy_line(line: &str) -> Option<(String, String, String)> {
         return None;
     }
 
-    // Colon-prefixed (DOMAIN\user:secret) — preserve full LM:NT pair.
+    // Colon-prefixed (DOMAIN\user:secret) — preserve full LM:NT pair. This is
+    // a terminal branch: once we see the colon delimiter the secret (or lack
+    // thereof) is unambiguous, so falling through to the whitespace branch
+    // below would just re-parse the same `:marker` string as a bare token.
     if let Some(stripped) = rest.strip_prefix(':') {
         let secret = stripped.trim();
-        if !secret.is_empty() {
-            return Some((domain.to_string(), username.to_string(), secret.to_string()));
+        if secret.is_empty() || is_lsassy_marker(secret) {
+            return None;
         }
+        return Some((domain.to_string(), username.to_string(), secret.to_string()));
     }
 
     // Whitespace-separated (DOMAIN\user  secret).
@@ -151,12 +155,22 @@ fn parse_lsassy_line(line: &str) -> Option<(String, String, String)> {
         // Take only the first whitespace-delimited token to avoid swallowing
         // trailing `[SHA1] …` decorations into the password.
         let first = secret.split_whitespace().next().unwrap_or("");
-        if !first.is_empty() {
+        if !first.is_empty() && !is_lsassy_marker(first) {
             return Some((domain.to_string(), username.to_string(), first.to_string()));
         }
     }
 
     None
+}
+
+/// Recognize lsassy field-marker tokens (e.g. `[PWD]`, `[TGT]`, `[LM]`,
+/// `[SHA1]`). These are *labels* lsassy emits when it found a credential
+/// of that type but redacted/elided the value — they are not secrets.
+/// Storing them as passwords poisoned operation state and caused tools to
+/// receive literal `[PWD]`/`[TGT]` strings as auth values.
+fn is_lsassy_marker(s: &str) -> bool {
+    let t = s.trim();
+    t.starts_with('[') && t.ends_with(']') && t.len() <= 16
 }
 
 /// Validate a DOMAIN string looks like an AD domain prefix, not garbage.
@@ -720,6 +734,29 @@ SMB         192.168.58.10   445    DC01             [+] contoso.local\\Administr
         let (hashes, creds) = parse_lsassy(output, &params);
         assert!(hashes.is_empty());
         assert!(creds.is_empty());
+    }
+
+    #[test]
+    fn lsassy_rejects_pwd_tgt_field_markers_as_passwords() {
+        // lsassy emits `[PWD]` / `[TGT]` as *labels* when it found a credential
+        // of that type but redacted/elided the value. Storing the marker as a
+        // password poisoned operation state and made tools receive literal
+        // `[PWD]`/`[TGT]` strings as auth values, breaking lateral movement.
+        let output = "\
+NORTH\\WINTERFELL$ [PWD]
+NORTH\\jon.snow [TGT]
+NORTH\\jon.snow:[PWD]
+CONTOSO\\real_user RealPassword123";
+        let params = json!({"domain": "contoso.local"});
+        let (hashes, creds) = parse_lsassy(output, &params);
+        assert!(hashes.is_empty());
+        assert_eq!(
+            creds.len(),
+            1,
+            "only the real password should be stored, got: {creds:?}"
+        );
+        assert_eq!(creds[0]["username"], "real_user");
+        assert_eq!(creds[0]["password"], "RealPassword123");
     }
 
     #[test]

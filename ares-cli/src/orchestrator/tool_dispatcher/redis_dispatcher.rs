@@ -10,6 +10,7 @@ use ares_llm::{ToolCall, ToolExecResult};
 
 use crate::orchestrator::task_queue::TaskQueue;
 
+use super::domain_validator::check_domain_arg;
 use super::{
     extract_credential_key, push_realtime_discoveries, AuthThrottle, ToolExecRequest,
     ToolExecResponse, RESULT_TTL_SECS, TOOL_EXEC_PREFIX, TOOL_RESULT_PREFIX,
@@ -56,6 +57,15 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
         );
 
         async {
+            // Reject calls whose `domain` argument doesn't match a known
+            // domain — catches LLM typos before they pollute credential
+            // records or misroute downstream tooling.
+            if let Some(rejection) =
+                check_domain_arg(&self.queue, &self.operation_id, call).await
+            {
+                return Ok(rejection);
+            }
+
             // Rate-limit auth-bearing tools to prevent AD account lockout
             if let Some(cred_key) = extract_credential_key(call) {
                 self.auth_throttle.acquire(&cred_key).await;

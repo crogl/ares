@@ -15,7 +15,10 @@ pub use blue::{
     BlueTaskInfo, Evidence, InvestigationStage, PyramidLevel, SharedBlueTeamState, TimelineEvent,
     TriageDecision, TriageRecord,
 };
-pub use core::{Credential, Hash, Host, Share, Target, TrustInfo, User};
+pub use core::{
+    CandidateDomain, Credential, DomainEvidence, Hash, Host, KerberosTicket, Share, Target,
+    TrustInfo, User,
+};
 pub use operation::{AttackChainStep, OperationMeta, SharedRedTeamState};
 pub use task::{
     AgentInfo, AgentRole, TaskInfo, TaskResult, TaskStatus, TaskStatusRecord, VulnerabilityInfo,

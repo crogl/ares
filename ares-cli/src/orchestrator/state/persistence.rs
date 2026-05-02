@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use redis::AsyncCommands;
 use tracing::{debug, info};
 
+use ares_core::models::CandidateDomain;
 use ares_core::state::{self, RedisStateReader};
 
 use redis::aio::ConnectionLike;
@@ -103,6 +104,23 @@ impl SharedState {
             }
         }
 
+        let candidate_domains_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_CANDIDATE_DOMAINS
+        );
+        let raw_candidates: HashMap<String, String> = conn
+            .hgetall(&candidate_domains_key)
+            .await
+            .unwrap_or_default();
+        let mut candidate_domains = HashMap::new();
+        for (fqdn, json_str) in &raw_candidates {
+            if let Ok(candidate) = serde_json::from_str::<CandidateDomain>(json_str) {
+                candidate_domains.insert(fqdn.clone(), candidate);
+            }
+        }
+
         // Load ACL chains
         let acl_chains_key = format!(
             "{}:{}:{}",
@@ -163,6 +181,22 @@ impl SharedState {
         let dispatched_acl_steps: HashSet<String> =
             conn.smembers(&acl_dedup_key).await.unwrap_or_default();
 
+        // Load forged Kerberos tickets
+        let kerberos_tickets_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_KERBEROS_TICKETS
+        );
+        let raw_tickets: HashMap<String, String> = conn
+            .hgetall(&kerberos_tickets_key)
+            .await
+            .unwrap_or_default();
+        let kerberos_tickets: Vec<ares_core::models::KerberosTicket> = raw_tickets
+            .into_values()
+            .filter_map(|s| serde_json::from_str(&s).ok())
+            .collect();
+
         // Apply to state
         let mut state = self.inner.write().await;
         state.target = loaded.target;
@@ -180,6 +214,7 @@ impl SharedState {
         state.domain_sids = domain_sids;
         state.admin_names = admin_names;
         state.trusted_domains = trusted_domains;
+        state.candidate_domains = candidate_domains;
         // Rebuild dominated_domains from krbtgt hashes
         state.dominated_domains = state
             .hashes
@@ -219,6 +254,7 @@ impl SharedState {
         state.dispatched_acl_steps = dispatched_acl_steps;
         state.pending_tasks = pending_tasks;
         state.completed_tasks = completed_tasks;
+        state.kerberos_tickets = kerberos_tickets;
 
         let cred_count = state.credentials.len();
         let hash_count = state.hashes.len();
@@ -317,6 +353,39 @@ impl SharedState {
             }
         }
 
+        let candidate_domains_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_CANDIDATE_DOMAINS
+        );
+        let raw_candidates: HashMap<String, String> = conn
+            .hgetall(&candidate_domains_key)
+            .await
+            .unwrap_or_default();
+        let mut candidate_domains = HashMap::new();
+        for (fqdn, json_str) in &raw_candidates {
+            if let Ok(candidate) = serde_json::from_str::<CandidateDomain>(json_str) {
+                candidate_domains.insert(fqdn.clone(), candidate);
+            }
+        }
+
+        // Refresh Kerberos tickets
+        let kerberos_tickets_key = format!(
+            "{}:{}:{}",
+            state::KEY_PREFIX,
+            operation_id,
+            state::KEY_KERBEROS_TICKETS
+        );
+        let raw_tickets: HashMap<String, String> = conn
+            .hgetall(&kerberos_tickets_key)
+            .await
+            .unwrap_or_default();
+        let kerberos_tickets: Vec<ares_core::models::KerberosTicket> = raw_tickets
+            .into_values()
+            .filter_map(|s| serde_json::from_str(&s).ok())
+            .collect();
+
         let mut state = self.inner.write().await;
         state.credentials = credentials;
         state.hashes = hashes;
@@ -331,7 +400,9 @@ impl SharedState {
         state.domain_sids = domain_sids;
         state.admin_names = admin_names;
         state.trusted_domains = trusted_domains;
+        state.candidate_domains = candidate_domains;
         state.acl_chains = acl_chains;
+        state.kerberos_tickets = kerberos_tickets;
         // Rebuild dominated_domains from refreshed hashes
         state.dominated_domains = state
             .hashes
@@ -412,13 +483,15 @@ mod tests {
         // Seed meta so exists() returns true, then publish data
         seed_meta(&q, "op-1").await;
 
+        // Publish a DC host so the suffix is promoted authoritatively
+        // (non-DC FQDN suffixes are now held as candidates, not domains).
         let host = ares_core::models::Host {
             ip: "192.168.58.5".to_string(),
-            hostname: "srv01.contoso.local".to_string(),
+            hostname: "dc01.contoso.local".to_string(),
             os: String::new(),
             roles: vec![],
             services: vec!["445/tcp".to_string()],
-            is_dc: false,
+            is_dc: true,
             owned: false,
         };
         state.publish_host(&q, host).await.unwrap();
@@ -467,6 +540,35 @@ mod tests {
 
         let s = state2.inner.read().await;
         assert!(s.dedup["crack_requests"].contains("hash123"));
+    }
+
+    #[tokio::test]
+    async fn load_from_redis_restores_candidate_domains() {
+        let state = SharedState::new("op-candidates".to_string());
+        let q = mock_queue();
+
+        seed_meta(&q, "op-candidates").await;
+        state
+            .publish_candidate_domain(
+                &q,
+                "transient.example.com",
+                ares_core::models::DomainEvidence::HostnameInference,
+                Some("192.168.58.50".to_string()),
+            )
+            .await
+            .unwrap();
+        state
+            .mark_candidate_probed(&q, "transient.example.com")
+            .await
+            .unwrap();
+
+        let state2 = SharedState::new("op-candidates".to_string());
+        state2.load_from_redis(&q).await.unwrap();
+
+        let s = state2.inner.read().await;
+        let candidate = s.candidate_domains.get("transient.example.com").unwrap();
+        assert!(candidate.probed);
+        assert_eq!(candidate.source_host_ip.as_deref(), Some("192.168.58.50"));
     }
 
     #[tokio::test]

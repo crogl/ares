@@ -37,6 +37,20 @@ static RE_AES256_KEY: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?:[^\\/\s:]+[\\/])?([^:\s\\/]+):aes256-cts-hmac-sha1-96:([a-fA-F0-9]+)").unwrap()
 });
 
+// $MACHINE.ACC markers reveal the dump's source domain (NetBIOS prefix):
+//   NORTH\WINTERFELL$:aes256-cts-hmac-sha1-96:<hex>
+//   NORTH\WINTERFELL$:plain_password_hex:<hex>
+//   NORTH\WINTERFELL$:aad3...:<nthash>:::
+// The captured prefix authoritatively identifies the dump's actual domain,
+// which may differ from the task's params.domain (e.g. a cross-forest task
+// targeting essos.local that ended up dumping a north DC).
+static RE_MACHINE_ACCT_DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?m)^([A-Za-z0-9_-]+)\\[A-Za-z0-9_.-]+\$:(?:aes256-cts-hmac-sha1-96|aes128-cts-hmac-sha1-96|plain_password_hex|des-cbc-md5|aad3b435b51404eeaad3b435b51404ee:[a-fA-F0-9]{32}:::)",
+    )
+    .unwrap()
+});
+
 pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
     let mut hashes = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -52,6 +66,35 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
         let aes = caps.get(2).unwrap().as_str().to_lowercase();
         aes_by_user.insert(user, aes);
     }
+
+    // Detect the dump's actual NetBIOS domain from $MACHINE.ACC markers.
+    // If found and it conflicts with default_domain (the task's params.domain),
+    // we suppress plain-format NTLM lines to prevent phantom mislabels — the
+    // discoveries blob from the tool's own parser will have already captured
+    // these hashes with the correct domain.
+    let default_netbios = default_domain
+        .split('.')
+        .next()
+        .unwrap_or("")
+        .to_lowercase();
+    let mut detected_netbios: Option<String> = None;
+    let mut detected_ambiguous = false;
+    for caps in RE_MACHINE_ACCT_DOMAIN.captures_iter(output) {
+        let nb = caps.get(1).unwrap().as_str().to_lowercase();
+        match detected_netbios {
+            None => detected_netbios = Some(nb),
+            Some(ref existing) if *existing == nb => {}
+            Some(_) => {
+                detected_ambiguous = true;
+                break;
+            }
+        }
+    }
+    let suppress_plain_ntlm = !detected_ambiguous
+        && !default_netbios.is_empty()
+        && detected_netbios
+            .as_deref()
+            .is_some_and(|nb| nb != default_netbios);
 
     // First pass: unwrap line-wrapped NTLM hashes
     let lines: Vec<&str> = output.lines().collect();
@@ -154,6 +197,13 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
 
         // NTLM without domain prefix
         if let Some(caps) = RE_NTLM_PLAIN.captures(line) {
+            // Skip plain NTLM lines when the dump came from a domain that
+            // differs from default_domain — applying default_domain would
+            // create phantom entries (e.g. essos.local:krbtgt mislabel of
+            // a north DC dump done under a cross-forest task).
+            if suppress_plain_ntlm {
+                continue;
+            }
             let username = caps.get(1).unwrap().as_str();
             let lm = caps.get(3).unwrap().as_str();
             let nt = caps.get(4).unwrap().as_str();
@@ -380,6 +430,68 @@ mod tests {
     #[test]
     fn extract_hashes_empty_output() {
         assert!(extract_hashes("", "CONTOSO").is_empty());
+    }
+
+    #[test]
+    fn extract_hashes_suppresses_plain_ntlm_on_domain_mismatch() {
+        // Regression test for Bug F: a cross-forest task with default_domain=essos.local
+        // dumped a NORTH DC (winterfell). The output's $MACHINE.ACC marker
+        // (NORTH\WINTERFELL$:aes256-...) reveals the real domain is NORTH, so plain
+        // NTLM lines (krbtgt:502:..., Administrator:500:...) must NOT be labeled essos.local.
+        let output = "\
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
+[*] $MACHINE.ACC
+NORTH\\WINTERFELL$:aes256-cts-hmac-sha1-96:583938786f0a9459ced10e35f5803be6d4017c6fd4ba21b6e7479f9bce851d6b
+NORTH\\WINTERFELL$:aad3b435b51404eeaad3b435b51404ee:a3f11b5a18f97db9a3d4f16aed85a1b6:::
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::
+krbtgt:aes256-cts-hmac-sha1-96:86eebe21a5af32061e42ef050c447d4467648e54884a92d91a3f97fbfa0114a4";
+        let hashes = extract_hashes(output, "essos.local");
+        // Plain NTLM lines must be suppressed — no hashes should carry the
+        // mismatched essos.local label.
+        let labeled_essos: Vec<_> = hashes
+            .iter()
+            .filter(|h| h.domain.eq_ignore_ascii_case("essos.local"))
+            .collect();
+        assert!(
+            labeled_essos.is_empty(),
+            "no hashes should be labeled essos.local when dump is from NORTH"
+        );
+        // The phantom mislabel was specifically of krbtgt and Administrator —
+        // make sure neither slipped through with the wrong domain.
+        assert!(
+            !hashes.iter().any(|h| h.username == "krbtgt"),
+            "plain-format krbtgt must be suppressed on domain mismatch"
+        );
+        assert!(
+            !hashes
+                .iter()
+                .any(|h| h.username.eq_ignore_ascii_case("Administrator")),
+            "plain-format Administrator must be suppressed on domain mismatch"
+        );
+    }
+
+    #[test]
+    fn extract_hashes_keeps_plain_ntlm_when_domain_matches() {
+        // When default_domain matches the detected NetBIOS prefix, plain NTLM
+        // lines are still extracted (the common case: a domain-targeted task).
+        let output = "\
+Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
+NORTH\\WINTERFELL$:aes256-cts-hmac-sha1-96:5839387800000000000000000000000000000000000000000000000000000000
+krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::";
+        let hashes = extract_hashes(output, "north.sevenkingdoms.local");
+        assert!(hashes.iter().any(|h| h.username == "krbtgt"));
+        assert!(hashes.iter().any(|h| h.username == "Administrator"));
+    }
+
+    #[test]
+    fn extract_hashes_keeps_plain_ntlm_when_no_machine_acct_marker() {
+        // When the output has no $MACHINE.ACC marker, fall back to default_domain
+        // (we have no signal to override). This preserves the existing behavior
+        // for partial outputs and non-secretsdump tools.
+        let output = "Administrator:500:aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0:::";
+        let hashes = extract_hashes(output, "contoso.local");
+        assert_eq!(hashes.len(), 1);
+        assert_eq!(hashes[0].domain, "contoso.local");
     }
 
     #[test]

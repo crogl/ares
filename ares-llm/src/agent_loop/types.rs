@@ -13,6 +13,18 @@ pub struct ToolExecResult {
     pub discoveries: Option<serde_json::Value>,
 }
 
+/// Raw stdout from a single tool dispatch, paired with the tool name and
+/// arguments that produced it. Carried through `AgentLoopOutcome` so secondary
+/// regex extractors downstream can be tool-aware (e.g. skip `[+] DOMAIN\user:secret`
+/// credential extraction when the tool was invoked with hash-auth flags — the
+/// "secret" is just the hash echoed back, not a discovered password).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolOutput {
+    pub name: String,
+    pub arguments: serde_json::Value,
+    pub output: String,
+}
+
 /// Trait for dispatching tool calls to external executors (Python workers).
 ///
 /// Implementers handle the Redis queue mechanics (LPUSH to tool_exec queue,
@@ -93,8 +105,8 @@ pub struct AgentLoopOutcome {
     /// Surfaced in reports but never used as authoritative state — must never
     /// feed `publish_*` calls.
     pub llm_findings: Vec<serde_json::Value>,
-    /// Raw tool output strings for secondary regex extraction.
-    pub tool_outputs: Vec<String>,
+    /// Raw tool outputs (name + args + stdout) for secondary regex extraction.
+    pub tool_outputs: Vec<ToolOutput>,
 }
 
 /// Why the agent loop stopped.

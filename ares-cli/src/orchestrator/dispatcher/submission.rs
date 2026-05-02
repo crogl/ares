@@ -286,11 +286,19 @@ impl Dispatcher {
                         Some(Value::Array(outcome.llm_findings.clone()))
                     };
 
-                    // Collect raw tool outputs for secondary regex extraction
+                    // Collect raw tool outputs for secondary regex extraction.
+                    // Serialize as objects {name, arguments, output} so consumers
+                    // can be tool-aware (skip credential regex for hash-auth invocations).
                     let tool_outputs_json: Vec<Value> = outcome
                         .tool_outputs
                         .iter()
-                        .map(|s| Value::String(s.clone()))
+                        .map(|to| {
+                            serde_json::json!({
+                                "name": to.name,
+                                "arguments": to.arguments,
+                                "output": to.output,
+                            })
+                        })
                         .collect();
 
                     match &outcome.reason {
@@ -414,11 +422,20 @@ impl Dispatcher {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
                             }
+                            // Bare end-of-turn means the LLM stopped without
+                            // calling task_complete or request_assistance — it
+                            // is a stall, not a success. Treating it as success
+                            // lets capability-gap exits masquerade as
+                            // accomplished objectives in run accounting.
                             TaskResult {
                                 task_id: tid.clone(),
-                                success: true,
+                                success: false,
                                 result: Some(result_json),
-                                error: None,
+                                error: Some(
+                                    "Agent ended turn without task_complete or \
+                                     request_assistance"
+                                        .into(),
+                                ),
                                 completed_at: Some(Utc::now()),
                                 worker_pod: Some("rust-llm-runner".into()),
                                 agent_name: Some(tt.clone()),

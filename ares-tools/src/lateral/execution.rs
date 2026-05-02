@@ -9,6 +9,29 @@ use crate::credentials;
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
+/// Reject calls that would land impacket in an interactive `getpass()` prompt.
+/// Without password or hash, impacket asks the controlling TTY for a password
+/// and crashes with EOFError when run from a non-interactive worker.
+fn require_password_or_hash(
+    tool: &str,
+    username: &str,
+    domain: Option<&str>,
+    password: Option<&str>,
+    hash: Option<&str>,
+) -> Result<()> {
+    if password.is_none() && hash.is_none() {
+        anyhow::bail!(
+            "{tool} requires a password or hash for {username}@{} but none was \
+             supplied. Credentials must be present in operation state for the \
+             (username, domain) pair so the resolver can inject them, or the \
+             LLM must call the *_kerberos variant with a valid ticket. Refusing \
+             to run because impacket would call getpass() and crash on no-TTY.",
+            domain.unwrap_or("(no domain)")
+        );
+    }
+    Ok(())
+}
+
 /// Execute a command on a remote host via impacket-psexec.
 ///
 /// Required args: `target`, `username`
@@ -21,6 +44,8 @@ pub async fn psexec(args: &Value) -> Result<ToolOutput> {
     let domain = optional_str(args, "domain");
     let command =
         optional_str(args, "command").unwrap_or(r#"cmd.exe /c "whoami && hostname && ipconfig""#);
+
+    require_password_or_hash("psexec", username, domain, password, hash)?;
 
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
@@ -76,6 +101,8 @@ pub async fn wmiexec(args: &Value) -> Result<ToolOutput> {
     let domain = optional_str(args, "domain");
     let command = optional_str(args, "command").unwrap_or("whoami");
 
+    require_password_or_hash("wmiexec", username, domain, password, hash)?;
+
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);
 
@@ -128,6 +155,8 @@ pub async fn smbexec(args: &Value) -> Result<ToolOutput> {
     let hash = optional_str(args, "hash");
     let domain = optional_str(args, "domain");
     let command = optional_str(args, "command").unwrap_or("whoami");
+
+    require_password_or_hash("smbexec", username, domain, password, hash)?;
 
     let (auth_str, extra_args) =
         credentials::impacket_auth(domain, username, password, hash, target);

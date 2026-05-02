@@ -1,5 +1,23 @@
 use super::*;
 
+/// Test-only wrappers that synthesize an empty `ToolOutputCtx` so legacy tests
+/// (predating tool-aware extraction) can keep their `(output, domain)` shape.
+fn extract_plaintext_passwords(output: &str, default_domain: &str) -> Vec<Credential> {
+    let ctx = ToolOutputCtx {
+        arguments: None,
+        output,
+    };
+    super::passwords::extract_plaintext_passwords(&ctx, default_domain)
+}
+
+fn extract_from_output_text(output: &str, default_domain: &str) -> TextExtractions {
+    let ctx = ToolOutputCtx {
+        arguments: None,
+        output,
+    };
+    super::extract_from_output_text(&ctx, default_domain)
+}
+
 #[test]
 fn extract_ntlm_with_domain() {
     let output =
@@ -347,6 +365,36 @@ SMB  192.168.58.11  445  DC02  [+] child.contoso.local\\jdoe:jdoe";
     assert_eq!(result.credentials[0].password, "jdoe");
     assert_eq!(result.credentials[0].domain, "child.contoso.local");
     assert_eq!(result.credentials[0].source, "netexec_auth");
+}
+
+#[test]
+fn extract_netexec_skips_hash_auth_echo() {
+    let output =
+        "SMB  192.168.58.11  445  DC01  [+] contoso.local\\jeor.mormont:6dccf1c567c56a40e56691a723a49664 (Pwn3d!)";
+    let args = serde_json::json!({"hashes": "6dccf1c567c56a40e56691a723a49664"});
+    let ctx = ToolOutputCtx {
+        arguments: Some(&args),
+        output,
+    };
+    let result = super::extract_from_output_text(&ctx, "contoso.local");
+    assert!(
+        result.credentials.is_empty(),
+        "hash echo must not become a credential: {:?}",
+        result.credentials
+    );
+}
+
+#[test]
+fn extract_netexec_password_auth_still_extracted() {
+    let output = "SMB  192.168.58.11  445  DC01  [+] contoso.local\\jdoe:RealPass1 (Pwn3d!)";
+    let args = serde_json::json!({"password": "RealPass1"});
+    let ctx = ToolOutputCtx {
+        arguments: Some(&args),
+        output,
+    };
+    let result = super::extract_from_output_text(&ctx, "contoso.local");
+    assert_eq!(result.credentials.len(), 1);
+    assert_eq!(result.credentials[0].password, "RealPass1");
 }
 
 #[test]

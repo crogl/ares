@@ -22,6 +22,9 @@ pub const KEY_USERS: &str = "users";
 pub const KEY_SHARES: &str = "shares";
 /// Redis SET key suffix for discovered domain names.
 pub const KEY_DOMAINS: &str = "domains";
+/// Redis HASH key suffix for candidate domains awaiting corroboration.
+/// Field = lowercase FQDN, value = `CandidateDomain` JSON.
+pub const KEY_CANDIDATE_DOMAINS: &str = "candidate_domains";
 /// Redis HASH key suffix for discovered vulnerabilities (vuln_id → JSON).
 pub const KEY_VULNS: &str = "vulns";
 /// Redis SET key suffix for exploited vulnerability IDs.
@@ -160,6 +163,10 @@ pub const BLUE_OP_PREFIX: &str = "ares:blue:op";
 /// Redis key prefix for investigation status.
 #[cfg(feature = "blue")]
 pub const BLUE_STATUS_PREFIX: &str = "ares:blue:inv";
+
+/// Redis HASH key suffix for forged inter-realm Kerberos tickets.
+/// Field = `{source}:{target}:{username}`, value = `KerberosTicket` JSON.
+pub const KEY_KERBEROS_TICKETS: &str = "kerberos_tickets";
 
 #[cfg(test)]
 mod tests {

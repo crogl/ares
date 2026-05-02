@@ -102,6 +102,16 @@ pub async fn undominated_forests(state: &SharedState) -> Vec<String> {
     )
 }
 
+/// Redis-authoritative count of red-team tasks still pending completion.
+async fn redis_pending_red_tasks(dispatcher: &Arc<Dispatcher>) -> Result<usize, redis::RedisError> {
+    let key = ares_core::state::build_key(
+        &dispatcher.config.operation_id,
+        ares_core::state::KEY_PENDING_TASKS,
+    );
+    let mut conn = dispatcher.queue.connection();
+    redis::cmd("HLEN").arg(&key).query_async(&mut conn).await
+}
+
 /// Extract forest root from a domain FQDN.
 ///
 /// For `north.contoso.local` → `contoso.local`
@@ -351,15 +361,30 @@ pub async fn wait_for_completion(
 
                 let active_tasks = dispatcher.tracker.total().await;
                 let deferred_tasks = dispatcher.deferred.total_count().await;
+                let redis_pending_tasks = match redis_pending_red_tasks(dispatcher).await {
+                    Ok(count) => count,
+                    Err(e) => {
+                        warn!(err = %e, "Failed to read pending red task count from Redis");
+                        usize::MAX
+                    }
+                };
 
-                if active_tasks == 0 && deferred_tasks == 0 {
+                if redis_pending_tasks == 0 && deferred_tasks == 0 {
+                    if active_tasks != 0 {
+                        warn!(
+                            active_tasks,
+                            "Local active-task tracker is non-zero, but Redis has no pending tasks; treating tracker entries as stale and proceeding with shutdown"
+                        );
+                    }
                     info!("All red team tasks drained");
                     break;
                 }
 
                 info!(
                     active_tasks,
-                    deferred_tasks, "Waiting for red team tasks to drain before shutdown..."
+                    redis_pending_tasks,
+                    deferred_tasks,
+                    "Waiting for red team tasks to drain before shutdown..."
                 );
 
                 tokio::select! {

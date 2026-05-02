@@ -54,22 +54,70 @@ impl TextExtractions {
     }
 }
 
+/// Tool-call context paired with stdout, used by `extract_from_output_text`
+/// to gate noisy regexes on the invoking tool's arguments.
+///
+/// `arguments` is best-effort: when None (e.g. legacy bare-string tool_outputs
+/// payloads), extractors fall back to the untyped behavior they had before this
+/// struct was introduced.
+pub struct ToolOutputCtx<'a> {
+    pub arguments: Option<&'a serde_json::Value>,
+    pub output: &'a str,
+}
+
+impl<'a> ToolOutputCtx<'a> {
+    /// Returns true when the invoking arguments indicate the tool was authenticated
+    /// with a hash rather than a plaintext password. Tools like nxc/netexec echo the
+    /// supplied secret back on success lines (`[+] DOMAIN\user:secret (Pwn3d!)`),
+    /// so a hash-auth invocation produces a hash where credential regexes expect a
+    /// password. Extractors must short-circuit `password` regexes for these calls.
+    pub(crate) fn is_hash_auth(&self) -> bool {
+        let Some(args) = self.arguments else {
+            return false;
+        };
+        let Some(obj) = args.as_object() else {
+            return false;
+        };
+        for (k, v) in obj {
+            let key = k.to_lowercase();
+            // Common spellings across our tool wrappers (nxc, impacket-*, etc.)
+            let is_hash_key = matches!(
+                key.as_str(),
+                "hash" | "hashes" | "nthash" | "lmhash" | "ntlm_hash" | "nt_hash" | "lm_hash"
+            );
+            if !is_hash_key {
+                continue;
+            }
+            let nonempty = match v {
+                serde_json::Value::String(s) => !s.trim().is_empty(),
+                serde_json::Value::Array(a) => !a.is_empty(),
+                serde_json::Value::Null => false,
+                _ => true,
+            };
+            if nonempty {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Extract all discoverable entities from raw output text.
 ///
 /// Runs all extraction passes and returns the combined results.
-pub fn extract_from_output_text(output: &str, default_domain: &str) -> TextExtractions {
+pub fn extract_from_output_text(ctx: &ToolOutputCtx<'_>, default_domain: &str) -> TextExtractions {
     let mut result = TextExtractions::default();
-    if output.is_empty() {
+    if ctx.output.is_empty() {
         return result;
     }
 
-    result.hosts = extract_hosts(output);
-    result.users = extract_users(output, default_domain);
-    result.credentials = extract_plaintext_passwords(output, default_domain);
-    result.shares = extract_shares(output);
-    result.hashes = extract_hashes(output, default_domain);
+    result.hosts = extract_hosts(ctx.output);
+    result.users = extract_users(ctx.output, default_domain);
+    result.credentials = extract_plaintext_passwords(ctx, default_domain);
+    result.shares = extract_shares(ctx.output);
+    result.hashes = extract_hashes(ctx.output, default_domain);
 
-    let cracked = extract_cracked_passwords(output, default_domain);
+    let cracked = extract_cracked_passwords(ctx.output, default_domain);
     result.credentials.extend(cracked);
 
     result
@@ -244,7 +292,48 @@ mod unit_tests {
 
     #[test]
     fn extract_from_output_text_empty() {
-        let result = extract_from_output_text("", "contoso.local");
+        let ctx = ToolOutputCtx {
+            arguments: None,
+            output: "",
+        };
+        let result = extract_from_output_text(&ctx, "contoso.local");
         assert!(result.is_empty());
+    }
+
+    #[test]
+    fn is_hash_auth_detects_common_keys() {
+        let args = serde_json::json!({"hashes": "aad3:abcd"});
+        let ctx = ToolOutputCtx {
+            arguments: Some(&args),
+            output: "",
+        };
+        assert!(ctx.is_hash_auth());
+
+        let args = serde_json::json!({"nthash": "abcd"});
+        let ctx = ToolOutputCtx {
+            arguments: Some(&args),
+            output: "",
+        };
+        assert!(ctx.is_hash_auth());
+
+        let args = serde_json::json!({"hashes": ""});
+        let ctx = ToolOutputCtx {
+            arguments: Some(&args),
+            output: "",
+        };
+        assert!(!ctx.is_hash_auth());
+
+        let args = serde_json::json!({"password": "P@ss"});
+        let ctx = ToolOutputCtx {
+            arguments: Some(&args),
+            output: "",
+        };
+        assert!(!ctx.is_hash_auth());
+
+        let ctx = ToolOutputCtx {
+            arguments: None,
+            output: "",
+        };
+        assert!(!ctx.is_hash_auth());
     }
 }

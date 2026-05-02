@@ -3,7 +3,7 @@ Domain: {{ domain }}
 Targets: {{ targets_display }}
 DC IP: {{ dc_ip_display }}
 Username: {{ user_display }}
-Credential ({{ cred_type }}): {{ cred_value }}
+Auth: {{ cred_type }} (auto-resolved at dispatch — do NOT pass password/hash/ticket fields)
 {% if hash_type -%}
 Hash Type: {{ hash_type }}
 {% endif -%}
@@ -20,7 +20,7 @@ Task ID: {{ task_id }}
 {{ hash_note }}
 
 {% endif -%}
-Use the exact credential value above; do not substitute placeholders. If DC IP is provided, pass -dc-ip to Kerberos/LDAP tools to avoid DNS issues. **PRIORITY ORDER when creds available:**
+Reference the principal by username + domain only; the worker injects the credential at dispatch. If DC IP is provided, pass -dc-ip to Kerberos/LDAP tools to avoid DNS issues. **PRIORITY ORDER when creds available:**
 1. gpp_password_finder + sysvol_script_search (LOW HANGING FRUIT - run first!)
 2. Kerberoast for service account hashes
 3. secretsdump if admin access exists

@@ -8,8 +8,9 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use redis::AsyncCommands;
 use tokio::sync::watch;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -382,7 +383,120 @@ pub async fn auto_credential_expansion(
                     .await;
             }
         }
+
+        // 5. Re-dispatch unsuccessful mssql_access vulns when a new same-domain
+        //    cleartext credential is available. Cross-forest MSSQL pivots fail
+        //    if the LLM tries them before any usable cred exists in the linked
+        //    server's source forest — once that cred arrives, push the vuln
+        //    back into the exploitation ZSET so the LLM gets another shot
+        //    with the new credential set in its prompt context.
+        let retries = collect_mssql_retries(&dispatcher).await;
+        for retry in retries {
+            if let Err(e) = requeue_mssql_vuln(&dispatcher, &retry).await {
+                debug!(err = %e, vuln_id = %retry.vuln_id, "Failed to requeue mssql_access");
+                continue;
+            }
+            info!(
+                vuln_id = %retry.vuln_id,
+                cred_user = %retry.cred_user,
+                cred_domain = %retry.cred_domain,
+                "Re-queued mssql_access for new credential"
+            );
+            dispatcher
+                .state
+                .write()
+                .await
+                .mark_processed(DEDUP_MSSQL_RETRY, retry.dedup_key.clone());
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_MSSQL_RETRY, &retry.dedup_key)
+                .await;
+        }
     }
+}
+
+struct MssqlRetry {
+    vuln_id: String,
+    vuln_json: String,
+    priority: i32,
+    cred_user: String,
+    cred_domain: String,
+    dedup_key: String,
+}
+
+/// Walk discovered vulnerabilities for `mssql_access` entries that are not
+/// yet exploited and have at least one matching unseen credential. Builds
+/// a (vuln, credential) work item with a stable dedup key so the same
+/// vuln/cred pair is not re-queued repeatedly.
+async fn collect_mssql_retries(dispatcher: &Arc<Dispatcher>) -> Vec<MssqlRetry> {
+    let state = dispatcher.state.read().await;
+    let mut out = Vec::new();
+    for vuln in state.discovered_vulnerabilities.values() {
+        if vuln.vuln_type != "mssql_access" {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+        let vuln_domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_lowercase();
+        for cred in &state.credentials {
+            if cred.password.is_empty() || cred.domain.is_empty() {
+                continue;
+            }
+            // Match on domain when the vuln carries one. Otherwise match any
+            // cred — the LLM will pick from the prompt's credential list.
+            let cred_dom = cred.domain.to_lowercase();
+            let matches_domain = vuln_domain.is_empty()
+                || cred_dom == vuln_domain
+                || cred_dom.ends_with(&format!(".{vuln_domain}"))
+                || vuln_domain.ends_with(&format!(".{cred_dom}"));
+            if !matches_domain {
+                continue;
+            }
+            let dedup_key = format!(
+                "{}:{}:{}",
+                vuln.vuln_id,
+                cred.username.to_lowercase(),
+                cred_dom
+            );
+            if state.is_processed(DEDUP_MSSQL_RETRY, &dedup_key) {
+                continue;
+            }
+            let Ok(vuln_json) = serde_json::to_string(vuln) else {
+                continue;
+            };
+            out.push(MssqlRetry {
+                vuln_id: vuln.vuln_id.clone(),
+                vuln_json,
+                priority: vuln.priority,
+                cred_user: cred.username.clone(),
+                cred_domain: cred.domain.clone(),
+                dedup_key,
+            });
+        }
+    }
+    out
+}
+
+/// Push the vuln back into the exploitation ZSET. The exploitation_workflow
+/// loop pops by lowest score; reuse the original priority so the retry
+/// competes fairly with other work.
+async fn requeue_mssql_vuln(
+    dispatcher: &Arc<Dispatcher>,
+    retry: &MssqlRetry,
+) -> anyhow::Result<()> {
+    let key = dispatcher.state.vuln_queue_key().await;
+    let mut conn = dispatcher.queue.connection();
+    let _: () = conn
+        .zadd(&key, &retry.vuln_json, retry.priority as f64)
+        .await?;
+    let _: () = conn.expire(&key, 86400).await.unwrap_or(());
+    Ok(())
 }
 
 struct ExpansionWork {

@@ -104,6 +104,102 @@ pub fn is_callback_tool(name: &str) -> bool {
     CALLBACK_TOOLS.contains(&name)
 }
 
+/// JSON schema property keys that contain secret material.
+///
+/// These are stripped from every tool's `input_schema` before tool definitions
+/// are sent to the LLM. The LLM names principals (`username`, `domain`); the
+/// worker's credential resolver injects secrets from harvested operation state
+/// at dispatch time.
+///
+/// Keep this in lock-step with `ares-cli/src/worker/credential_resolver.rs::CREDENTIAL_KEYS`.
+pub const SECRET_SCHEMA_KEYS: &[&str] = &[
+    "password",
+    "hash",
+    "nt_hash",
+    "ntlm_hash",
+    "aes_key",
+    "aes256_key",
+    "ticket_path",
+    "krbtgt_hash",
+    "child_krbtgt_hash",
+    "parent_krbtgt_hash",
+    "trust_key",
+    "trust_aes_key",
+    "trust_hash",
+    "admin_hash",
+    "coerce_password",
+    "coerce_hash",
+    "domain_sid",
+    "source_sid",
+    "target_sid",
+    "extra_sid",
+    "kerberos_keys",
+];
+
+/// Names of callback tools whose `password` / `hash` arguments are part of the
+/// callback contract (e.g. tools that record harvested credentials). These are
+/// exempt from secret-stripping.
+const CALLBACK_NAMES_WITH_SECRETS: &[&str] = &[
+    "list_credentials",
+    "get_credential_summary",
+    "get_hash_summary",
+    "get_all_credentials",
+    "get_all_hashes",
+    "get_hash_value",
+];
+
+/// Per-tool exposed-key exemptions. For tools where a "secret-shaped" argument
+/// is actually input *data* (e.g. `password_spray.password` is the candidate
+/// password to spray, not a credential to look up), the named keys remain in
+/// the LLM-visible schema. The credential resolver will not inject anything
+/// for these keys because the calls have no `(username, domain)` principal.
+fn exposed_secret_keys(tool_name: &str) -> &'static [&'static str] {
+    match tool_name {
+        "password_spray" => &["password"],
+        _ => &[],
+    }
+}
+
+/// Strip every secret-bearing property from a tool's input schema.
+///
+/// Mutates `input_schema.properties` to remove keys in `SECRET_SCHEMA_KEYS`,
+/// and prunes those keys from the `required[]` array. The LLM never sees a
+/// slot for them — except for keys explicitly exposed by `exposed_secret_keys`
+/// for tools where the argument represents input data rather than a credential.
+fn strip_secret_fields(tool: &mut ToolDefinition) {
+    if CALLBACK_NAMES_WITH_SECRETS.contains(&tool.name.as_str()) {
+        return;
+    }
+    let Some(obj) = tool.input_schema.as_object_mut() else {
+        return;
+    };
+
+    let exposed = exposed_secret_keys(&tool.name);
+
+    if let Some(props) = obj.get_mut("properties").and_then(|v| v.as_object_mut()) {
+        for key in SECRET_SCHEMA_KEYS {
+            if exposed.contains(key) {
+                continue;
+            }
+            props.remove(*key);
+        }
+    }
+
+    if let Some(req) = obj.get_mut("required").and_then(|v| v.as_array_mut()) {
+        req.retain(|v| match v.as_str() {
+            Some(s) => exposed.contains(&s) || !SECRET_SCHEMA_KEYS.contains(&s),
+            None => true,
+        });
+    }
+}
+
+/// Apply `strip_secret_fields` to every tool in a definitions list.
+fn strip_secrets_from_all(tools: &mut [ToolDefinition]) {
+    for tool in tools.iter_mut() {
+        strip_secret_fields(tool);
+    }
+}
+
 fn callback_tool_definitions() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
@@ -217,6 +313,10 @@ pub fn tools_for_role(role: AgentRole) -> Vec<ToolDefinition> {
     tools.extend(reporting::tool_definitions());
     tools.extend(callback_tool_definitions());
 
+    // Strip credential fields from every tool schema. The LLM names principals;
+    // the worker's credential_resolver injects secrets at dispatch time.
+    strip_secrets_from_all(&mut tools);
+
     tools
 }
 
@@ -251,6 +351,10 @@ pub fn tools_for_capabilities(capabilities: &[String]) -> Vec<ToolDefinition> {
     // Always include reporting + callback tools
     matched.extend(reporting::tool_definitions());
     matched.extend(callback_tool_definitions());
+
+    // Strip credential fields — see tools_for_role.
+    strip_secrets_from_all(&mut matched);
+
     matched
 }
 
@@ -283,6 +387,92 @@ mod tests {
         assert!(is_callback_tool("list_credentials"));
         assert!(!is_callback_tool("nmap_scan"));
         assert!(!is_callback_tool("secretsdump"));
+    }
+
+    #[test]
+    fn no_secret_fields_in_any_role_schema() {
+        for role in [
+            AgentRole::Recon,
+            AgentRole::CredentialAccess,
+            AgentRole::Cracker,
+            AgentRole::Acl,
+            AgentRole::Privesc,
+            AgentRole::Lateral,
+            AgentRole::Coercion,
+            AgentRole::Orchestrator,
+        ] {
+            let tools = tools_for_role(role);
+            for tool in &tools {
+                if CALLBACK_NAMES_WITH_SECRETS.contains(&tool.name.as_str()) {
+                    continue;
+                }
+                let exposed = exposed_secret_keys(&tool.name);
+                let props = tool
+                    .input_schema
+                    .get("properties")
+                    .and_then(|v| v.as_object());
+                if let Some(props) = props {
+                    for key in SECRET_SCHEMA_KEYS {
+                        if exposed.contains(key) {
+                            continue;
+                        }
+                        assert!(
+                            !props.contains_key(*key),
+                            "Tool '{}' (role {:?}) leaks secret field '{}' to LLM",
+                            tool.name,
+                            role,
+                            key
+                        );
+                    }
+                }
+                let req = tool.input_schema.get("required").and_then(|v| v.as_array());
+                if let Some(req) = req {
+                    for v in req {
+                        if let Some(s) = v.as_str() {
+                            assert!(
+                                exposed.contains(&s) || !SECRET_SCHEMA_KEYS.contains(&s),
+                                "Tool '{}' (role {:?}) requires secret field '{}'",
+                                tool.name,
+                                role,
+                                s
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn no_secret_fields_in_capability_schemas() {
+        let caps: Vec<String> = ["psexec", "secretsdump", "generate_golden_ticket"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let tools = tools_for_capabilities(&caps);
+        for tool in &tools {
+            if CALLBACK_NAMES_WITH_SECRETS.contains(&tool.name.as_str()) {
+                continue;
+            }
+            let exposed = exposed_secret_keys(&tool.name);
+            if let Some(props) = tool
+                .input_schema
+                .get("properties")
+                .and_then(|v| v.as_object())
+            {
+                for key in SECRET_SCHEMA_KEYS {
+                    if exposed.contains(key) {
+                        continue;
+                    }
+                    assert!(
+                        !props.contains_key(*key),
+                        "Capability tool '{}' leaks secret field '{}' to LLM",
+                        tool.name,
+                        key
+                    );
+                }
+            }
+        }
     }
 
     #[test]
