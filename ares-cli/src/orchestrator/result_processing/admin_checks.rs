@@ -11,7 +11,7 @@ use super::timeline::{create_admin_upgrade_timeline_event, create_domain_admin_t
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::StateInner;
 
-/// Resolve a NetBIOS/flat domain name (e.g. `ESSOS`) to a known FQDN.
+/// Resolve a NetBIOS/flat domain name (e.g. `FABRIKAM`) to a known FQDN.
 ///
 /// Checks three sources, in order:
 /// 1. `state.trusted_domains`: each `TrustInfo` carries an explicit `flat_name`.
@@ -417,12 +417,12 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
     // actually `<sid>-<rid>` entries from a different forest. Caching a
     // regex-truncated FSP SID against the task's payload domain misforges
     // every downstream golden / inter-realm ticket — caused op-20260429-164553
-    // to forge a TGT for sevenkingdoms.local with a bogus ExtraSid that the
+    // to forge a TGT for contoso.local with a bogus ExtraSid that the
     // parent KDC rejected with rpc_s_access_denied.
     //
     // lsaquery is the primary unauth path for cross-forest target SID discovery
     // — it routinely succeeds against null sessions where impacket-lookupsid
-    // gets STATUS_ACCESS_DENIED. op-20260429-181500 discovered essos's SID via
+    // gets STATUS_ACCESS_DENIED. op-20260429-181500 discovered fabrikam's SID via
     // lsaquery but failed to cache it (only lookupsid was wired up), so the
     // subsequent forge_inter_realm_and_dump fired with has_target_sid=false
     // and produced no krbtgt extraction.
@@ -438,12 +438,12 @@ pub(crate) async fn extract_and_cache_domain_sid(payload: &Value, dispatcher: &A
 
     // Resolve the FQDN this SID belongs to. Anchor preference order:
     // 1. Flat name parsed from the output — authoritative when present. For
-    //    impacket-lookupsid we get it from the RID lines (e.g. `500: ESSOS\…`);
-    //    for rpcclient lsaquery we get it from `Domain Name: ESSOS`.
+    //    impacket-lookupsid we get it from the RID lines (e.g. `500: FABRIKAM\…`);
+    //    for rpcclient lsaquery we get it from `Domain Name: FABRIKAM`.
     // 2. Payload's `domain` field — used only when output has no flat name AND
     //    the field is a valid FQDN. The payload's domain is the *task* target,
     //    not necessarily the domain that produced the SID; trusting it blindly
-    //    misattributed essos.local's SID to north.sevenkingdoms.local in
+    //    misattributed fabrikam.local's SID to child.contoso.local in
     //    op-20260429-112418.
     // 3. State's primary domain — last resort, only when nothing else applies.
     let parsed_flat = lsaquery_flat.or_else(|| {
@@ -593,19 +593,19 @@ mod tests {
 
     #[test]
     fn resolve_flat_prefers_trust_metadata_over_primary_label() {
-        // Both north.sevenkingdoms.local and sevenkingdoms.local are known.
-        // Flat "SEVENKINGDOMS" should resolve to the parent FQDN even when
+        // Both child.contoso.local and contoso.local are known.
+        // Flat "CONTOSO" should resolve to the parent FQDN even when
         // both could plausibly match by first-label heuristic.
         let mut state = StateInner::new("op-test".into());
-        state.domains.push("north.sevenkingdoms.local".into());
-        state.domains.push("sevenkingdoms.local".into());
+        state.domains.push("child.contoso.local".into());
+        state.domains.push("contoso.local".into());
         state.trusted_domains.insert(
-            "sevenkingdoms.local".into(),
-            make_trust("sevenkingdoms.local", "SEVENKINGDOMS"),
+            "contoso.local".into(),
+            make_trust("contoso.local", "CONTOSO"),
         );
         assert_eq!(
-            resolve_flat_to_fqdn("SEVENKINGDOMS", &state).as_deref(),
-            Some("sevenkingdoms.local")
+            resolve_flat_to_fqdn("CONTOSO", &state).as_deref(),
+            Some("contoso.local")
         );
     }
 

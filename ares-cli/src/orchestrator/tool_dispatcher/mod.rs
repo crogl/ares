@@ -14,7 +14,7 @@ use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
-use crate::orchestrator::state::DISCOVERY_KEY_PREFIX;
+use crate::orchestrator::state::{SharedState, DISCOVERY_KEY_PREFIX};
 use crate::orchestrator::task_queue::TaskQueue;
 
 mod auth_throttle;
@@ -118,6 +118,65 @@ const AUTH_BEARING_TOOLS: &[&str] = &[
     "atexec",
     "smbclient_kerberos_shares",
 ];
+
+/// Spray-style tools that accept `excluded_users` to skip already-locked
+/// accounts. The dispatcher auto-injects the current quarantine list so the
+/// LLM cannot omit it (or pass a stale value) and re-lock those accounts.
+const SPRAY_TOOLS: &[&str] = &["password_spray", "username_as_password"];
+
+/// Merge the current per-domain quarantine list into `excluded_users` on
+/// spray-style tool calls. Mutates `arguments` in place; no-op for tools
+/// outside `SPRAY_TOOLS`, when `state` is unset, or when no domain arg is
+/// present. Preserves any LLM-supplied `excluded_users` by union-merging.
+pub(super) async fn inject_excluded_users(
+    state: &Option<SharedState>,
+    tool_name: &str,
+    arguments: &mut serde_json::Value,
+) {
+    if !SPRAY_TOOLS.contains(&tool_name) {
+        return;
+    }
+    let Some(state) = state else { return };
+    let Some(domain) = arguments
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let quarantined = state.read().await.quarantined_users_in_domain(&domain);
+    if quarantined.is_empty() {
+        return;
+    }
+
+    let existing = arguments
+        .get("excluded_users")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let mut set: std::collections::BTreeSet<String> = quarantined
+        .iter()
+        .map(|u| u.to_lowercase())
+        .collect();
+    for u in existing.split(',') {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            set.insert(trimmed.to_lowercase());
+        }
+    }
+    let merged: Vec<String> = set.into_iter().collect();
+    if let Some(obj) = arguments.as_object_mut() {
+        obj.insert(
+            "excluded_users".to_string(),
+            serde_json::Value::String(merged.join(",")),
+        );
+        debug!(
+            tool = %tool_name,
+            domain = %domain,
+            count = merged.len(),
+            "Auto-injected excluded_users from quarantine"
+        );
+    }
+}
 
 /// Extract a credential key from tool call arguments for rate limiting.
 /// Returns `Some("user@domain")` if the tool authenticates with credentials.

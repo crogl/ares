@@ -83,6 +83,17 @@ pub struct User {
     pub source: String,
 }
 
+/// AD built-in accounts that ship `userAccountControl & ACCOUNTDISABLE` set
+/// out of the box. Spraying or otherwise auth'ing against these can never
+/// succeed and just burns the per-account badPwdCount budget — which on
+/// shared lockout policies trips real accounts in the same window.
+pub fn is_always_disabled_account(username: &str) -> bool {
+    matches!(
+        username.to_lowercase().as_str(),
+        "guest" | "defaultaccount" | "wdagutilityaccount" | "krbtgt"
+    )
+}
+
 /// Discovered credential.
 ///
 /// Matches Python: `class Credential(Model)`

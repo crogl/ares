@@ -602,7 +602,7 @@ mod tests {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let vuln = make_vuln("VULN-ACL-003", "genericall", "KINGSLANDING$");
+        let vuln = make_vuln("VULN-ACL-003", "genericall", "DC01$");
         let added = state.publish_vulnerability(&q, vuln).await.unwrap();
         assert!(added);
 

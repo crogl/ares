@@ -65,6 +65,10 @@ pub const KEY_DOMAIN_SIDS: &str = "domain_sids";
 pub const KEY_ADMIN_NAMES: &str = "admin_names";
 /// Redis HASH key suffix mapping domain FQDN → TrustInfo JSON.
 pub const KEY_TRUSTED_DOMAINS: &str = "trusted_domains";
+/// Redis SET key suffix for domain FQDNs where krbtgt has been compromised
+/// (full domain admin via DCSync). Mirrors `state.dominated_domains` so
+/// post-mortem reports and `SCARD` checks see the same view.
+pub const KEY_DOMINATED_DOMAINS: &str = "dominated_domains";
 
 /// Redis STRING key suffix for operation status JSON.
 pub const KEY_STATUS: &str = "status";
@@ -208,6 +212,7 @@ mod tests {
             KEY_DOMAIN_SIDS,
             KEY_ADMIN_NAMES,
             KEY_TRUSTED_DOMAINS,
+            KEY_DOMINATED_DOMAINS,
             KEY_STATUS,
             KEY_MODEL,
             KEY_STOP_REQUESTED,
@@ -254,6 +259,7 @@ mod tests {
             KEY_DOMAIN_SIDS,
             KEY_ADMIN_NAMES,
             KEY_TRUSTED_DOMAINS,
+            KEY_DOMINATED_DOMAINS,
             KEY_STATUS,
             KEY_MODEL,
             KEY_STOP_REQUESTED,

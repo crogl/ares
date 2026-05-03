@@ -228,6 +228,18 @@ pub async fn process_completed_task(
                     err = err_msg,
                     "Exploit failure recorded as timeline event"
                 );
+                // Increment per-vuln failure counter; the exploitation workflow
+                // skips the vuln once it crosses MAX_EXPLOIT_FAILURES, so a
+                // stuck vuln (e.g. mssql_access with 0 creds) cannot loop
+                // forever.
+                let count = dispatcher.state.record_exploit_failure(&vuln_id).await;
+                if count >= crate::orchestrator::state::MAX_EXPLOIT_FAILURES {
+                    warn!(
+                        vuln_id = %vuln_id,
+                        failure_count = count,
+                        "Vuln abandoned — exceeded max exploit failures"
+                    );
+                }
             }
         }
     }
@@ -249,10 +261,124 @@ pub async fn process_completed_task(
         }
     }
 
+    // Per-user lockout quarantine for enumeration paths (no cred_key set).
+    // username_as_password and password_spray test multiple users in one
+    // task — when a specific user trips STATUS_ACCOUNT_LOCKED_OUT we
+    // remember that principal so future enum tasks can skip it.
+    if has_lockout_in_result(result) {
+        let locked = extract_locked_usernames_from_result(&result.result);
+        if !locked.is_empty() {
+            let resolved_domain = if let Some(ref td) = task_domain {
+                td.clone()
+            } else {
+                resolve_domain_from_ip(dispatcher, task_target_ip.as_deref()).await
+            };
+            if !resolved_domain.is_empty() {
+                let mut state = dispatcher.state.write().await;
+                for (user, dom_hint) in &locked {
+                    let dom = dom_hint.as_deref().unwrap_or(&resolved_domain);
+                    warn!(
+                        user = %user,
+                        domain = %dom,
+                        task_id = %task_id,
+                        "User quarantined for 5 min: enumeration lockout detected"
+                    );
+                    state.quarantine_user(user, dom);
+                }
+            }
+        }
+    }
+
     dispatcher.credential_access_notify.notify_waiters();
     dispatcher.delegation_notify.notify_waiters();
 
     let _ = dispatcher.notify_state_update().await;
+}
+
+/// Extract `(username, optional domain)` pairs from a tool result that
+/// reported a per-user lockout. Looks at `tool_outputs`, `output`,
+/// `tool_output`, and `summary` fields for netexec-style lines such as:
+///
+///   `[-] DOMAIN\\username:password STATUS_ACCOUNT_LOCKED_OUT`
+///   `[-] username:password KDC_ERR_CLIENT_REVOKED`
+///
+/// Returns lower-cased usernames; the domain (if present in the prefix) is
+/// also lowercased. Used by `process_completed_task` to populate
+/// `quarantined_users` for enumeration tasks that lack a `cred_key`.
+pub(crate) fn extract_locked_usernames_from_result(
+    result: &Option<Value>,
+) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    let Some(payload) = result else {
+        return out;
+    };
+
+    let mut texts: Vec<String> = Vec::new();
+    if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                texts.push(s.to_string());
+            } else if let Some(s) = item.get("output").and_then(|v| v.as_str()) {
+                texts.push(s.to_string());
+            }
+        }
+    }
+    for key in &["summary", "output", "tool_output"] {
+        if let Some(s) = payload.get(*key).and_then(|v| v.as_str()) {
+            texts.push(s.to_string());
+        }
+    }
+
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for text in texts {
+        for line in text.lines() {
+            if !LOCKOUT_PATTERNS.iter().any(|p| line.contains(p)) {
+                continue;
+            }
+            let Some((user, domain)) = parse_lockout_principal(line) else {
+                continue;
+            };
+            let user_l = user.to_lowercase();
+            // Skip accounts that ship disabled — already filtered at
+            // dispatch time; quarantining them adds noise, not safety.
+            if matches!(
+                user_l.as_str(),
+                "guest" | "krbtgt" | "defaultaccount" | "wdagutilityaccount"
+            ) {
+                continue;
+            }
+            let dom_l = domain.map(|d| d.to_lowercase());
+            let dedup_key = format!("{user_l}@{}", dom_l.as_deref().unwrap_or(""));
+            if seen.insert(dedup_key) {
+                out.push((user_l, dom_l));
+            }
+        }
+    }
+    out
+}
+
+/// Pull `(username, Option<domain>)` from a netexec line that mentions a
+/// lockout. Requires the canonical `DOMAIN\user:pass` token preceding the
+/// lockout marker — this is the only form netexec emits for auth events.
+/// Bare `user:pass` (or `Welcome1:` style narrative tokens) are rejected
+/// because LLM summary text frequently contains `word:` tokens that are
+/// not principals (e.g. `Notable:`, `username_as_password:`).
+fn parse_lockout_principal(line: &str) -> Option<(String, Option<String>)> {
+    let marker_pos = LOCKOUT_PATTERNS
+        .iter()
+        .filter_map(|p| line.find(p))
+        .min()?;
+    let prefix = &line[..marker_pos];
+    let token = prefix
+        .split_whitespace()
+        .rev()
+        .find(|t| t.contains('\\') && t.contains(':'))?;
+    let principal = token.split(':').next()?;
+    let (dom, user) = principal.split_once('\\')?;
+    if user.is_empty() || dom.is_empty() {
+        return None;
+    }
+    Some((user.to_string(), Some(dom.to_string())))
 }
 
 /// Return true if the task result carries any parser-extracted discoveries.

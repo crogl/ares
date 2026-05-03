@@ -48,15 +48,19 @@ pub fn parse_domain_trusts(output: &str) -> Vec<Value> {
 
         let classified_type = classify_trust_type(trust_type, trust_attributes, cn);
 
-        // SID filtering is on by default for both forest and external trusts in
-        // modern AD (Server 2003+). Explicit attribute flags override the default,
-        // but absent the flag we still treat cross-forest/external trusts as
-        // filtered — mirrors `netdom trust /SidFiltering` which defaults to "yes"
-        // and blocks ExtraSid claims with RID < 1000.
-        let sid_filtering = trust_attributes & TRUST_ATTR_FOREST_TRANSITIVE != 0
-            || trust_attributes & TRUST_ATTR_QUARANTINED_DOMAIN != 0
-            || classified_type == "forest"
-            || classified_type == "external";
+        // Modern AD defaults to SID filtering on cross-forest/external trusts,
+        // but `netdom trust /SidFiltering /Disable` is a common lab and
+        // production reconfiguration with no corresponding LDAP attribute. The
+        // only authoritative LDAP-visible signal that filtering is *on* is the
+        // QUARANTINED_DOMAIN bit, which AD sets when a trust has been
+        // explicitly quarantined. Inferring filtering from FOREST_TRANSITIVE
+        // alone (or from classified_type) is a false-positive that
+        // permanently suppresses `forge_inter_realm_and_dump` against any
+        // misconfigured cross-forest trust — losing the entire foreign forest
+        // (the op-20260502-185055 fabrikam regression). The forge's
+        // dedup-on-empty-output path already handles the false-negative case
+        // (~30s doomed DCSync, then dedup locks and fallbacks fire).
+        let sid_filtering = trust_attributes & TRUST_ATTR_QUARANTINED_DOMAIN != 0;
 
         Some(json!({
             "domain": cn.to_lowercase(),
@@ -174,7 +178,9 @@ flatName: FABRIKAM
         assert_eq!(trusts[0]["flat_name"], "FABRIKAM");
         assert_eq!(trusts[0]["direction"], "bidirectional");
         assert_eq!(trusts[0]["trust_type"], "forest");
-        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
+        // FOREST_TRANSITIVE (0x08) alone does NOT imply SID filtering — only
+        // QUARANTINED_DOMAIN (0x04) is authoritative. See parse_domain_trusts.
+        assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]
@@ -245,8 +251,11 @@ flatName: CHILD
         assert_eq!(trusts.len(), 1);
         assert_eq!(trusts[0]["direction"], "outbound");
         assert_eq!(trusts[0]["trust_type"], "external");
-        // External trusts have SID filtering on by default in modern AD.
-        assert!(trusts[0]["sid_filtering"].as_bool().unwrap());
+        // Without QUARANTINED_DOMAIN we don't infer SID filtering — labs and
+        // misconfigured prod often have it disabled and there's no other
+        // LDAP-visible signal. The forge will attempt and dedup-on-empty if
+        // filtering is actually on.
+        assert!(!trusts[0]["sid_filtering"].as_bool().unwrap());
     }
 
     #[test]

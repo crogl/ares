@@ -541,12 +541,12 @@ mod tests {
     #[test]
     fn netbios_domain_resolution() {
         // Simulate the NetBIOS→FQDN resolution logic from the automation loop
-        let raw = "NORTH";
+        let raw = "CHILD";
         let raw_lower = raw.to_lowercase();
 
         // When netbios_to_fqdn has a mapping, use it
         let mut map = std::collections::HashMap::new();
-        map.insert("north".to_string(), "north.contoso.local".to_string());
+        map.insert("child".to_string(), "child.contoso.local".to_string());
 
         let resolved = if !raw_lower.contains('.') {
             map.get(&raw_lower)
@@ -555,7 +555,7 @@ mod tests {
         } else {
             raw_lower.clone()
         };
-        assert_eq!(resolved, "north.contoso.local");
+        assert_eq!(resolved, "child.contoso.local");
 
         // When FQDN is already used, pass through
         let fqdn_raw = "contoso.local";
@@ -570,7 +570,7 @@ mod tests {
         assert_eq!(resolved2, "contoso.local");
 
         // When no mapping exists, use the raw value
-        let unknown = "CHILD";
+        let unknown = "UNKNOWN";
         let unknown_lower = unknown.to_lowercase();
         let resolved3 = if !unknown_lower.contains('.') {
             map.get(&unknown_lower)
@@ -579,7 +579,7 @@ mod tests {
         } else {
             unknown_lower.clone()
         };
-        assert_eq!(resolved3, "child");
+        assert_eq!(resolved3, "unknown");
     }
 
     #[test]

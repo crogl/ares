@@ -627,7 +627,7 @@ async fn run_relay_and_coerce<P: CoerceProcs>(
     opts: RunOptions,
 ) -> Result<ToolOutput> {
     // attacker_ip MUST be one of our local interface IPs. The LLM has been
-    // observed to misread context and pass a *target* host (e.g. CASTELBLACK)
+    // observed to misread context and pass a *target* host (e.g. DC01)
     // as the attacker IP, which makes the relay listener bind to 0.0.0.0 but
     // PetitPotam tells the coerced DC to authenticate back to the wrong host
     // — auth never reaches the relay. Fail fast with a clear error.

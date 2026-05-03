@@ -17,6 +17,33 @@ use std::sync::LazyLock;
 pub(super) static PASSWORD_PREFIX_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)^password\s*:\s*").unwrap());
 
+/// Trust ranking for a credential source.
+///
+/// Used by `publish_credential` to decide whether a new (user, password)
+/// pair claiming a different realm than an existing entry should be treated
+/// as authoritative or as a phantom. Higher value = more trusted.
+///
+/// - **High (3)**: deterministic, host-bound dumps where the realm is
+///   pinned by the source DC's NTDS / LSA storage.
+/// - **Medium (2)**: realm validated by an actual authentication round-trip
+///   or by a cracking pipeline whose input was already realm-pinned.
+/// - **Low (1)**: heuristic / format-fragile sources where the realm is
+///   inferred from surrounding tool output and can bleed across forests
+///   (description fields, registry autologon, SYSVOL scripts).
+/// - **Unknown (0)**: anything not classified — treated as least trusted.
+pub(super) fn credential_source_trust(source: &str) -> u8 {
+    match source {
+        "secretsdump" | "lsa_secrets" | "dpapi" | "kerberos_extracted" | "initial" => 3,
+        "netexec_auth" | "cracked:hashcat" | "cracked:john" | "cracked" => 2,
+        "description_field"
+        | "autologon_registry"
+        | "sysvol_script"
+        | "user_description_leak"
+        | "netexec_password" => 1,
+        _ => 0,
+    }
+}
+
 /// Regex matching trailing parenthetical metadata like ` (Guest)`, ` (Pwn3d!)`.
 pub(super) static TRAILING_PAREN_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\s+\([^)]+\)\s*$").unwrap());
@@ -105,6 +132,12 @@ pub(super) fn sanitize_credential(
             }
         }
     }
+
+    // Canonicalize realm casing. AD realms are case-insensitive; storing them
+    // mixed-case (`CONTOSO.LOCAL` from one tool, `contoso.local` from another)
+    // splits the same identity into two state entries and slips past dedup
+    // keys built with `format!("{domain}\\{user}:{pass}")`.
+    cred.domain = cred.domain.to_lowercase();
 
     // Validate after sanitization
     if !crate::orchestrator::output_extraction::is_valid_credential(&cred.username, &cred.password)
@@ -320,6 +353,17 @@ mod tests {
         let result = sanitize_credential(cred, &HashMap::new()).unwrap();
         assert_eq!(result.username, "sam.wilson");
         assert_eq!(result.domain, "child.contoso.local");
+    }
+
+    #[test]
+    fn realm_case_canonicalized_to_lowercase() {
+        // Tools surface realm in mixed/upper case (`CONTOSO.LOCAL` from
+        // rpcclient, `Contoso.Local` from LDAP). Without canonicalization, the
+        // same identity ends up split across multiple state entries and
+        // realm-strict credential lookups miss matches.
+        let cred = make_cred("alice", "P@ssw0rd!", "CONTOSO.LOCAL");
+        let result = sanitize_credential(cred, &HashMap::new()).unwrap();
+        assert_eq!(result.domain, "contoso.local");
     }
 
     #[test]

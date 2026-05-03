@@ -130,7 +130,7 @@ pub fn extract_plaintext_passwords(
     // invoked with hash auth — the "secret" is the supplied NT/LM hash echoed
     // back, not a discovered plaintext password. Without this gate, every
     // successful pass-the-hash sweep ingests the hash a second time as a fake
-    // credential row (`jeor.mormont:6dccf1c567c56a40e56691a723a49664`).
+    // credential row (`frank:6dccf1c567c56a40e56691a723a49664`).
     let skip_netexec_auth = ctx.is_hash_auth();
 
     if !skip_netexec_auth {

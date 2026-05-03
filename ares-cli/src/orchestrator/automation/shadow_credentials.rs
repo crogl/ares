@@ -84,8 +84,8 @@ pub async fn auto_shadow_credentials(
 
                     // Find credential for the source user. The source user's
                     // own domain may differ from the vuln's target `domain`
-                    // (cross-forest ACL edges like petyer.baelish@sk →
-                    // jorah.mormont@essos), so we cannot domain-restrict the
+                    // (cross-forest ACL edges like charlie@contoso →
+                    // ivy@fabrikam), so we cannot domain-restrict the
                     // lookup against the target.
                     let credential = state.find_source_credential(&source_user, &domain);
                     let hash = if credential.is_none() {

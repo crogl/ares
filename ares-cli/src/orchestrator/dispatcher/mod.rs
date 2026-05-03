@@ -69,6 +69,28 @@ impl CredentialInflight {
     }
 }
 
+/// Result of a submission attempt that distinguishes between "deferred and
+/// safely enqueued" vs "dropped due to overflow / no role mapping".
+///
+/// Existing call sites use `throttled_submit` which collapses Deferred and
+/// Dropped into `Ok(None)`. New automations that need to dedup deferred work
+/// should use `throttled_submit_outcome` and only mark dedup on
+/// `Submitted`/`Deferred`, never on `Dropped` (otherwise overflowed tasks are
+/// lost forever and never retried by the deferred drain).
+#[derive(Debug, Clone)]
+pub enum SubmissionOutcome {
+    /// Task is running (LLM agent loop spawned). String is the task_id.
+    Submitted(String),
+    /// Task is in the deferred ZSET; the deferred processor will retry when
+    /// throttler/credential capacity opens up.
+    Deferred,
+    /// Task was lost: the deferred queue was at its per-type cap, or no role
+    /// mapping exists for the task_type/target_role. Caller MUST NOT mark this
+    /// item as dispatched; it will be re-considered on the next automation
+    /// tick when capacity is available.
+    Dropped,
+}
+
 /// Extract `"user@domain"` from a task payload's `credential` field.
 pub fn credential_key_from_payload(payload: &serde_json::Value) -> Option<String> {
     let cred = payload.get("credential")?;

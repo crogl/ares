@@ -20,8 +20,8 @@ operation:
   # stop_on_golden_ticket: true  — stop after golden ticket + all forests dominated
   #
   # Default (both false): wait until ALL forest root DCs are secretsdumped.
-  # Child domain DA does NOT count — e.g. north.sevenkingdoms.local krbtgt
-  # does not satisfy sevenkingdoms.local; trust escalation must complete first.
+  # Child domain DA does NOT count — e.g. child.contoso.local krbtgt
+  # does not satisfy contoso.local; trust escalation must complete first.
   # See docs/red.md "Operation Completion" for details.
   # stop_on_domain_admin: true
   stop_on_golden_ticket: false

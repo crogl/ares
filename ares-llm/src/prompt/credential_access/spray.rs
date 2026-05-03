@@ -50,6 +50,9 @@ pub(super) fn try_generate(
     if !cred_line.is_empty() {
         ctx.insert("cred_line", &cred_line);
     }
+    if !p.excluded_users.is_empty() {
+        ctx.insert("excluded_users", p.excluded_users);
+    }
     insert_state_context(&mut ctx, state, "credential_access", Some(dc_ip));
 
     Some(render_template_with_context(TASK_CREDACCESS_SPRAY, &ctx))

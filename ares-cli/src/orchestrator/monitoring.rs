@@ -367,41 +367,67 @@ pub(crate) const CRITICAL_TOOLS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Query Redis for each worker's tool inventory and report any missing
-/// critical tools. Returns a list of (role, missing_tools) pairs.
+/// Check if a binary is available on the local PATH.
+async fn is_in_path(binary: &str) -> bool {
+    tokio::process::Command::new("which")
+        .arg(binary)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await
+        .is_ok_and(|s| s.success())
+}
+
+/// Report any missing critical tools per role.
+///
+/// In local-dispatch mode (`ARES_TOOL_DISPATCH=local`) there are no separate
+/// worker processes publishing inventory to Redis, so we probe the local
+/// PATH directly. In remote mode we read each worker's published inventory
+/// from `ares:tools:ares-{role}-agent`.
 pub(crate) async fn preflight_tool_check(
     conn: &mut redis::aio::ConnectionManager,
 ) -> Vec<(String, Vec<String>)> {
     use redis::AsyncCommands;
 
+    let local_dispatch = std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("local");
     let mut problems = Vec::new();
 
     for &(role, critical) in CRITICAL_TOOLS {
-        // Worker publishes inventory under hyphenated agent name
-        // (see ares-cli/src/worker/config.rs: agent_name = format!("ares-{}-agent", role.replace('_', "-"))).
-        // Mirror that here so role names with underscores resolve correctly.
-        let agent_key = format!("ares:tools:ares-{}-agent", role.replace('_', "-"));
-        let available: Vec<String> = match conn.get::<_, Option<String>>(&agent_key).await {
-            Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
-            _ => {
-                // No inventory published yet — worker may not have started
-                warn!(
-                    role = role,
-                    "No tool inventory found — worker may not be running"
-                );
-                problems.push((
-                    role.to_string(),
-                    critical.iter().map(|s| s.to_string()).collect(),
-                ));
-                continue;
+        let missing: Vec<String> = if local_dispatch {
+            let mut out = Vec::new();
+            for &tool in critical {
+                if !is_in_path(tool).await {
+                    out.push(tool.to_string());
+                }
             }
-        };
+            out
+        } else {
+            // Worker publishes inventory under hyphenated agent name
+            // (see ares-cli/src/worker/config.rs: agent_name = format!("ares-{}-agent", role.replace('_', "-"))).
+            // Mirror that here so role names with underscores resolve correctly.
+            let agent_key = format!("ares:tools:ares-{}-agent", role.replace('_', "-"));
+            let available: Vec<String> = match conn.get::<_, Option<String>>(&agent_key).await {
+                Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
+                _ => {
+                    // No inventory published yet — worker may not have started
+                    warn!(
+                        role = role,
+                        "No tool inventory found — worker may not be running"
+                    );
+                    problems.push((
+                        role.to_string(),
+                        critical.iter().map(|s| s.to_string()).collect(),
+                    ));
+                    continue;
+                }
+            };
 
-        let missing: Vec<String> = critical
-            .iter()
-            .filter(|&&tool| !available.iter().any(|a| a == tool))
-            .map(|s| s.to_string())
-            .collect();
+            critical
+                .iter()
+                .filter(|&&tool| !available.iter().any(|a| a == tool))
+                .map(|s| s.to_string())
+                .collect()
+        };
 
         if !missing.is_empty() {
             problems.push((role.to_string(), missing));
@@ -562,12 +588,7 @@ mod tests {
 
     #[test]
     fn critical_tools_have_valid_roles() {
-        let known_roles = [
-            "recon",
-            "credential_access",
-            "privesc",
-            "lateral_movement",
-        ];
+        let known_roles = ["recon", "credential_access", "privesc", "lateral_movement"];
         for &(role, tools) in CRITICAL_TOOLS {
             assert!(
                 known_roles.contains(&role),
@@ -588,6 +609,14 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn is_in_path_finds_which_itself() {
+        // `which` is on PATH on every dev box and CI; a nonsense binary is not.
+        // Used by the local-dispatch branch of preflight_tool_check.
+        assert!(is_in_path("which").await);
+        assert!(!is_in_path("nonexistent_binary_for_preflight_xyz_123").await);
     }
 
     #[test]

@@ -743,9 +743,9 @@ SMB         192.168.58.10   445    DC01             [+] contoso.local\\Administr
         // password poisoned operation state and made tools receive literal
         // `[PWD]`/`[TGT]` strings as auth values, breaking lateral movement.
         let output = "\
-NORTH\\WINTERFELL$ [PWD]
-NORTH\\jon.snow [TGT]
-NORTH\\jon.snow:[PWD]
+CHILD\\DC01$ [PWD]
+CHILD\\eve [TGT]
+CHILD\\eve:[PWD]
 CONTOSO\\real_user RealPassword123";
         let params = json!({"domain": "contoso.local"});
         let (hashes, creds) = parse_lsassy(output, &params);

@@ -704,6 +704,10 @@ pub(crate) fn requires_exact_realm(tool_name: &str) -> bool {
             | "ldap_search_descriptions"
             | "ldap_acl_enumeration"
             | "targeted_kerberoast"
+            | "kerberoast"
+            | "nopac"
+            | "certifried"
+            | "enumerate_domain_trusts"
     )
 }
 
@@ -1076,14 +1080,14 @@ mod tests {
 
     #[test]
     fn find_credential_cross_realm_fallback() {
-        // LLM passes target domain (essos.local) for a tool acting as a
-        // user whose home realm is north.sevenkingdoms.local. The resolver
+        // LLM passes target domain (fabrikam.local) for a tool acting as a
+        // user whose home realm is child.contoso.local. The resolver
         // should still return the user's stored cred so the cross-realm
         // auth attempt can proceed via Kerberos referral / NTLM pass-through.
-        let creds = vec![cred("samwell.tarly", "north.sevenkingdoms.local", "P@ss1")];
-        let found = find_credential(&creds, "samwell.tarly", "essos.local", false).unwrap();
+        let creds = vec![cred("alice", "child.contoso.local", "P@ss1")];
+        let found = find_credential(&creds, "alice", "fabrikam.local", false).unwrap();
         assert_eq!(found.password, "P@ss1");
-        assert_eq!(found.domain, "north.sevenkingdoms.local");
+        assert_eq!(found.domain, "child.contoso.local");
     }
 
     #[test]
@@ -1106,12 +1110,12 @@ mod tests {
 
     #[test]
     fn find_credential_realm_strict_blocks_cross_realm_fallback() {
-        // The resolver MUST NOT inject a north-realm cred when the tool
-        // (e.g. bloodyad_set_password against essos.local DC) requires an
+        // The resolver MUST NOT inject a child-realm cred when the tool
+        // (e.g. bloodyad_set_password against fabrikam.local DC) requires an
         // exact-realm bind. Wrong-realm cred → 52e/775 at LDAP bind, which
         // wastes the dispatch and burns the agent's tool budget.
-        let creds = vec![cred("robb.stark", "north.sevenkingdoms.local", "P@ss1")];
-        let found = find_credential(&creds, "robb.stark", "essos.local", true);
+        let creds = vec![cred("bob", "child.contoso.local", "P@ss1")];
+        let found = find_credential(&creds, "bob", "fabrikam.local", true);
         assert!(
             found.is_none(),
             "realm_strict must block cross-realm any_user fallback"
@@ -1133,12 +1137,12 @@ mod tests {
     #[test]
     fn find_hash_realm_strict_blocks_cross_realm_fallback() {
         let hashes = vec![hash(
-            "robb.stark",
-            "north.sevenkingdoms.local",
+            "bob",
+            "child.contoso.local",
             "deadbeef",
             None,
         )];
-        let found = find_hash(&hashes, "robb.stark", "essos.local", true);
+        let found = find_hash(&hashes, "bob", "fabrikam.local", true);
         assert!(
             found.is_none(),
             "realm_strict must block cross-realm any_user fallback for hashes"
@@ -1167,6 +1171,10 @@ mod tests {
             "ldap_search_descriptions",
             "ldap_acl_enumeration",
             "targeted_kerberoast",
+            "kerberoast",
+            "nopac",
+            "certifried",
+            "enumerate_domain_trusts",
         ] {
             assert!(
                 requires_exact_realm(tool),
@@ -1219,14 +1227,14 @@ mod tests {
         // the target domain but the only stored hash for the user is in their
         // home realm. Return the home-realm hash rather than nothing.
         let hashes = vec![hash(
-            "samwell.tarly",
-            "north.sevenkingdoms.local",
+            "alice",
+            "child.contoso.local",
             "deadbeef",
             None,
         )];
-        let found = find_hash(&hashes, "samwell.tarly", "essos.local", false).unwrap();
+        let found = find_hash(&hashes, "alice", "fabrikam.local", false).unwrap();
         assert_eq!(found.hash_value, "deadbeef");
-        assert_eq!(found.domain, "north.sevenkingdoms.local");
+        assert_eq!(found.domain, "child.contoso.local");
     }
 
     #[test]
@@ -1244,14 +1252,14 @@ mod tests {
         // Kerberoast TGS ciphertext must never be injected as `hash=…` —
         // impacket bombs out with "Odd-length string" since it's not NTLM.
         let mut tgs = hash(
-            "jon.snow",
-            "north.local",
-            "$krb5tgs$23$*jon.snow$NORTH.LOCAL$north.local/jon.snow*$abc...",
+            "eve",
+            "child.local",
+            "$krb5tgs$23$*eve$CHILD.LOCAL$child.local/eve*$abc...",
             None,
         );
         tgs.hash_type = "kerberoast".to_string();
         let hashes = vec![tgs];
-        let found = find_hash(&hashes, "jon.snow", "north.local", false);
+        let found = find_hash(&hashes, "eve", "child.local", false);
         assert!(
             found.is_none(),
             "kerberoast TGS must not be returned as authenticating hash"
@@ -1260,16 +1268,16 @@ mod tests {
 
     #[test]
     fn find_hash_keeps_ntlm_when_kerberoast_also_present() {
-        let mut tgs = hash("jon.snow", "north.local", "$krb5tgs$23$*...", None);
+        let mut tgs = hash("eve", "child.local", "$krb5tgs$23$*...", None);
         tgs.hash_type = "kerberoast".to_string();
         let ntlm = hash(
-            "jon.snow",
-            "north.local",
+            "eve",
+            "child.local",
             "aad3b435b51404eeaad3b435b51404ee:d350c5900e26d2c95f501e94cf95b078",
             None,
         );
         let hashes = vec![tgs, ntlm];
-        let found = find_hash(&hashes, "jon.snow", "north.local", false).unwrap();
+        let found = find_hash(&hashes, "eve", "child.local", false).unwrap();
         assert!(found.hash_value.starts_with("aad3"));
     }
 

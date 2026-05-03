@@ -223,7 +223,7 @@ pub async fn certipy_ca(args: &Value) -> Result<ToolOutput> {
 /// `certipy_auth` to obtain a TGT/NT hash for any principal in the domain.
 ///
 /// Required args: `ca_pfx` (path to stolen CA PFX), `upn` (target principal,
-///                e.g. `administrator@essos.local`)
+///                e.g. `administrator@fabrikam.local`)
 /// Optional args: `subject`, `template`, `out` (output PFX path)
 pub async fn certipy_forge(args: &Value) -> Result<ToolOutput> {
     let ca_pfx = required_str(args, "ca_pfx")?;
