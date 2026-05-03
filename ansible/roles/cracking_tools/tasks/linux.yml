@@ -24,6 +24,26 @@
     mode: '0755'
   become: true
 
+- name: Install NVIDIA driver and OpenCL runtime
+  ansible.builtin.apt:
+    name: "{{ cracking_tools_nvidia_driver_packages }}"
+    state: present
+    install_recommends: true
+  become: true
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - ansible_facts['os_family'] == 'Debian'
+
+- name: Install NVIDIA CUDA toolkit
+  ansible.builtin.apt:
+    name: "{{ cracking_tools_nvidia_cuda_toolkit_packages }}"
+    state: present
+    install_recommends: true
+  become: true
+  when:
+    - cracking_tools_install_cuda_toolkit | bool
+    - ansible_facts['os_family'] == 'Debian'
+
 - name: Install GPU support packages
   ansible.builtin.apt:
     name: "{{ cracking_tools_opencl_packages }}"
@@ -50,6 +70,33 @@
   when:
     - cracking_tools_gpu_support | bool
     - cracking_tools_nvidia_opencl_icd | default(false) | bool
+
+# nvidia-smi/clinfo will return non-zero on a CPU-only AMI builder (no GPU
+# attached) — that's expected. The check is purely informational so a logged
+# failure on the first GPU boot is easy to spot.
+- name: Verify NVIDIA driver (non-fatal — no GPU on builder hosts)
+  ansible.builtin.command: nvidia-smi
+  register: cracking_tools_nvidia_smi
+  changed_when: false
+  failed_when: false
+  when: cracking_tools_install_nvidia_driver | bool
+
+- name: Verify OpenCL platform discovery (non-fatal)
+  ansible.builtin.command: clinfo -l
+  register: cracking_tools_clinfo
+  changed_when: false
+  failed_when: false
+  when:
+    - cracking_tools_gpu_support | bool
+    - cracking_tools_install_nvidia_driver | bool
+
+- name: Show GPU/OpenCL detection summary
+  ansible.builtin.debug:
+    msg:
+      - "nvidia-smi rc={{ cracking_tools_nvidia_smi.rc | default('skipped') }}"
+      - "clinfo rc={{ cracking_tools_clinfo.rc | default('skipped') }}"
+      - "{{ cracking_tools_clinfo.stdout | default('clinfo not run') }}"
+  when: cracking_tools_install_nvidia_driver | bool
 
 - name: Ensure libgcc runtime is present for hashcat
   when:

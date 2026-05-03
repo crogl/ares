@@ -34,9 +34,14 @@ base:
     most_recent: true
 
 sources:
-  - name: nimbus_range
+  # Clone the ares repo and use its ansible/ subtree as the nimbus_range
+  # collection. This keeps the AMI tracking the same branch as the rest of
+  # the project — role edits ship together, no second repo to publish to.
+  # Mirrors the pattern in ares-golden-azure/warpgate.yaml.
+  - name: ares
     git:
-      repository: https://github.com/dreadnode/ansible-collection-nimbus_range.git
+      repository: https://github.com/dreadnode/ares.git
+      ref: feat/more-attack-cov
       depth: 1
       auth:
         token: ${GITHUB_TOKEN}
@@ -52,39 +57,30 @@ provisioners:
       - pipx install --force ansible-core
       - pipx ensurepath
 
-  # Copy ansible collection from source (cloned securely by warpgate without embedding token in shell commands)
+  # Copy the ansible/ subtree of the ares repo into the nimbus_range
+  # collection path on the build instance.
   - type: file
-    source: ${sources.nimbus_range}
-    destination: /tmp/nimbus_range
+    source: ${sources.ares}
+    destination: /tmp/ares
 
   - type: shell
     inline:
       - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
-      - cp -r /tmp/nimbus_range/* /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
-      - rm -rf /tmp/nimbus_range
+      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
+      - rm -rf /tmp/ares
 
-  # Install NVIDIA drivers for GPU-accelerated hashcat on g4dn (T4 GPU)
-  - type: shell
-    inline:
-      - apt-get update
-      - apt-get install -y --no-install-recommends nvidia-driver firmware-misc-nonfree
-      - nvidia-smi || echo "nvidia-smi not available during AMI build (expected if no GPU attached)"
-
-  # Attack Box - all red team tools + Alloy telemetry
+  # Attack Box - all red team tools + Alloy telemetry. The cracking_tools
+  # role handles the full NVIDIA stack (driver, DKMS, CUDA toolkit, OpenCL
+  # ICD) — driving it through ansible keeps Recommends enabled (so dkms +
+  # libcuda1 come along), uses linux-headers-amd64 (the meta-package, kept
+  # in sync with the running kernel) instead of pinning to the AMI builder's
+  # kernel, and verifies nvidia-smi/clinfo at build time.
   # NOTE: Using shell instead of ansible provisioner because the playbook
   # exceeds EC2 Image Builder's 16000 character component limit.
   - type: shell
     inline:
       - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
-      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true
-
-  # NVIDIA GPU drivers + CUDA toolkit for hashcat GPU acceleration.
-  # Kernel headers + dkms are required so the nvidia module builds for the
-  # running kernel. The AMI then works on GPU instances (e.g. g4dn.xlarge)
-  # without manual driver setup.
-  - type: shell
-    inline:
-      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-headers-$(uname -r) dkms nvidia-driver nvidia-cuda-toolkit
+      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=true -e cracking_tools_install_cuda_toolkit=true
 
   # Cleanup
   - type: shell

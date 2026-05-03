@@ -45,6 +45,12 @@
     cracking_tools_gpu_support: true
     cracking_tools_hashcat_from_source: true
     cracking_tools_nvidia_opencl_icd: true
+    # Bake the kernel-mode NVIDIA driver + CUDA into the image. Without these,
+    # hashcat on g4dn (T4) reports "OpenCL platform not found" and falls back
+    # to john-on-CPU, which is too slow to feed credential cracks back into
+    # the orchestrator within an op's budget.
+    cracking_tools_install_nvidia_driver: true
+    cracking_tools_install_cuda_toolkit: true
     cracking_tools_wordlists:
       - rockyou
       - seclists_passwords
