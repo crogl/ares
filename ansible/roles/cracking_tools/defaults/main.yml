@@ -66,14 +66,14 @@ cracking_tools_install_cuda_toolkit: false
 # meta-package. We pull driver + open-source kernel module from NVIDIA's
 # CUDA Debian repo (added in tasks/linux.yml) because Kali's archive
 # nvidia-driver (550.163.01) does not build against kernel 6.19+.
-# `nvidia-open-kernel-dkms` is required for Turing+ (T4 included) on
+# `nvidia-kernel-open-dkms` is required for Turing+ (T4 included) on
 # modern kernels; legacy `nvidia-kernel-dkms` is a dead-end here.
 cracking_tools_nvidia_driver_packages:
   - linux-headers-cloud-amd64
   - dkms
   - firmware-misc-nonfree
   - cuda-drivers
-  - nvidia-open-kernel-dkms
+  - nvidia-kernel-open-dkms
   - nvidia-opencl-icd
   - nvidia-opencl-common
 cracking_tools_nvidia_cuda_toolkit_packages:
