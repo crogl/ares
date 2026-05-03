@@ -60,7 +60,7 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_nvidia_driver_packages.1` | str | <code>dkms</code> | No description |
 | `cracking_tools_nvidia_driver_packages.2` | str | <code>firmware-misc-nonfree</code> | No description |
 | `cracking_tools_nvidia_driver_packages.3` | str | <code>nvidia-driver</code> | No description |
-| `cracking_tools_nvidia_driver_packages.4` | str | <code>libnvidia-opencl1</code> | No description |
+| `cracking_tools_nvidia_driver_packages.4` | str | <code>nvidia-opencl-icd</code> | No description |
 | `cracking_tools_nvidia_driver_packages.5` | str | <code>nvidia-opencl-common</code> | No description |
 | `cracking_tools_nvidia_cuda_toolkit_packages` | list | <code>&#91;&#93;</code> | No description |
 | `cracking_tools_nvidia_cuda_toolkit_packages.0` | str | <code>nvidia-cuda-toolkit</code> | No description |

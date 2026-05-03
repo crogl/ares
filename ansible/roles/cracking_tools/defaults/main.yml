@@ -67,7 +67,7 @@ cracking_tools_nvidia_driver_packages:
   - dkms
   - firmware-misc-nonfree
   - nvidia-driver
-  - libnvidia-opencl1
+  - nvidia-opencl-icd
   - nvidia-opencl-common
 cracking_tools_nvidia_cuda_toolkit_packages:
   - nvidia-cuda-toolkit
