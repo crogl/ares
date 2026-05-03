@@ -105,7 +105,10 @@ Install and configure password cracking tools for Ares agents
 - **Set DEBIAN_FRONTEND to noninteractive** (ansible.builtin.lineinfile) - Conditional
 - **Update apt cache** (ansible.builtin.apt) - Conditional
 - **Create wordlist directory** (ansible.builtin.file)
-- **Install NVIDIA driver and OpenCL runtime** (ansible.builtin.apt) - Conditional
+- **Install NVIDIA driver and OpenCL runtime (with full log)** (ansible.builtin.shell) - Conditional
+- **Show NVIDIA install log tail on failure** (ansible.builtin.command) - Conditional
+- **Print NVIDIA install tail** (ansible.builtin.debug) - Conditional
+- **Fail if NVIDIA install failed** (ansible.builtin.fail) - Conditional
 - **Install NVIDIA CUDA toolkit** (ansible.builtin.apt) - Conditional
 - **Install GPU support packages** (ansible.builtin.apt) - Conditional
 - **Create OpenCL vendors directory** (ansible.builtin.file) - Conditional

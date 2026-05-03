@@ -24,15 +24,51 @@
     mode: '0755'
   become: true
 
-- name: Install NVIDIA driver and OpenCL runtime
-  ansible.builtin.apt:
-    name: "{{ cracking_tools_nvidia_driver_packages }}"
-    state: present
-    install_recommends: true
+# Driven through shell+tee instead of ansible.builtin.apt: the apt module
+# captures dpkg stderr but truncates large stdout (DKMS kernel-module build
+# errors land deep in apt-get's output, well after the cutoff). With tee we
+# can show the real error on failure.
+- name: Install NVIDIA driver and OpenCL runtime (with full log)
+  ansible.builtin.shell:
+    cmd: |
+      set -o pipefail
+      DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        -o Dpkg::Options::=--force-confdef \
+        -o Dpkg::Options::=--force-confold \
+        -o APT::Install-Recommends=yes \
+        {{ cracking_tools_nvidia_driver_packages | map('quote') | join(' ') }} \
+        2>&1 | tee /tmp/ares-nvidia-install.log
+    executable: /bin/bash
   become: true
+  register: cracking_tools_nvidia_install_result
+  changed_when: false
+  failed_when: false
   when:
     - cracking_tools_install_nvidia_driver | bool
     - ansible_facts['os_family'] == 'Debian'
+
+- name: Show NVIDIA install log tail on failure
+  ansible.builtin.command: tail -200 /tmp/ares-nvidia-install.log
+  become: true
+  register: cracking_tools_nvidia_install_tail
+  changed_when: false
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - cracking_tools_nvidia_install_result.rc | default(0) != 0
+
+- name: Print NVIDIA install tail
+  ansible.builtin.debug:
+    var: cracking_tools_nvidia_install_tail.stdout_lines
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - cracking_tools_nvidia_install_result.rc | default(0) != 0
+
+- name: Fail if NVIDIA install failed
+  ansible.builtin.fail:
+    msg: "NVIDIA driver install failed (rc={{ cracking_tools_nvidia_install_result.rc }}); see tail above"
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - cracking_tools_nvidia_install_result.rc | default(0) != 0
 
 - name: Install NVIDIA CUDA toolkit
   ansible.builtin.apt:
