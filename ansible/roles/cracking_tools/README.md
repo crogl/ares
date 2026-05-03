@@ -56,7 +56,7 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_install_nvidia_driver` | bool | <code>False</code> | No description |
 | `cracking_tools_install_cuda_toolkit` | bool | <code>False</code> | No description |
 | `cracking_tools_nvidia_driver_packages` | list | <code>&#91;&#93;</code> | No description |
-| `cracking_tools_nvidia_driver_packages.0` | str | <code>linux-headers-amd64</code> | No description |
+| `cracking_tools_nvidia_driver_packages.0` | str | <code>linux-headers-cloud-amd64</code> | No description |
 | `cracking_tools_nvidia_driver_packages.1` | str | <code>dkms</code> | No description |
 | `cracking_tools_nvidia_driver_packages.2` | str | <code>firmware-misc-nonfree</code> | No description |
 | `cracking_tools_nvidia_driver_packages.3` | str | <code>nvidia-driver</code> | No description |
