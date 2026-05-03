@@ -101,10 +101,16 @@ pub async fn auto_credential_access(
         };
 
         for (domain, dc_ip) in asrep_work {
+            let excluded_users = dispatcher
+                .state
+                .read()
+                .await
+                .quarantined_users_in_domain(&domain);
             let payload = json!({
                 "techniques": ["kerberos_user_enum_noauth", "asrep_roast", "username_as_password"],
                 "target_ip": dc_ip,
                 "domain": domain,
+                "excluded_users": excluded_users.join(","),
             });
 
             let priority = dispatcher.effective_priority("asrep_roast");
@@ -215,6 +221,10 @@ pub async fn auto_credential_access(
                 .users
                 .iter()
                 .filter(|u| !u.domain.is_empty())
+                // Skip AD built-in disabled accounts (guest, krbtgt, etc.).
+                // Spraying these can never succeed and burns badPwdCount budget
+                // that real accounts share under domain lockout policy.
+                .filter(|u| !ares_core::models::is_always_disabled_account(&u.username))
                 // Skip delegation accounts — their auth budget is reserved for
                 // S4U exploitation. Spraying them causes lockout before S4U fires.
                 .filter(|u| !state.is_delegation_account(&u.username))
@@ -256,10 +266,16 @@ pub async fn auto_credential_access(
             }
             sprayed_domains.insert(domain.clone());
 
+            let excluded_users = dispatcher
+                .state
+                .read()
+                .await
+                .quarantined_users_in_domain(domain);
             let payload = json!({
                 "technique": "username_as_password",
                 "target_ip": dc_ip,
                 "domain": domain,
+                "excluded_users": excluded_users.join(","),
             });
 
             match dispatcher
@@ -510,6 +526,11 @@ pub async fn auto_credential_access(
             };
 
         for (domain, dc_ip) in common_spray_work {
+            let excluded_users = dispatcher
+                .state
+                .read()
+                .await
+                .quarantined_users_in_domain(&domain);
             let payload = json!({
                 "techniques": ["password_spray", "username_as_password"],
                 "reason": "low_hanging_fruit",
@@ -517,6 +538,7 @@ pub async fn auto_credential_access(
                 "domain": domain,
                 "use_common_passwords": true,
                 "acknowledge_no_policy": true,
+                "excluded_users": excluded_users.join(","),
             });
 
             // Mark as processed BEFORE submitting to prevent duplicate deferred entries.

@@ -207,7 +207,7 @@ pub async fn krbrelayup(args: &Value) -> Result<ToolOutput> {
 /// raiseChild auto-discovers the parent forest root via the child DC's
 /// trustedDomain LDAP objects, so callers don't need to supply parent FQDN
 /// or DC IPs to the script. But raiseChild *does* call `gethostbyname()` /
-/// SMB-binds against the bare domain name (e.g. `north.sevenkingdoms.local`),
+/// SMB-binds against the bare domain name (e.g. `child.contoso.local`),
 /// not the DC FQDN — so on a worker without forest DNS this fails with
 /// `Name or service not known`. Pre-seeding `/etc/hosts` fixes that.
 pub async fn raise_child(args: &Value) -> Result<ToolOutput> {

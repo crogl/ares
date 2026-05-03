@@ -21,12 +21,15 @@ pub fn build_credential_dedup_key(cred: &Credential) -> String {
     format!("cred:{domain}:{username}:{password_hash_short}")
 }
 
-/// Build hash dedup key matching Python's `_build_hash_dedup_key()`.
+/// Build hash dedup key.
 ///
 /// Dedup key format varies by hash type:
 /// - AS-REP: `asrep:{domain}:{username}`
 /// - Kerberoast: `krb:{domain}:{username}:{etype}:{spn}` or `krb:{domain}:{username}:{hash[:32]}`
-/// - NTLM/other: `ntlm:{domain}:{username}:{hash[:32]}`
+/// - NTLM/other: `ntlm:{domain}:{username}:{nt_hash}` — NT half of `lm:nt`,
+///   not LM, because AD always emits the empty-LM placeholder
+///   `aad3b435b51404eeaad3b435b51404ee` and a `hash_value[..32]` prefix would
+///   collapse every user's password rotations into a single dedup slot.
 pub fn build_hash_dedup_key(hash: &Hash) -> String {
     let hash_type = hash.hash_type.trim().to_lowercase();
     let hash_value = &hash.hash_value;
@@ -54,8 +57,18 @@ pub fn build_hash_dedup_key(hash: &Hash) -> String {
     }
 
     // NTLM/other
-    let prefix = &hash_value[..32.min(hash_value.len())];
-    format!("ntlm:{domain}:{username}:{prefix}")
+    let key_part = ntlm_dedup_key_part(hash_value);
+    format!("ntlm:{domain}:{username}:{key_part}")
+}
+
+/// For an `lm:nt` NTLM pair, return the NT half. For a single 32-char hash
+/// (already-NT or non-standard formats), return up to 32 chars.
+fn ntlm_dedup_key_part(hash_value: &str) -> &str {
+    if let Some((_, nt)) = hash_value.split_once(':') {
+        &nt[..32.min(nt.len())]
+    } else {
+        &hash_value[..32.min(hash_value.len())]
+    }
 }
 
 /// Extract SPN and encryption type from a Kerberoast hash for deduplication.
@@ -173,7 +186,49 @@ mod tests {
             "aad3b435b51404eeaad3b435b51404ee:209c6174da490caeb422f3fa5a7ae634",
         );
         let key = build_hash_dedup_key(&h);
-        assert!(key.starts_with("ntlm:contoso.local:admin:"));
+        // Must include the NT half, not the empty-LM placeholder, otherwise
+        // every AD account dedups to the same prefix.
+        assert_eq!(
+            key,
+            "ntlm:contoso.local:admin:209c6174da490caeb422f3fa5a7ae634"
+        );
+    }
+
+    #[test]
+    fn hash_dedup_key_ntlm_password_rotation_distinct() {
+        // Same user, two different NT hashes (e.g. password rotation between
+        // dumps). The keys must differ so the second hash is stored, not
+        // silently dropped by dedup.
+        let h1 = make_hash(
+            "admin",
+            "contoso.local",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:209c6174da490caeb422f3fa5a7ae634",
+        );
+        let h2 = make_hash(
+            "admin",
+            "contoso.local",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:1111222233334444555566667777aaaa",
+        );
+        assert_ne!(build_hash_dedup_key(&h1), build_hash_dedup_key(&h2));
+    }
+
+    #[test]
+    fn hash_dedup_key_ntlm_bare_nt_hash() {
+        // Some sources emit just a 32-char NT hash without the LM:NT pair.
+        // The key should still be deterministic and stable.
+        let h = make_hash(
+            "admin",
+            "contoso.local",
+            "NTLM",
+            "209c6174da490caeb422f3fa5a7ae634",
+        );
+        let key = build_hash_dedup_key(&h);
+        assert_eq!(
+            key,
+            "ntlm:contoso.local:admin:209c6174da490caeb422f3fa5a7ae634"
+        );
     }
 
     #[test]

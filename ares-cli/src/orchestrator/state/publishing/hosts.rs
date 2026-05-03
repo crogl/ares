@@ -109,7 +109,7 @@ impl SharedState {
                     changed = true;
                 }
                 // Upgrade short name to FQDN when a better hostname arrives.
-                // Without this, the short name (e.g. "kingslanding") sticks
+                // Without this, the short name (e.g. "dc01") sticks
                 // and `register_dc` can't derive a domain from it, which
                 // forces the ambiguous fallback path and mis-maps DCs.
                 let upgrade_to_fqdn = host.hostname.contains('.')
@@ -835,7 +835,7 @@ mod tests {
         let q = mock_queue();
 
         let host = make_host(
-            "10.1.2.178",
+            "192.168.58.178",
             "win-hvtt4f8yn5n.win-hvtt4f8yn5n.ttb0.local",
             false,
         );
@@ -863,7 +863,7 @@ mod tests {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let host = make_host("10.1.2.179", "desktop-abc1234.workgroup.local", false);
+        let host = make_host("192.168.58.179", "desktop-abc1234.workgroup.local", false);
         state.publish_host(&q, host).await.unwrap();
 
         let s = state.inner.read().await;
@@ -882,7 +882,7 @@ mod tests {
         let state = SharedState::new("op-1".to_string());
         let q = mock_queue();
 
-        let host = make_host("10.1.2.178", "win-hvtt4f8yn5n.ttb0.local", true);
+        let host = make_host("192.168.58.178", "win-hvtt4f8yn5n.ttb0.local", true);
         state.register_dc(&q, &host).await.unwrap();
 
         let s = state.inner.read().await;

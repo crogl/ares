@@ -78,6 +78,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "acknowledge_no_policy": {
                         "type": "boolean",
                         "description": "Override that allows spraying without lockout_threshold. Use only when password_policy cannot be retrieved; lockouts are likely."
+                    },
+                    "excluded_users": {
+                        "type": "string",
+                        "description": "Comma-separated usernames to drop from the wordlist before spraying. Use this with the quarantine list provided in the task payload to avoid re-locking already-locked accounts."
                     }
                 },
                 "required": ["target", "domain"]
@@ -100,6 +104,10 @@ pub fn definitions() -> Vec<ToolDefinition> {
                     "domain": {
                         "type": "string",
                         "description": "Target domain name"
+                    },
+                    "excluded_users": {
+                        "type": "string",
+                        "description": "Comma-separated usernames to drop from the wordlist before spraying. Use this with the quarantine list provided in the task payload to avoid re-locking already-locked accounts."
                     }
                 },
                 "required": ["target", "domain"]

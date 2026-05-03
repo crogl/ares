@@ -109,7 +109,7 @@ pub async fn auto_rbcd_exploitation(
                         .to_string();
 
                     // Find credential for the source user. Cross-forest ACL
-                    // edges (e.g. tyron.lannister@sk → braavos$@essos) put the
+                    // edges (e.g. leo@contoso → sql01$@fabrikam) put the
                     // source user in a different domain than the vuln's `domain`
                     // field (which is the target's domain), so we cannot
                     // domain-restrict against the target.

@@ -15,6 +15,7 @@ mod publishing;
 mod shared;
 
 // Re-export everything that was publicly visible from the old single file.
+pub use dedup::MAX_EXPLOIT_FAILURES;
 pub use inner::StateInner;
 pub use shared::SharedState;
 

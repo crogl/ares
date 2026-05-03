@@ -285,7 +285,7 @@ $krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:fr3edom
     fn john_show_tgs_unknown_user() {
         // John --show for TGS shows ?:password (can't determine username)
         let output = "--- john --show ---\n\
-            ?:iknownothing\n\n\
+            ?:P@ssw0rd!\n\n\
             1 password hash cracked, 0 left\n";
         let params = json!({
             "hash_value": "$krb5tgs$23$*john.smith$CHILD.CONTOSO.LOCAL$CIFS/filesvr01*$abcdef$123456"
@@ -293,7 +293,7 @@ $krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:fr3edom
         let creds = parse_cracker_output(output, &params);
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0]["username"], "john.smith");
-        assert_eq!(creds[0]["password"], "iknownothing");
+        assert_eq!(creds[0]["password"], "P@ssw0rd!");
         assert_eq!(creds[0]["domain"], "CHILD.CONTOSO.LOCAL");
         assert_eq!(creds[0]["source"], "cracked:john");
     }
@@ -302,7 +302,7 @@ $krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:fr3edom
     fn john_show_tgs_unknown_user_no_hash_param() {
         // Without hash_value param, ?:password is skipped
         let output = "--- john --show ---\n\
-            ?:iknownothing\n\n\
+            ?:P@ssw0rd!\n\n\
             1 password hash cracked, 0 left\n";
         let params = json!({"domain": "contoso.local"});
         let creds = parse_cracker_output(output, &params);

@@ -16,7 +16,7 @@ use crate::orchestrator::throttling::ThrottleDecision;
 
 use ares_llm::LoopEndReason;
 
-use super::Dispatcher;
+use super::{Dispatcher, SubmissionOutcome};
 
 impl Dispatcher {
     /// Submit a task with throttle checking. Returns the task_id if submitted,
@@ -28,6 +28,26 @@ impl Dispatcher {
         payload: serde_json::Value,
         priority: i32,
     ) -> Result<Option<String>> {
+        match self
+            .throttled_submit_outcome(task_type, target_role, payload, priority)
+            .await?
+        {
+            SubmissionOutcome::Submitted(id) => Ok(Some(id)),
+            SubmissionOutcome::Deferred | SubmissionOutcome::Dropped => Ok(None),
+        }
+    }
+
+    /// Like `throttled_submit` but returns a `SubmissionOutcome` distinguishing
+    /// "deferred and safely enqueued" from "dropped due to overflow". Use this
+    /// when the caller needs to dedup deferred work without losing tasks that
+    /// got silently dropped on queue overflow.
+    pub async fn throttled_submit_outcome(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         let decision = self
             .throttler
             .check(task_type, target_role, Some(&payload))
@@ -35,36 +55,14 @@ impl Dispatcher {
 
         match decision {
             ThrottleDecision::Allow => {
-                self.do_submit(task_type, target_role, payload, priority)
+                self.do_submit_outcome(task_type, target_role, payload, priority)
                     .await
             }
             ThrottleDecision::Defer => {
-                let task = DeferredTask {
-                    priority,
-                    enqueue_time: Utc::now().timestamp() as f64,
-                    task_type: task_type.to_string(),
-                    target_role: target_role.to_string(),
-                    payload,
-                    source_agent: "orchestrator".to_string(),
-                };
-                match self.deferred.enqueue(&task).await {
-                    Ok(true) => {
-                        debug!(task_type, target_role, "Task deferred");
-                        Ok(None)
-                    }
-                    Ok(false) => {
-                        debug!(task_type, target_role, "Deferred queue full, task dropped");
-                        Ok(None)
-                    }
-                    Err(e) => {
-                        warn!(err = %e, "Failed to defer task, attempting direct submit");
-                        self.do_submit(task_type, target_role, task.payload, priority)
-                            .await
-                    }
-                }
+                self.enqueue_deferred(task_type, target_role, payload, priority)
+                    .await
             }
             ThrottleDecision::Wait(dur) => {
-                // Sleep and retry once
                 tokio::time::sleep(dur).await;
                 let retry_decision = self
                     .throttler
@@ -72,22 +70,49 @@ impl Dispatcher {
                     .await;
                 match retry_decision {
                     ThrottleDecision::Allow => {
-                        self.do_submit(task_type, target_role, payload, priority)
+                        self.do_submit_outcome(task_type, target_role, payload, priority)
                             .await
                     }
                     _ => {
-                        let task = DeferredTask {
-                            priority,
-                            enqueue_time: Utc::now().timestamp() as f64,
-                            task_type: task_type.to_string(),
-                            target_role: target_role.to_string(),
-                            payload,
-                            source_agent: "orchestrator".to_string(),
-                        };
-                        let _ = self.deferred.enqueue(&task).await;
-                        Ok(None)
+                        self.enqueue_deferred(task_type, target_role, payload, priority)
+                            .await
                     }
                 }
+            }
+        }
+    }
+
+    async fn enqueue_deferred(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
+        let task = DeferredTask {
+            priority,
+            enqueue_time: Utc::now().timestamp() as f64,
+            task_type: task_type.to_string(),
+            target_role: target_role.to_string(),
+            payload,
+            source_agent: "orchestrator".to_string(),
+        };
+        match self.deferred.enqueue(&task).await {
+            Ok(true) => {
+                debug!(task_type, target_role, "Task deferred");
+                Ok(SubmissionOutcome::Deferred)
+            }
+            Ok(false) => {
+                warn!(
+                    task_type,
+                    target_role, "Deferred queue full, task dropped (will retry next tick)"
+                );
+                Ok(SubmissionOutcome::Dropped)
+            }
+            Err(e) => {
+                warn!(err = %e, "Failed to defer task, attempting direct submit");
+                self.do_submit_outcome(task_type, target_role, task.payload, priority)
+                    .await
             }
         }
     }
@@ -117,11 +142,25 @@ impl Dispatcher {
         task_type: &str,
         target_role: &str,
         payload: serde_json::Value,
-        _priority: i32,
+        priority: i32,
     ) -> Result<Option<String>> {
-        // Prefer the caller-specified target_role (from recommended_agent)
-        // over the static task_type → role mapping. This lets automation
-        // modules like MSSQL route exploits to lateral instead of privesc.
+        match self
+            .do_submit_outcome(task_type, target_role, payload, priority)
+            .await?
+        {
+            SubmissionOutcome::Submitted(id) => Ok(Some(id)),
+            SubmissionOutcome::Deferred | SubmissionOutcome::Dropped => Ok(None),
+        }
+    }
+
+    /// Like `do_submit` but returns a `SubmissionOutcome`.
+    pub async fn do_submit_outcome(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         let role = ares_llm::tool_registry::AgentRole::parse(target_role)
             .or_else(|| crate::orchestrator::llm_runner::role_for_task_type(task_type));
 
@@ -133,7 +172,7 @@ impl Dispatcher {
                     target_role = target_role,
                     "No LLM role mapping for task type or target role, dropping"
                 );
-                return Ok(None);
+                return Ok(SubmissionOutcome::Dropped);
             }
         };
 
@@ -143,6 +182,7 @@ impl Dispatcher {
             target_role,
             role,
             payload,
+            priority,
         )
         .await
     }
@@ -157,26 +197,39 @@ impl Dispatcher {
         target_role: &str,
         role: ares_llm::tool_registry::AgentRole,
         payload: serde_json::Value,
-    ) -> Result<Option<String>> {
+        priority: i32,
+    ) -> Result<SubmissionOutcome> {
         // Per-credential concurrency gate: if too many tasks are already
         // in-flight for this credential, defer instead of spawning another.
         let cred_key = super::credential_key_from_payload(&payload);
         if let Some(ref key) = cred_key {
             if !self.credential_inflight.try_acquire(key).await {
-                info!(
+                debug!(
                     credential = key.as_str(),
                     task_type, "Credential concurrency limit reached, deferring task"
                 );
                 let task = DeferredTask {
-                    priority: 3,
+                    priority,
                     enqueue_time: Utc::now().timestamp() as f64,
                     task_type: task_type.to_string(),
                     target_role: target_role.to_string(),
                     payload,
                     source_agent: "orchestrator".to_string(),
                 };
-                let _ = self.deferred.enqueue(&task).await;
-                return Ok(None);
+                return match self.deferred.enqueue(&task).await {
+                    Ok(true) => Ok(SubmissionOutcome::Deferred),
+                    Ok(false) => {
+                        warn!(
+                            credential = key.as_str(),
+                            task_type, "Deferred queue full while gating on cred — task dropped"
+                        );
+                        Ok(SubmissionOutcome::Dropped)
+                    }
+                    Err(e) => {
+                        warn!(err = %e, "Failed to defer cred-gated task");
+                        Ok(SubmissionOutcome::Dropped)
+                    }
+                };
             }
         }
 
@@ -535,6 +588,6 @@ impl Dispatcher {
             }
         });
 
-        Ok(Some(task_id))
+        Ok(SubmissionOutcome::Submitted(task_id))
     }
 }

@@ -4,9 +4,10 @@ DC IP: {{ dc_ip_display }}
 Task ID: {{ task_id }}
 
 **CRITICAL: These techniques work WITHOUT credentials to discover passwords:**
-1. username_as_password(target=DC_IP, domain=DOMAIN) - HIGH SUCCESS RATE
+1. username_as_password(target=DC_IP, domain=DOMAIN{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %}) - HIGH SUCCESS RATE
    Tests if users have username=password (e.g., testuser:testuser)
-   Zero lockout risk, one attempt per user
+   Zero lockout risk, one attempt per user{% if excluded_users %}
+   **DO NOT include these locked-out users: {{ excluded_users }} — pass them via `excluded_users` so the worker drops them from the wordlist.**{% endif %}
 
 2. password_policy(target=DC_IP, domain=DOMAIN) - REQUIRED BEFORE SPRAY
    Read the lockout threshold (e.g. "Account Lockout Threshold: 5"). You must
@@ -20,22 +21,23 @@ Task ID: {{ task_id }}
    The tool keeps a 1-attempt safety buffer below `lockout_threshold` and
    refuses to run when the budget is gone.
    **Increment `attempts_used_per_account` by 1 after each spray** so
-   successive sprays stop before locking accounts:
+   successive sprays stop before locking accounts.{% if excluded_users %}
+   **Always pass `excluded_users='{{ excluded_users }}'` to skip already-locked accounts.**{% endif %}
 
    password_spray(target=DC_IP, domain=DOMAIN, password='Password1',
-                  lockout_threshold=THRESHOLD, attempts_used_per_account=0)
+                  lockout_threshold=THRESHOLD, attempts_used_per_account=0{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
    password_spray(target=DC_IP, domain=DOMAIN, password='Welcome1',
-                  lockout_threshold=THRESHOLD, attempts_used_per_account=1)
+                  lockout_threshold=THRESHOLD, attempts_used_per_account=1{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
    password_spray(target=DC_IP, domain=DOMAIN, password='Passw0rd!',
-                  lockout_threshold=THRESHOLD, attempts_used_per_account=2)
+                  lockout_threshold=THRESHOLD, attempts_used_per_account=2{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
    password_spray(target=DC_IP, domain=DOMAIN, password='Winter2025',
-                  lockout_threshold=THRESHOLD, attempts_used_per_account=3)
+                  lockout_threshold=THRESHOLD, attempts_used_per_account=3{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
    password_spray(target=DC_IP, domain=DOMAIN, password='Spring2026',
-                  lockout_threshold=THRESHOLD, attempts_used_per_account=4)
+                  lockout_threshold=THRESHOLD, attempts_used_per_account=4{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
 
    **No-creds fallback** (when `password_policy` failed):
    password_spray(target=DC_IP, domain=DOMAIN, password='Password1',
-                  acknowledge_no_policy=true)
+                  acknowledge_no_policy=true{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
 
    If a spray returns a "lockout budget exhausted" refusal, STOP — do not retry
    until the AD observation window resets.

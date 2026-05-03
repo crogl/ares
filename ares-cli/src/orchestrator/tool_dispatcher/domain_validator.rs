@@ -1,7 +1,7 @@
 //! Validate `domain` arguments on outgoing LLM tool calls.
 //!
 //! The LLM occasionally fat-fingers domain names in tool arguments
-//! (e.g. `north.sevenkingdomain.local` instead of `north.sevenkingdoms.local`).
+//! (e.g. `child.contossso.local` instead of `child.contoso.local`).
 //! Tools accept the typo silently, then auth fails, credential lineage breaks,
 //! and downstream consumers (cross-forest forge, ADCS enum, credential_resolver)
 //! get misdirected. The publishing-side guard already keeps these typos out of
@@ -159,12 +159,12 @@ mod tests {
     fn edit_distance_basic() {
         assert_eq!(edit_distance("contoso.local", "contoso.local"), 0);
         assert_eq!(
-            edit_distance("north.sevenkingdomain.local", "north.sevenkingdoms.local"),
-            3
+            edit_distance("child.contossso.local", "child.contoso.local"),
+            2
         );
         assert_eq!(
-            edit_distance("north.sevenkingdomainss.local", "north.sevenkingdoms.local"),
-            4
+            edit_distance("child.contosssso.local", "child.contoso.local"),
+            3
         );
         assert!(edit_distance("foo.bar", "completely.different") > 5);
     }
@@ -172,17 +172,17 @@ mod tests {
     #[test]
     fn closest_match_picks_nearest() {
         let known = vec![
-            "essos.local".to_string(),
-            "north.sevenkingdoms.local".to_string(),
-            "sevenkingdoms.local".to_string(),
+            "fabrikam.local".to_string(),
+            "child.contoso.local".to_string(),
+            "contoso.local".to_string(),
         ];
-        let picked = closest_match("north.sevenkingdomain.local", &known);
-        assert_eq!(picked.as_deref(), Some("north.sevenkingdoms.local"));
+        let picked = closest_match("child.contossso.local", &known);
+        assert_eq!(picked.as_deref(), Some("child.contoso.local"));
     }
 
     #[test]
     fn closest_match_returns_none_when_far() {
-        let known = vec!["essos.local".to_string()];
+        let known = vec!["fabrikam.local".to_string()];
         assert!(closest_match("totally.unrelated.domain", &known).is_none());
     }
 }

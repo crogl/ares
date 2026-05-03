@@ -34,6 +34,11 @@ pub(crate) struct Params<'a> {
     pub has_password: bool,
     pub has_hash: bool,
     pub has_creds: bool,
+    /// Comma-separated list of usernames that are quarantined (locked out)
+    /// in this domain. The orchestrator extracts these from prior lockout
+    /// observations and passes them through so spray prompts instruct the
+    /// LLM to skip them and the worker tool drops them from the wordlist.
+    pub excluded_users: &'a str,
 }
 
 pub(crate) fn generate_credential_access_prompt(
@@ -87,6 +92,10 @@ pub(crate) fn generate_credential_access_prompt(
         .or_else(|| payload.get("password").and_then(|v| v.as_str()))
         .unwrap_or("");
     let reason = payload.get("reason").and_then(|v| v.as_str()).unwrap_or("");
+    let excluded_users = payload
+        .get("excluded_users")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
 
     let ticket_path = payload.get("ticket_path").and_then(|v| v.as_str());
     let no_pass = payload
@@ -112,6 +121,7 @@ pub(crate) fn generate_credential_access_prompt(
         has_password,
         has_hash,
         has_creds,
+        excluded_users,
     };
 
     // Branch 1: Kerberos ticket-based secretsdump

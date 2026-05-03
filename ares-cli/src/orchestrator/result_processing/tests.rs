@@ -1125,3 +1125,104 @@ fn critical_hash_partial_match() {
     assert!(!is_critical_hash("krbtgt_backup"));
     assert!(!is_critical_hash("admin"));
 }
+
+#[test]
+fn extract_locked_users_basic_netexec_format() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "SMB    192.168.58.10  445  DC01  [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT\n\
+             SMB    192.168.58.10  445  DC01  [+] CONTOSO\\testuser3:testuser3 (Pwn3d!)\n\
+             SMB    192.168.58.10  445  DC01  [-] CONTOSO\\testuser2:testuser2 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let mut locked = extract_locked_usernames_from_result(&Some(payload));
+    locked.sort();
+    assert_eq!(
+        locked,
+        vec![
+            ("testuser1".to_string(), Some("contoso".to_string())),
+            ("testuser2".to_string(), Some("contoso".to_string())),
+        ]
+    );
+}
+
+#[test]
+fn extract_locked_users_kdc_revoked_format() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "summary": "[-] CONTOSO\\testuser1:testuser1 KDC_ERR_CLIENT_REVOKED"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(
+        locked,
+        vec![("testuser1".to_string(), Some("contoso".to_string()))]
+    );
+}
+
+#[test]
+fn extract_locked_users_skips_disabled_builtins() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "[-] CONTOSO\\Guest:Guest STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\krbtgt:krbtgt STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(
+        locked,
+        vec![("testuser1".to_string(), Some("contoso".to_string()))]
+    );
+}
+
+#[test]
+fn extract_locked_users_dedups_repeats() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": [
+            "[-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT\n\
+             [-] CONTOSO\\testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+        ]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert_eq!(locked.len(), 1);
+}
+
+#[test]
+fn extract_locked_users_no_matches_returns_empty() {
+    use super::extract_locked_usernames_from_result;
+    let payload = json!({
+        "tool_outputs": ["[+] CONTOSO\\testuser1:testuser1 (Pwn3d!)"]
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty());
+}
+
+#[test]
+fn extract_locked_users_rejects_bare_principal() {
+    use super::extract_locked_usernames_from_result;
+    // Bare `user:pass` (no DOMAIN\ prefix) is rejected — netexec always
+    // emits the canonical `DOMAIN\user:pass` form on auth events.
+    let payload = json!({
+        "summary": "[-] testuser1:testuser1 STATUS_ACCOUNT_LOCKED_OUT"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty());
+}
+
+#[test]
+fn extract_locked_users_rejects_llm_narrative_tokens() {
+    use super::extract_locked_usernames_from_result;
+    // LLM summary text often contains `word:` tokens (technique names,
+    // password values, list bullets) that are not principals. The
+    // backslash gate prevents these from being misclassified.
+    let payload = json!({
+        "summary": "1) username_as_password: returned STATUS_ACCOUNT_LOCKED_OUT\n\
+                    Notable: P@ssw0rd1 spray got STATUS_ACCOUNT_LOCKED_OUT\n\
+                    auth: failed with STATUS_ACCOUNT_LOCKED_OUT"
+    });
+    let locked = extract_locked_usernames_from_result(&Some(payload));
+    assert!(locked.is_empty(), "got false positives: {locked:?}");
+}

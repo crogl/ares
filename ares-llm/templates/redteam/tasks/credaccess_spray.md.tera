@@ -8,11 +8,14 @@ Task ID: {{ task_id }}
 {% endif -%}
 **EXECUTE username_as_password (worker injects credentials at dispatch):**
 1. First save users: save_users_to_file(target='{{ dc_ip }}', username='{{ username }}', domain='{{ domain }}')
-2. Then spray: username_as_password(target='{{ dc_ip }}', domain='{{ domain }}', users_file='/tmp/users.txt')
+2. Then spray: username_as_password(target='{{ dc_ip }}', domain='{{ domain }}', users_file='/tmp/users.txt'{% if excluded_users %}, excluded_users='{{ excluded_users }}'{% endif %})
 
 This tests if users have username=password (e.g., testuser:testuser).
 Zero lockout risk, one attempt per user.
 Report any credentials found immediately.
+{% if excluded_users %}
+**DO NOT auth as these locked-out users: {{ excluded_users }} — pass them via `excluded_users` so the worker drops them from the wordlist before netexec runs.**
+{% endif %}
 {% if state_context %}
 
 ## Current Operation State

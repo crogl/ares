@@ -344,18 +344,24 @@ async fn run_inner() -> Result<()> {
     let tool_disp: Arc<dyn ares_llm::ToolDispatcher> =
         if std::env::var("ARES_TOOL_DISPATCH").as_deref() == Ok("local") {
             info!("Tool dispatch: local (in-process via ares-tools)");
-            Arc::new(tool_dispatcher::LocalToolDispatcher::new(
-                queue.clone(),
-                config.operation_id.clone(),
-                auth_throttle.clone(),
-            ))
+            Arc::new(
+                tool_dispatcher::LocalToolDispatcher::new(
+                    queue.clone(),
+                    config.operation_id.clone(),
+                    auth_throttle.clone(),
+                )
+                .with_state(shared_state.clone()),
+            )
         } else {
             info!("Tool dispatch: Redis queue (ares:tool_exec:{{role}})");
-            Arc::new(tool_dispatcher::RedisToolDispatcher::new(
-                queue.clone(),
-                config.operation_id.clone(),
-                auth_throttle.clone(),
-            ))
+            Arc::new(
+                tool_dispatcher::RedisToolDispatcher::new(
+                    queue.clone(),
+                    config.operation_id.clone(),
+                    auth_throttle.clone(),
+                )
+                .with_state(shared_state.clone()),
+            )
         };
 
     // Build sorted technique priorities for the LLM system prompt.

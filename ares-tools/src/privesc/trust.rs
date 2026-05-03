@@ -96,7 +96,7 @@ pub async fn extract_trust_key(args: &Value) -> Result<ToolOutput> {
 /// validate AES256 inter-realm tickets without RC4. impacket-ticketer rejects
 /// both flags simultaneously ("Pick only one" — exits without writing a ccache),
 /// so we choose AES when available and fall back to NT hash otherwise. NT-only
-/// tickets validate against meereen.essos.local in the GOAD lab — verified
+/// tickets validate against dc01.fabrikam.local in the lab — verified
 /// working for cross-realm bloodyAD LDAP bind.
 pub async fn create_inter_realm_ticket(args: &Value) -> Result<ToolOutput> {
     let trust_key = required_str(args, "trust_key")?;

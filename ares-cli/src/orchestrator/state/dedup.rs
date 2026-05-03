@@ -11,6 +11,13 @@ use redis::aio::ConnectionLike;
 use super::SharedState;
 use crate::orchestrator::task_queue::TaskQueueCore;
 
+/// After this many consecutive failed exploit dispatches for the same vuln,
+/// the exploitation workflow stops re-dispatching it. Set just high enough
+/// to absorb transient failures (LLM hiccups, throttle bumps) while still
+/// catching unsatisfiable preconditions in well under an hour:
+/// 5 attempts × 120s cooldown = ~10 min ceiling per stuck vuln.
+pub const MAX_EXPLOIT_FAILURES: u32 = 5;
+
 impl SharedState {
     /// Mark a vulnerability as exploited.
     ///
@@ -156,6 +163,32 @@ impl SharedState {
         let _: () = conn.srem(&redis_key, ip).await?;
         Ok(())
     }
+
+    /// Increment the failure counter for `vuln_id` and return the new count.
+    /// Called from result processing on every failed exploit task. When the
+    /// count reaches `MAX_EXPLOIT_FAILURES` the exploitation workflow will
+    /// abandon the vuln on the next pop.
+    pub async fn record_exploit_failure(&self, vuln_id: &str) -> u32 {
+        let mut state = self.inner.write().await;
+        let count = state
+            .exploit_failure_counts
+            .entry(vuln_id.to_string())
+            .and_modify(|c| *c += 1)
+            .or_insert(1);
+        *count
+    }
+
+    /// Returns true once `vuln_id` has accumulated `MAX_EXPLOIT_FAILURES`
+    /// consecutive failures. Checked by the exploitation workflow before
+    /// dispatching a vuln from the priority queue.
+    pub async fn is_exploit_abandoned(&self, vuln_id: &str) -> bool {
+        let state = self.inner.read().await;
+        state
+            .exploit_failure_counts
+            .get(vuln_id)
+            .map(|c| *c >= MAX_EXPLOIT_FAILURES)
+            .unwrap_or(false)
+    }
 }
 
 /// Given the primary vuln being marked exploited, return additional vuln_ids
@@ -223,7 +256,7 @@ fn compute_superseded(
 
 #[cfg(test)]
 mod tests {
-    use super::compute_superseded;
+    use super::{compute_superseded, MAX_EXPLOIT_FAILURES};
     use crate::orchestrator::state::SharedState;
     use crate::orchestrator::task_queue::TaskQueueCore;
     use ares_core::models::VulnerabilityInfo;
@@ -313,57 +346,57 @@ mod tests {
     fn supersede_mssql_impersonation_supersedes_host_access() {
         let mut discovered = HashMap::new();
         discovered.insert(
-            "mssql_10_1_2_51".to_string(),
-            vuln("mssql_10_1_2_51", "mssql_access", "10.1.2.51", &[]),
+            "mssql_192_168_58_51".to_string(),
+            vuln("mssql_192_168_58_51", "mssql_access", "192.168.58.51", &[]),
         );
         discovered.insert(
-            "mssql_impersonation_10.1.2.51".to_string(),
+            "mssql_impersonation_192.168.58.51".to_string(),
             vuln(
-                "mssql_impersonation_10.1.2.51",
+                "mssql_impersonation_192.168.58.51",
                 "mssql_impersonation",
-                "10.1.2.51",
+                "192.168.58.51",
                 &[],
             ),
         );
-        let primary = discovered.get("mssql_impersonation_10.1.2.51");
-        let out = compute_superseded("mssql_impersonation_10.1.2.51", primary, &discovered);
-        assert_eq!(out, vec!["mssql_10_1_2_51".to_string()]);
+        let primary = discovered.get("mssql_impersonation_192.168.58.51");
+        let out = compute_superseded("mssql_impersonation_192.168.58.51", primary, &discovered);
+        assert_eq!(out, vec!["mssql_192_168_58_51".to_string()]);
     }
 
     #[test]
     fn supersede_mssql_linked_server_supersedes_host_access() {
         let mut discovered = HashMap::new();
         discovered.insert(
-            "mssql_10_1_2_254".to_string(),
-            vuln("mssql_10_1_2_254", "mssql_access", "10.1.2.254", &[]),
+            "mssql_192_168_58_254".to_string(),
+            vuln("mssql_192_168_58_254", "mssql_access", "192.168.58.254", &[]),
         );
-        let lsid = "mssql_linked_server_10.1.2.254_SQL".to_string();
+        let lsid = "mssql_linked_server_192.168.58.254_SQL".to_string();
         discovered.insert(
             lsid.clone(),
-            vuln(&lsid, "mssql_linked_server", "10.1.2.254", &[]),
+            vuln(&lsid, "mssql_linked_server", "192.168.58.254", &[]),
         );
         let out = compute_superseded(&lsid, discovered.get(&lsid), &discovered);
-        assert_eq!(out, vec!["mssql_10_1_2_254".to_string()]);
+        assert_eq!(out, vec!["mssql_192_168_58_254".to_string()]);
     }
 
     #[test]
     fn supersede_mssql_does_not_match_other_hosts() {
         let mut discovered = HashMap::new();
         discovered.insert(
-            "mssql_10_1_2_51".to_string(),
-            vuln("mssql_10_1_2_51", "mssql_access", "10.1.2.51", &[]),
+            "mssql_192_168_58_51".to_string(),
+            vuln("mssql_192_168_58_51", "mssql_access", "192.168.58.51", &[]),
         );
         discovered.insert(
-            "mssql_impersonation_10.1.2.254".to_string(),
+            "mssql_impersonation_192.168.58.254".to_string(),
             vuln(
-                "mssql_impersonation_10.1.2.254",
+                "mssql_impersonation_192.168.58.254",
                 "mssql_impersonation",
-                "10.1.2.254",
+                "192.168.58.254",
                 &[],
             ),
         );
-        let primary = discovered.get("mssql_impersonation_10.1.2.254");
-        let out = compute_superseded("mssql_impersonation_10.1.2.254", primary, &discovered);
+        let primary = discovered.get("mssql_impersonation_192.168.58.254");
+        let out = compute_superseded("mssql_impersonation_192.168.58.254", primary, &discovered);
         assert!(out.is_empty());
     }
 
@@ -371,50 +404,50 @@ mod tests {
     fn supersede_dc_secretsdump_covers_trust_and_child_to_parent() {
         let mut discovered = HashMap::new();
         discovered.insert(
-            "dc_secretsdump_essos.local".to_string(),
+            "dc_secretsdump_fabrikam.local".to_string(),
             vuln(
-                "dc_secretsdump_essos.local",
+                "dc_secretsdump_fabrikam.local",
                 "dc_secretsdump",
-                "10.1.2.58",
-                &[("domain", "essos.local")],
+                "192.168.58.58",
+                &[("domain", "fabrikam.local")],
             ),
         );
         discovered.insert(
-            "forest_trust_sevenkingdoms.local_essos.local".to_string(),
+            "forest_trust_contoso.local_fabrikam.local".to_string(),
             vuln(
-                "forest_trust_sevenkingdoms.local_essos.local",
+                "forest_trust_contoso.local_fabrikam.local",
                 "forest_trust_escalation",
-                "10.1.2.58",
-                &[("target_domain", "essos.local")],
+                "192.168.58.58",
+                &[("target_domain", "fabrikam.local")],
             ),
         );
         discovered.insert(
-            "child_to_parent_north_essos".to_string(),
+            "child_to_parent_child_fabrikam".to_string(),
             vuln(
-                "child_to_parent_north_essos",
+                "child_to_parent_child_fabrikam",
                 "child_to_parent",
-                "10.1.2.58",
-                &[("target_domain", "essos.local")],
+                "192.168.58.58",
+                &[("target_domain", "fabrikam.local")],
             ),
         );
         // Unrelated trust should NOT be superseded.
         discovered.insert(
-            "forest_trust_essos_north".to_string(),
+            "forest_trust_fabrikam_child".to_string(),
             vuln(
-                "forest_trust_essos_north",
+                "forest_trust_fabrikam_child",
                 "forest_trust_escalation",
-                "10.1.2.150",
-                &[("target_domain", "north.sevenkingdoms.local")],
+                "192.168.58.150",
+                &[("target_domain", "child.contoso.local")],
             ),
         );
-        let primary = discovered.get("dc_secretsdump_essos.local");
-        let mut out = compute_superseded("dc_secretsdump_essos.local", primary, &discovered);
+        let primary = discovered.get("dc_secretsdump_fabrikam.local");
+        let mut out = compute_superseded("dc_secretsdump_fabrikam.local", primary, &discovered);
         out.sort();
         assert_eq!(
             out,
             vec![
-                "child_to_parent_north_essos".to_string(),
-                "forest_trust_sevenkingdoms.local_essos.local".to_string(),
+                "child_to_parent_child_fabrikam".to_string(),
+                "forest_trust_contoso.local_fabrikam.local".to_string(),
             ]
         );
     }
@@ -433,37 +466,69 @@ mod tests {
         {
             let mut s = state.inner.write().await;
             s.discovered_vulnerabilities.insert(
-                "mssql_10_1_2_51".into(),
-                vuln("mssql_10_1_2_51", "mssql_access", "10.1.2.51", &[]),
+                "mssql_192_168_58_51".into(),
+                vuln("mssql_192_168_58_51", "mssql_access", "192.168.58.51", &[]),
             );
             s.discovered_vulnerabilities.insert(
-                "mssql_impersonation_10.1.2.51".into(),
+                "mssql_impersonation_192.168.58.51".into(),
                 vuln(
-                    "mssql_impersonation_10.1.2.51",
+                    "mssql_impersonation_192.168.58.51",
                     "mssql_impersonation",
-                    "10.1.2.51",
+                    "192.168.58.51",
                     &[],
                 ),
             );
         }
 
         state
-            .mark_exploited(&q, "mssql_impersonation_10.1.2.51")
+            .mark_exploited(&q, "mssql_impersonation_192.168.58.51")
             .await
             .unwrap();
 
         let s = state.inner.read().await;
         assert!(s
             .exploited_vulnerabilities
-            .contains("mssql_impersonation_10.1.2.51"));
-        assert!(s.exploited_vulnerabilities.contains("mssql_10_1_2_51"));
+            .contains("mssql_impersonation_192.168.58.51"));
+        assert!(s.exploited_vulnerabilities.contains("mssql_192_168_58_51"));
 
         let mut conn = q.connection();
         let members: std::collections::HashSet<String> =
             redis::AsyncCommands::smembers(&mut conn, "ares:op:op-1:exploited")
                 .await
                 .unwrap();
-        assert!(members.contains("mssql_impersonation_10.1.2.51"));
-        assert!(members.contains("mssql_10_1_2_51"));
+        assert!(members.contains("mssql_impersonation_192.168.58.51"));
+        assert!(members.contains("mssql_192_168_58_51"));
+    }
+
+    #[tokio::test]
+    async fn record_exploit_failure_increments_counter() {
+        let state = SharedState::new("op-1".to_string());
+        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 1);
+        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 2);
+        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 3);
+        // Different vuln tracked independently.
+        assert_eq!(state.record_exploit_failure("other_vuln").await, 1);
+    }
+
+    #[tokio::test]
+    async fn is_exploit_abandoned_below_threshold() {
+        let state = SharedState::new("op-1".to_string());
+        for _ in 0..(MAX_EXPLOIT_FAILURES - 1) {
+            state.record_exploit_failure("vuln_a").await;
+        }
+        assert!(!state.is_exploit_abandoned("vuln_a").await);
+        assert!(!state.is_exploit_abandoned("never_failed").await);
+    }
+
+    #[tokio::test]
+    async fn is_exploit_abandoned_at_and_above_threshold() {
+        let state = SharedState::new("op-1".to_string());
+        for _ in 0..MAX_EXPLOIT_FAILURES {
+            state.record_exploit_failure("vuln_a").await;
+        }
+        assert!(state.is_exploit_abandoned("vuln_a").await);
+        // Further failures don't un-abandon.
+        state.record_exploit_failure("vuln_a").await;
+        assert!(state.is_exploit_abandoned("vuln_a").await);
     }
 }

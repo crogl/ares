@@ -5,11 +5,12 @@ use tracing::{debug, warn};
 
 use ares_llm::{ToolCall, ToolExecResult};
 
+use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::worker::credential_resolver::resolve_credentials;
 
 use super::domain_validator::check_domain_arg;
-use super::{extract_credential_key, push_realtime_discoveries, AuthThrottle};
+use super::{extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle};
 
 /// Dispatches tool calls directly via `ares_tools::dispatch` without Redis.
 ///
@@ -19,6 +20,7 @@ pub struct LocalToolDispatcher {
     pub(super) queue: TaskQueue,
     pub(super) operation_id: String,
     pub(super) auth_throttle: AuthThrottle,
+    pub(super) state: Option<SharedState>,
 }
 
 impl LocalToolDispatcher {
@@ -27,7 +29,15 @@ impl LocalToolDispatcher {
             queue,
             operation_id,
             auth_throttle,
+            state: None,
         }
+    }
+
+    /// Attach orchestrator state so spray-style tool calls can be augmented
+    /// with the current quarantine list before dispatch.
+    pub fn with_state(mut self, state: SharedState) -> Self {
+        self.state = Some(state);
+        self
     }
 }
 
@@ -56,6 +66,10 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         // tool_executor path so local (in-process) dispatch gets the same
         // injection.
         let mut resolved_arguments = call.arguments.clone();
+        // Spray hygiene: augment excluded_users from the current quarantine
+        // list before dispatch. Done before credential resolution so the
+        // domain arg (used for the lookup) is the LLM-supplied target.
+        inject_excluded_users(&self.state, &call.name, &mut resolved_arguments).await;
         let mut conn = self.queue.connection();
         if let Err(e) = resolve_credentials(
             &mut conn,
@@ -71,6 +85,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                 "credential_resolver failed; continuing with original arguments"
             );
             resolved_arguments = call.arguments.clone();
+            inject_excluded_users(&self.state, &call.name, &mut resolved_arguments).await;
         }
 
         match ares_tools::dispatch(&call.name, &resolved_arguments).await {

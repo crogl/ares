@@ -96,3 +96,76 @@ fn cross_role_routing_recon_stays_recon() {
         "recon"
     );
 }
+
+#[tokio::test]
+async fn inject_excluded_users_no_state_is_noop() {
+    let mut args = serde_json::json!({"target": "1.2.3.4", "domain": "contoso.local"});
+    inject_excluded_users(&None, "password_spray", &mut args).await;
+    assert!(args.get("excluded_users").is_none());
+}
+
+#[tokio::test]
+async fn inject_excluded_users_skips_non_spray_tools() {
+    let state = SharedState::new("op-1".into());
+    state
+        .write()
+        .await
+        .quarantine_user("testuser1", "contoso.local");
+    let mut args = serde_json::json!({"target": "1.2.3.4", "domain": "contoso.local"});
+    inject_excluded_users(&Some(state), "smb_login_check", &mut args).await;
+    assert!(args.get("excluded_users").is_none());
+}
+
+#[tokio::test]
+async fn inject_excluded_users_populates_from_state() {
+    let state = SharedState::new("op-1".into());
+    {
+        let mut s = state.write().await;
+        s.quarantine_user("testuser1", "contoso.local");
+        s.quarantine_user("testuser2", "contoso.local");
+        s.quarantine_user("testuser3", "fabrikam.local");
+    }
+    let mut args = serde_json::json!({"target": "1.2.3.4", "domain": "contoso.local"});
+    inject_excluded_users(&Some(state), "password_spray", &mut args).await;
+    let excluded = args
+        .get("excluded_users")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    let mut parts: Vec<&str> = excluded.split(',').collect();
+    parts.sort();
+    assert_eq!(parts, vec!["testuser1", "testuser2"]);
+}
+
+#[tokio::test]
+async fn inject_excluded_users_unions_with_existing() {
+    let state = SharedState::new("op-1".into());
+    state
+        .write()
+        .await
+        .quarantine_user("testuser1", "contoso.local");
+    let mut args = serde_json::json!({
+        "target": "1.2.3.4",
+        "domain": "contoso.local",
+        "excluded_users": "Administrator,testuser2",
+    });
+    inject_excluded_users(&Some(state), "username_as_password", &mut args).await;
+    let excluded = args
+        .get("excluded_users")
+        .and_then(|v| v.as_str())
+        .unwrap();
+    let mut parts: Vec<&str> = excluded.split(',').collect();
+    parts.sort();
+    assert_eq!(parts, vec!["administrator", "testuser1", "testuser2"]);
+}
+
+#[tokio::test]
+async fn inject_excluded_users_no_domain_is_noop() {
+    let state = SharedState::new("op-1".into());
+    state
+        .write()
+        .await
+        .quarantine_user("testuser1", "contoso.local");
+    let mut args = serde_json::json!({"target": "1.2.3.4"});
+    inject_excluded_users(&Some(state), "password_spray", &mut args).await;
+    assert!(args.get("excluded_users").is_none());
+}

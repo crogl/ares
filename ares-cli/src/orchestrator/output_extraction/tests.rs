@@ -370,7 +370,7 @@ SMB  192.168.58.11  445  DC02  [+] child.contoso.local\\jdoe:jdoe";
 #[test]
 fn extract_netexec_skips_hash_auth_echo() {
     let output =
-        "SMB  192.168.58.11  445  DC01  [+] contoso.local\\jeor.mormont:6dccf1c567c56a40e56691a723a49664 (Pwn3d!)";
+        "SMB  192.168.58.11  445  DC01  [+] contoso.local\\frank:6dccf1c567c56a40e56691a723a49664 (Pwn3d!)";
     let args = serde_json::json!({"hashes": "6dccf1c567c56a40e56691a723a49664"});
     let ctx = ToolOutputCtx {
         arguments: Some(&args),
@@ -542,12 +542,12 @@ fn extract_cracked_tgs_john_show_unknown_user() {
     let output = "Loaded 1 password hash (krb5tgs)\n\
         $krb5tgs$23$*john.smith$CHILD.CONTOSO.LOCAL$CIFS/filesvr01*$abcdef$123456\n\
         --- john --show ---\n\
-        ?:iknownothing\n\n\
+        ?:P@ssw0rd!\n\n\
         1 password hash cracked, 0 left\n";
     let creds = extract_cracked_passwords(output, "child.contoso.local");
     assert_eq!(creds.len(), 1);
     assert_eq!(creds[0].username, "john.smith");
-    assert_eq!(creds[0].password, "iknownothing");
+    assert_eq!(creds[0].password, "P@ssw0rd!");
     assert_eq!(creds[0].domain, "CHILD.CONTOSO.LOCAL");
     assert_eq!(creds[0].source, "cracked:john");
 }
@@ -556,7 +556,7 @@ fn extract_cracked_tgs_john_show_unknown_user() {
 fn extract_cracked_tgs_john_unknown_user_no_hash_context() {
     // Without a TGS hash line in the output, ?:password is skipped
     let output = "--- john --show ---\n\
-        ?:iknownothing\n\n\
+        ?:P@ssw0rd!\n\n\
         1 password hash cracked, 0 left\n";
     let creds = extract_cracked_passwords(output, "contoso.local");
     assert!(creds.is_empty(), "No TGS hash context = no credential");

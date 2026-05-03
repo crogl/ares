@@ -34,6 +34,13 @@ pub struct StateInner {
     pub discovered_vulnerabilities: HashMap<String, VulnerabilityInfo>,
     pub exploited_vulnerabilities: HashSet<String>,
 
+    // Per-vuln consecutive exploit-failure counts. Drives `is_exploit_abandoned`
+    // — once a vuln crosses MAX_EXPLOIT_FAILURES, the exploitation workflow
+    // skips it permanently for this op. Prevents 2-hour LLM stuck-loops on
+    // exploits whose preconditions (creds, reachable target, working tool)
+    // can never be satisfied. Operation-scoped, in-memory only.
+    pub exploit_failure_counts: HashMap<String, u32>,
+
     // Maps
     pub domain_controllers: HashMap<String, String>,
     pub netbios_to_fqdn: HashMap<String, String>,
@@ -73,6 +80,15 @@ pub struct StateInner {
     // KDC_ERR_CLIENT_REVOKED are quarantined to avoid burning auth budget.
     pub quarantined_credentials: HashMap<String, DateTime<Utc>>,
 
+    // Username lockout quarantine: `user@domain` → expiry time.
+    // Distinct from quarantined_credentials: tracks principals seen locked
+    // during enumeration paths (username_as_password, password_spray) where
+    // we have no specific cleartext credential to quarantine, only the
+    // principal itself. Used to filter user lists before re-dispatching
+    // enum tools so we don't keep incrementing badPwdCount on already-locked
+    // accounts.
+    pub quarantined_users: HashMap<String, DateTime<Utc>>,
+
     // Per-trust counter: how many times the cross-forest forge dispatch
     // has been deferred waiting for the AES256 trust key to upsert.
     // secretsdump runs twice (NTLM-only first, then AES-equipped) and
@@ -111,6 +127,7 @@ impl StateInner {
             candidate_domains: HashMap::new(),
             discovered_vulnerabilities: HashMap::new(),
             exploited_vulnerabilities: HashSet::new(),
+            exploit_failure_counts: HashMap::new(),
             domain_controllers: HashMap::new(),
             netbios_to_fqdn: HashMap::new(),
             domain_sids: HashMap::new(),
@@ -127,6 +144,7 @@ impl StateInner {
             pending_tasks: HashMap::new(),
             completed_tasks: HashMap::new(),
             quarantined_credentials: HashMap::new(),
+            quarantined_users: HashMap::new(),
             forge_aes_defers: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
@@ -169,6 +187,47 @@ impl StateInner {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
         self.quarantined_credentials.insert(key, expiry);
+    }
+
+    /// Check if a user is quarantined due to lockout observed during
+    /// enumeration. Expired quarantines are ignored (lazy cleanup).
+    pub fn is_user_quarantined(&self, username: &str, domain: &str) -> bool {
+        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        self.quarantined_users
+            .get(&key)
+            .map(|expiry| Utc::now() < *expiry)
+            .unwrap_or(false)
+    }
+
+    /// Quarantine a user for `QUARANTINE_DURATION_SECS` after lockout.
+    pub fn quarantine_user(&mut self, username: &str, domain: &str) {
+        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+        let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
+        self.quarantined_users.insert(key, expiry);
+    }
+
+    /// Return a deduplicated list of currently-quarantined usernames in
+    /// `domain` (case-insensitive). Used to populate `excluded_users` on
+    /// outbound spray dispatches so the worker can drop them before auth.
+    pub fn quarantined_users_in_domain(&self, domain: &str) -> Vec<String> {
+        let domain_l = domain.to_lowercase();
+        let now = Utc::now();
+        let mut out: Vec<String> = self
+            .quarantined_users
+            .iter()
+            .filter(|(_, expiry)| now < **expiry)
+            .filter_map(|(key, _)| {
+                let (user, dom) = key.split_once('@')?;
+                if dom == domain_l {
+                    Some(user.to_string())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Resolve the DC IP for a domain.
@@ -310,8 +369,8 @@ impl StateInner {
     /// action), regardless of which TARGET domain the action is aimed at.
     ///
     /// Cross-forest ACL/MSSQL/ADCS exploitation has the source user living in
-    /// their own domain (e.g. `petyer.baelish@sevenkingdoms.local`) while a
-    /// vuln's `domain` field points at the target (e.g. `essos.local`).
+    /// their own domain (e.g. `testuser@contoso.local`) while a vuln's
+    /// `domain` field points at the target (e.g. `fabrikam.local`).
     /// Same-domain matching against the target therefore drops legitimate
     /// cross-forest work.
     ///
@@ -827,6 +886,54 @@ mod tests {
         // Dominate fabrikam too
         state.dominated_domains.insert("fabrikam.local".into());
         assert!(state.all_forests_dominated());
+    }
+
+    #[test]
+    fn user_quarantine_basic() {
+        let mut state = StateInner::new("op-1".into());
+        assert!(!state.is_user_quarantined("testuser1", "contoso.local"));
+
+        state.quarantine_user("testuser1", "contoso.local");
+        assert!(state.is_user_quarantined("testuser1", "contoso.local"));
+        assert!(state.is_user_quarantined("TESTUSER1", "CONTOSO.LOCAL")); // case insensitive
+
+        // Different user not affected
+        assert!(!state.is_user_quarantined("testuser2", "contoso.local"));
+        // Same user, different domain not affected
+        assert!(!state.is_user_quarantined("testuser1", "fabrikam.local"));
+    }
+
+    #[test]
+    fn quarantined_users_in_domain_filters() {
+        let mut state = StateInner::new("op-1".into());
+        state.quarantine_user("testuser1", "contoso.local");
+        state.quarantine_user("testuser2", "contoso.local");
+        state.quarantine_user("testuser3", "fabrikam.local");
+
+        let mut contoso = state.quarantined_users_in_domain("contoso.local");
+        contoso.sort();
+        assert_eq!(
+            contoso,
+            vec!["testuser1".to_string(), "testuser2".to_string()]
+        );
+
+        let fabrikam = state.quarantined_users_in_domain("fabrikam.local");
+        assert_eq!(fabrikam, vec!["testuser3".to_string()]);
+
+        let unknown = state.quarantined_users_in_domain("unknown.local");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn quarantined_users_in_domain_skips_expired() {
+        let mut state = StateInner::new("op-1".into());
+        state
+            .quarantined_users
+            .insert("expired@contoso.local".into(), Utc::now() - chrono::Duration::seconds(1));
+        state.quarantine_user("fresh", "contoso.local");
+
+        let users = state.quarantined_users_in_domain("contoso.local");
+        assert_eq!(users, vec!["fresh".to_string()]);
     }
 
     #[test]

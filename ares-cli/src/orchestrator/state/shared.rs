@@ -34,9 +34,29 @@ impl SharedState {
             &s.domain_controllers,
         );
 
+        // Hide quarantined credentials from LLM agents. A locked-out
+        // account can't authenticate during the quarantine window, and
+        // surfacing it just invites more failed-auth attempts on the same
+        // account (which keep the badPwdCount climbing on shared lockout
+        // policies). The state's own resolvers already filter
+        // is_credential_quarantined for automation paths; this filter does
+        // the same for the LLM-facing snapshot.
+        let credentials: Vec<_> = s
+            .credentials
+            .iter()
+            .filter(|c| !s.is_credential_quarantined(&c.username, &c.domain))
+            .cloned()
+            .collect();
+        let hashes: Vec<_> = s
+            .hashes
+            .iter()
+            .filter(|h| !s.is_credential_quarantined(&h.username, &h.domain))
+            .cloned()
+            .collect();
+
         ares_llm::prompt::StateSnapshot {
-            credentials: s.credentials.clone(),
-            hashes: s.hashes.clone(),
+            credentials,
+            hashes,
             hosts: s.hosts.clone(),
             shares: s.shares.clone(),
             domains: s.domains.clone(),
@@ -201,6 +221,69 @@ mod tests {
         let key = state.discovery_key().await;
         assert!(key.contains("op-xyz"));
         assert!(key.starts_with("ares:discoveries:"));
+    }
+
+    #[tokio::test]
+    async fn snapshot_hides_quarantined_credentials() {
+        let state = SharedState::new("op-1".into());
+        {
+            let mut inner = state.write().await;
+            inner.credentials.push(Credential {
+                id: "c1".into(),
+                username: "live_user".into(),
+                password: "p1".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.credentials.push(Credential {
+                id: "c2".into(),
+                username: "locked_user".into(),
+                password: "p2".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.hashes.push(Hash {
+                id: "h1".into(),
+                username: "locked_user".into(),
+                hash_type: "NTLM".into(),
+                hash_value: "aabbcc".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                cracked_password: None,
+                aes_key: None,
+                discovered_at: Some(chrono::Utc::now()),
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.hashes.push(Hash {
+                id: "h2".into(),
+                username: "live_user".into(),
+                hash_type: "NTLM".into(),
+                hash_value: "ddeeff".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                cracked_password: None,
+                aes_key: None,
+                discovered_at: Some(chrono::Utc::now()),
+                parent_id: None,
+                attack_step: 0,
+            });
+            inner.quarantine_credential("locked_user", "contoso.local");
+        }
+
+        let snap = state.snapshot().await;
+        assert_eq!(snap.credentials.len(), 1, "quarantined cred must be hidden");
+        assert_eq!(snap.credentials[0].username, "live_user");
+        assert_eq!(snap.hashes.len(), 1, "quarantined hash must be hidden");
+        assert_eq!(snap.hashes[0].username, "live_user");
     }
 
     #[tokio::test]

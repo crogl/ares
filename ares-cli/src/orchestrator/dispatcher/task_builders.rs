@@ -223,7 +223,7 @@ impl Dispatcher {
     /// Refuses to dispatch when the credential's realm differs from the target
     /// host's realm and no trust path is known — wrong-realm NTLM/Kerberos auth
     /// against a foreign DC just returns ACCESS_DENIED and burns LLM tokens
-    /// (see the swarm of NORTH\catelyn → braavos.essos.local failures).
+    /// (see the swarm of CHILD\dave → sql01.fabrikam.local failures).
     pub async fn request_lateral(
         &self,
         target_ip: &str,

@@ -38,12 +38,12 @@ static RE_AES256_KEY: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 // $MACHINE.ACC markers reveal the dump's source domain (NetBIOS prefix):
-//   NORTH\WINTERFELL$:aes256-cts-hmac-sha1-96:<hex>
-//   NORTH\WINTERFELL$:plain_password_hex:<hex>
-//   NORTH\WINTERFELL$:aad3...:<nthash>:::
+//   CHILD\DC01$:aes256-cts-hmac-sha1-96:<hex>
+//   CHILD\DC01$:plain_password_hex:<hex>
+//   CHILD\DC01$:aad3...:<nthash>:::
 // The captured prefix authoritatively identifies the dump's actual domain,
 // which may differ from the task's params.domain (e.g. a cross-forest task
-// targeting essos.local that ended up dumping a north DC).
+// targeting fabrikam.local that ended up dumping a child DC).
 static RE_MACHINE_ACCT_DOMAIN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?m)^([A-Za-z0-9_-]+)\\[A-Za-z0-9_.-]+\$:(?:aes256-cts-hmac-sha1-96|aes128-cts-hmac-sha1-96|plain_password_hex|des-cbc-md5|aad3b435b51404eeaad3b435b51404ee:[a-fA-F0-9]{32}:::)",
@@ -199,8 +199,8 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
         if let Some(caps) = RE_NTLM_PLAIN.captures(line) {
             // Skip plain NTLM lines when the dump came from a domain that
             // differs from default_domain — applying default_domain would
-            // create phantom entries (e.g. essos.local:krbtgt mislabel of
-            // a north DC dump done under a cross-forest task).
+            // create phantom entries (e.g. fabrikam.local:krbtgt mislabel of
+            // a child DC dump done under a cross-forest task).
             if suppress_plain_ntlm {
                 continue;
             }
@@ -434,27 +434,27 @@ mod tests {
 
     #[test]
     fn extract_hashes_suppresses_plain_ntlm_on_domain_mismatch() {
-        // Regression test for Bug F: a cross-forest task with default_domain=essos.local
-        // dumped a NORTH DC (winterfell). The output's $MACHINE.ACC marker
-        // (NORTH\WINTERFELL$:aes256-...) reveals the real domain is NORTH, so plain
-        // NTLM lines (krbtgt:502:..., Administrator:500:...) must NOT be labeled essos.local.
+        // Regression test for Bug F: a cross-forest task with default_domain=fabrikam.local
+        // dumped a CHILD DC (dc01). The output's $MACHINE.ACC marker
+        // (CHILD\DC01$:aes256-...) reveals the real domain is CHILD, so plain
+        // NTLM lines (krbtgt:502:..., Administrator:500:...) must NOT be labeled fabrikam.local.
         let output = "\
 Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
 [*] $MACHINE.ACC
-NORTH\\WINTERFELL$:aes256-cts-hmac-sha1-96:583938786f0a9459ced10e35f5803be6d4017c6fd4ba21b6e7479f9bce851d6b
-NORTH\\WINTERFELL$:aad3b435b51404eeaad3b435b51404ee:a3f11b5a18f97db9a3d4f16aed85a1b6:::
+CHILD\\DC01$:aes256-cts-hmac-sha1-96:583938786f0a9459ced10e35f5803be6d4017c6fd4ba21b6e7479f9bce851d6b
+CHILD\\DC01$:aad3b435b51404eeaad3b435b51404ee:a3f11b5a18f97db9a3d4f16aed85a1b6:::
 krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::
 krbtgt:aes256-cts-hmac-sha1-96:86eebe21a5af32061e42ef050c447d4467648e54884a92d91a3f97fbfa0114a4";
-        let hashes = extract_hashes(output, "essos.local");
+        let hashes = extract_hashes(output, "fabrikam.local");
         // Plain NTLM lines must be suppressed — no hashes should carry the
-        // mismatched essos.local label.
-        let labeled_essos: Vec<_> = hashes
+        // mismatched fabrikam.local label.
+        let labeled_fabrikam: Vec<_> = hashes
             .iter()
-            .filter(|h| h.domain.eq_ignore_ascii_case("essos.local"))
+            .filter(|h| h.domain.eq_ignore_ascii_case("fabrikam.local"))
             .collect();
         assert!(
-            labeled_essos.is_empty(),
-            "no hashes should be labeled essos.local when dump is from NORTH"
+            labeled_fabrikam.is_empty(),
+            "no hashes should be labeled fabrikam.local when dump is from CHILD"
         );
         // The phantom mislabel was specifically of krbtgt and Administrator —
         // make sure neither slipped through with the wrong domain.
@@ -476,9 +476,9 @@ krbtgt:aes256-cts-hmac-sha1-96:86eebe21a5af32061e42ef050c447d4467648e54884a92d91
         // lines are still extracted (the common case: a domain-targeted task).
         let output = "\
 Administrator:500:aad3b435b51404eeaad3b435b51404ee:2e993405ab82e4454afc9c9bb0939a25:::
-NORTH\\WINTERFELL$:aes256-cts-hmac-sha1-96:5839387800000000000000000000000000000000000000000000000000000000
+CHILD\\DC01$:aes256-cts-hmac-sha1-96:5839387800000000000000000000000000000000000000000000000000000000
 krbtgt:502:aad3b435b51404eeaad3b435b51404ee:8c6d94541dbc90f085e86828428d2cbf:::";
-        let hashes = extract_hashes(output, "north.sevenkingdoms.local");
+        let hashes = extract_hashes(output, "child.contoso.local");
         assert!(hashes.iter().any(|h| h.username == "krbtgt"));
         assert!(hashes.iter().any(|h| h.username == "Administrator"));
     }

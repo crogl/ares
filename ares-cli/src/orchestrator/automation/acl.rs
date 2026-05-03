@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use serde_json::json;
 use tokio::sync::watch;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::dispatcher::{Dispatcher, SubmissionOutcome};
 use crate::orchestrator::state::*;
 
 /// Extract steps from an ACL chain JSON value.
@@ -141,29 +141,45 @@ pub async fn auto_acl_chain_follow(
             });
 
             let priority = dispatcher.effective_priority("acl_abuse");
-            match dispatcher
-                .throttled_submit("acl_chain_step", "acl", payload, priority)
+            // Mark dedup on Submitted OR Deferred — Deferred means the task is
+            // safely in the deferred ZSET and the drain will retry it. Without
+            // this, the next 30s tick re-emits the same step and the deferred
+            // ZSET hits its per-type cap, silently dropping work.
+            let mark_dedup = match dispatcher
+                .throttled_submit_outcome("acl_chain_step", "acl", payload, priority)
                 .await
             {
-                Ok(Some(task_id)) => {
+                Ok(SubmissionOutcome::Submitted(task_id)) => {
                     info!(
                         task_id = %task_id,
                         step_key = %dedup_key,
                         "ACL chain step dispatched"
                     );
-                    // Mark as dispatched in both in-memory set and dedup
-                    {
-                        let mut state = dispatcher.state.write().await;
-                        state.dispatched_acl_steps.insert(dedup_key.clone());
-                        state.mark_processed(DEDUP_ACL_STEPS, dedup_key.clone());
-                    }
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_ACL_STEPS, &dedup_key)
-                        .await;
+                    true
                 }
-                Ok(None) => {} // deferred or throttled
-                Err(e) => warn!(err = %e, "Failed to dispatch ACL chain step"),
+                Ok(SubmissionOutcome::Deferred) => {
+                    debug!(step_key = %dedup_key, "ACL chain step deferred (will retry via deferred drain)");
+                    true
+                }
+                Ok(SubmissionOutcome::Dropped) => {
+                    debug!(step_key = %dedup_key, "ACL chain step dropped (will reconsider next tick)");
+                    false
+                }
+                Err(e) => {
+                    warn!(err = %e, "Failed to dispatch ACL chain step");
+                    false
+                }
+            };
+            if mark_dedup {
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.dispatched_acl_steps.insert(dedup_key.clone());
+                    state.mark_processed(DEDUP_ACL_STEPS, dedup_key.clone());
+                }
+                let _ = dispatcher
+                    .state
+                    .persist_dedup(&dispatcher.queue, DEDUP_ACL_STEPS, &dedup_key)
+                    .await;
             }
         }
     }

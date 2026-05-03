@@ -17,7 +17,7 @@ pub static LOOKUPSID_HEADER_RE: LazyLock<Regex> = LazyLock::new(|| {
 /// Match `rpcclient -c lsaquery` output. Produces:
 ///
 /// ```text
-/// Domain Name: ESSOS
+/// Domain Name: FABRIKAM
 /// Domain Sid: S-1-5-21-3030751166-2423545109-3706592460
 /// ```
 ///
@@ -257,12 +257,12 @@ mod tests {
 
     #[test]
     fn extract_lsaquery_basic() {
-        let output = "Domain Name: ESSOS\n\
+        let output = "Domain Name: FABRIKAM\n\
                        Domain Sid: S-1-5-21-3030751166-2423545109-3706592460\n";
         assert_eq!(
             extract_lsaquery_domain_sid(output),
             Some((
-                "ESSOS".to_string(),
+                "FABRIKAM".to_string(),
                 "S-1-5-21-3030751166-2423545109-3706592460".to_string()
             ))
         );
@@ -270,7 +270,7 @@ mod tests {
 
     #[test]
     fn extract_lsaquery_with_preamble() {
-        let output = "[*] Connecting to 10.1.2.58\n\
+        let output = "[*] Connecting to 192.168.58.58\n\
                        Domain Name: CONTOSO\n\
                        Domain Sid: S-1-5-21-100-200-300\n\
                        [*] Done.\n";
@@ -291,7 +291,7 @@ mod tests {
 
     #[test]
     fn extract_lsaquery_handles_crlf() {
-        let output = "Domain Name: ESSOS\r\nDomain Sid: S-1-5-21-1-2-3\r\n";
+        let output = "Domain Name: FABRIKAM\r\nDomain Sid: S-1-5-21-1-2-3\r\n";
         assert_eq!(
             extract_lsaquery_domain_sid(output).map(|(_, s)| s),
             Some("S-1-5-21-1-2-3".to_string())
@@ -301,7 +301,7 @@ mod tests {
     #[test]
     fn extract_lsaquery_requires_both_lines() {
         // Missing Domain Sid line
-        let no_sid = "Domain Name: ESSOS\n";
+        let no_sid = "Domain Name: FABRIKAM\n";
         assert_eq!(extract_lsaquery_domain_sid(no_sid), None);
         // Missing Domain Name line
         let no_name = "Domain Sid: S-1-5-21-1-2-3\n";
@@ -313,7 +313,7 @@ mod tests {
         // Lines not adjacent — pattern intentionally requires them on
         // consecutive lines so we don't pair the wrong (flat, sid) when
         // multiple servers/responses are concatenated.
-        let output = "Domain Name: ESSOS\nUnrelated line here\nDomain Sid: S-1-5-21-1-2-3\n";
+        let output = "Domain Name: FABRIKAM\nUnrelated line here\nDomain Sid: S-1-5-21-1-2-3\n";
         assert_eq!(extract_lsaquery_domain_sid(output), None);
     }
 }

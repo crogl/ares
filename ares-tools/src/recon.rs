@@ -413,6 +413,12 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
     let password = optional_str(args, "password");
     let hash = optional_str(args, "hash");
     let base_dn = optional_str(args, "base_dn");
+    // Cross-realm auth: orchestrator sets `bind_domain` to the cred's actual
+    // realm when the credential lives in a different forest from the search
+    // target (e.g. cred is `user@contoso.local` querying `fabrikam.local` DC).
+    // Without this, the bind DN gets the target realm and the foreign DC
+    // rejects with `invalidCredentials`. Falls back to `domain` when absent.
+    let bind_domain = optional_str(args, "bind_domain").unwrap_or(domain);
 
     // Hash-based auth: use impacket LDAP client with pass-the-hash (NTLM)
     if let (Some(u), Some(h)) = (username, hash) {
@@ -432,7 +438,7 @@ pub async fn enumerate_domain_trusts(args: &Value) -> Result<ToolOutput> {
             r#"python3 -c "
 from impacket.ldap import ldap as ldap_mod
 conn = ldap_mod.LDAPConnection('ldap://{target}', '{base_dn}', '{target}')
-conn.login('{u}', '', '{domain}', lmhash='', nthash='{nt_hash}')
+conn.login('{u}', '', '{bind_domain}', lmhash='', nthash='{nt_hash}')
 sc = ldap_mod.SimplePagedResultsControl(size=1000)
 resp = conn.search(searchFilter='(objectClass=trustedDomain)', attributes=['cn','trustDirection','trustType','trustAttributes','flatName'], searchControls=[sc])
 for item in resp:
@@ -451,7 +457,7 @@ for item in resp:
 "
 "#,
             target = target,
-            domain = domain,
+            bind_domain = bind_domain,
             u = u,
             nt_hash = nt_hash,
             base_dn = computed_base_dn,
@@ -476,7 +482,7 @@ for item in resp:
         .timeout_secs(120);
 
     if let (Some(u), Some(p)) = (username, password) {
-        let bind_dn = format!("{u}@{domain}");
+        let bind_dn = format!("{u}@{bind_domain}");
         cmd = cmd.flag("-D", bind_dn).flag("-w", p);
     }
 
@@ -966,6 +972,37 @@ mod tests {
         let args = json!({
             "target": "192.168.58.1",
             "domain": "contoso.local",
+            "username": "admin",
+            "hash": "aad3b435:aabbccdd"
+        });
+        let result = enumerate_domain_trusts(&args).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enumerate_domain_trusts_cross_realm_bind_domain() {
+        // Cross-forest: cred is for contoso.local but we're querying
+        // fabrikam.local DC. The tool must bind with the cred's realm,
+        // not the target realm.
+        mock::push(mock::success());
+        let args = json!({
+            "target": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "bind_domain": "contoso.local",
+            "username": "admin",
+            "password": "P@ss"
+        });
+        let result = enumerate_domain_trusts(&args).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn enumerate_domain_trusts_cross_realm_pth_bind_domain() {
+        mock::push(mock::success());
+        let args = json!({
+            "target": "192.168.58.20",
+            "domain": "fabrikam.local",
+            "bind_domain": "contoso.local",
             "username": "admin",
             "hash": "aad3b435:aabbccdd"
         });

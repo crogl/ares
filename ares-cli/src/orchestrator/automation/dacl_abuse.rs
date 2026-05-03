@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::dedup::is_ghost_machine_account;
-use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::dispatcher::{Dispatcher, SubmissionOutcome};
 use crate::orchestrator::state::*;
 
 /// Dispatches ACL abuse when matching credentials + bloodhound paths exist.
@@ -61,11 +61,15 @@ pub async fn auto_dacl_abuse(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             });
 
             let priority = dispatcher.effective_priority("dacl_abuse");
-            match dispatcher
-                .throttled_submit("acl_chain_step", "acl", payload, priority)
+            // Mark dedup on Submitted OR Deferred to prevent the 30s tick from
+            // re-emitting identical work each cycle and bloating the deferred
+            // ZSET past its per-type cap (which silently drops entries). Only
+            // skip dedup on Dropped — those need to be reconsidered next tick.
+            let mark_dedup = match dispatcher
+                .throttled_submit_outcome("acl_chain_step", "acl", payload, priority)
                 .await
             {
-                Ok(Some(task_id)) => {
+                Ok(SubmissionOutcome::Submitted(task_id)) => {
                     info!(
                         task_id = %task_id,
                         vuln_id = %item.vuln_id,
@@ -74,21 +78,30 @@ pub async fn auto_dacl_abuse(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
                         target = %item.target_user,
                         "DACL abuse dispatched"
                     );
-                    {
-                        let mut state = dispatcher.state.write().await;
-                        state.mark_processed(DEDUP_DACL_ABUSE, item.dedup_key.clone());
-                    }
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_DACL_ABUSE, &item.dedup_key)
-                        .await;
+                    true
                 }
-                Ok(None) => {
-                    debug!(vuln_id = %item.vuln_id, "DACL abuse deferred");
+                Ok(SubmissionOutcome::Deferred) => {
+                    debug!(vuln_id = %item.vuln_id, "DACL abuse deferred (will retry via deferred drain)");
+                    true
+                }
+                Ok(SubmissionOutcome::Dropped) => {
+                    debug!(vuln_id = %item.vuln_id, "DACL abuse dropped (will reconsider next tick)");
+                    false
                 }
                 Err(e) => {
                     warn!(err = %e, vuln_id = %item.vuln_id, "Failed to dispatch DACL abuse");
+                    false
                 }
+            };
+            if mark_dedup {
+                {
+                    let mut state = dispatcher.state.write().await;
+                    state.mark_processed(DEDUP_DACL_ABUSE, item.dedup_key.clone());
+                }
+                let _ = dispatcher
+                    .state
+                    .persist_dedup(&dispatcher.queue, DEDUP_DACL_ABUSE, &item.dedup_key)
+                    .await;
             }
         }
     }

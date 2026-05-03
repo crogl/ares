@@ -55,6 +55,9 @@ pub(super) fn generate_without_creds(
         "dc_ip_display",
         if dc_ip.is_empty() { "N/A" } else { dc_ip },
     );
+    if !p.excluded_users.is_empty() {
+        ctx.insert("excluded_users", p.excluded_users);
+    }
     insert_state_context(&mut ctx, state, "credential_access", Some(dc_ip));
 
     render_template_with_context(TASK_CREDACCESS_LOW_HANGING_NO_CREDS, &ctx)

@@ -8,12 +8,13 @@ use ares_core::telemetry::propagation::inject_traceparent;
 use ares_core::telemetry::spans::{producer_span, Team};
 use ares_llm::{ToolCall, ToolExecResult};
 
+use crate::orchestrator::state::SharedState;
 use crate::orchestrator::task_queue::TaskQueue;
 
 use super::domain_validator::check_domain_arg;
 use super::{
-    extract_credential_key, push_realtime_discoveries, AuthThrottle, ToolExecRequest,
-    ToolExecResponse, RESULT_TTL_SECS, TOOL_EXEC_PREFIX, TOOL_RESULT_PREFIX,
+    extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
+    ToolExecRequest, ToolExecResponse, RESULT_TTL_SECS, TOOL_EXEC_PREFIX, TOOL_RESULT_PREFIX,
 };
 
 /// Dispatches tool calls to workers via Redis queues.
@@ -27,6 +28,7 @@ pub struct RedisToolDispatcher {
     pub(super) tool_timeout: std::time::Duration,
     pub(super) operation_id: String,
     pub(super) auth_throttle: AuthThrottle,
+    pub(super) state: Option<SharedState>,
 }
 
 impl RedisToolDispatcher {
@@ -36,7 +38,15 @@ impl RedisToolDispatcher {
             tool_timeout: std::time::Duration::from_secs(super::DEFAULT_TOOL_TIMEOUT_SECS),
             operation_id,
             auth_throttle,
+            state: None,
         }
+    }
+
+    /// Attach orchestrator state so spray-style tool calls can be augmented
+    /// with the current quarantine list before dispatch.
+    pub fn with_state(mut self, state: SharedState) -> Self {
+        self.state = Some(state);
+        self
     }
 }
 
@@ -71,6 +81,12 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
                 self.auth_throttle.acquire(&cred_key).await;
             }
 
+            // Server-side spray hygiene: union the current per-domain
+            // quarantine list into excluded_users. The LLM cannot be relied
+            // on to pass this consistently across many spray invocations.
+            let mut arguments = call.arguments.clone();
+            inject_excluded_users(&self.state, &call.name, &mut arguments).await;
+
             let call_id = format!("{}_{}", call.name, uuid::Uuid::new_v4().simple());
 
             // Inject trace context for cross-service span linking
@@ -80,7 +96,7 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
                 call_id: call_id.clone(),
                 task_id: task_id.to_string(),
                 tool_name: call.name.clone(),
-                arguments: call.arguments.clone(),
+                arguments,
                 traceparent,
                 operation_id: Some(self.operation_id.clone()),
             };

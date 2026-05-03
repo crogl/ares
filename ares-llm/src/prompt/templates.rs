@@ -569,9 +569,9 @@ mod tests {
 
     #[test]
     fn render_system_instructions_with_listener_ip() {
-        let result = render_system_instructions(None, None, Some("10.1.2.178")).unwrap();
+        let result = render_system_instructions(None, None, Some("192.168.58.178")).unwrap();
         assert!(
-            result.contains("10.1.2.178"),
+            result.contains("192.168.58.178"),
             "Listener IP should be substituted into prompt"
         );
         assert!(

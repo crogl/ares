@@ -9,6 +9,7 @@ pub mod args;
 #[cfg(feature = "blue")]
 pub mod blue;
 pub mod coercion;
+pub mod concurrency;
 pub mod cracker;
 pub mod credential_access;
 pub mod credentials;
@@ -71,6 +72,17 @@ impl ToolOutput {
 /// sanitization, worker resolver). See [`credentials::validate_arguments`].
 pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> {
     credentials::validate_arguments(tool_name, arguments)?;
+
+    // Cap concurrent spider_plus dispatches process-wide to prevent the
+    // netexec fork-storm OOM observed on EC2 (bug_orch_oom_spider_plus.md).
+    // The permit is held for the duration of the tool execution and dropped
+    // when this function returns.
+    let _spider_permit = if concurrency::is_spider_plus_tool(tool_name) {
+        Some(concurrency::acquire_spider_plus_permit().await)
+    } else {
+        None
+    };
+
     match tool_name {
         // ── Reconnaissance ──────────────────────────────────────────
         "nmap_scan" => recon::nmap_scan(arguments).await,

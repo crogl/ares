@@ -3,12 +3,49 @@
 //! password policy, password spray, username-as-password, credman, autologon).
 
 use anyhow::Result;
+use ares_core::models::is_always_disabled_account;
 use serde_json::Value;
 
 use crate::args::{optional_bool, optional_i64, optional_str, required_str};
 use crate::credentials;
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
+
+/// Read a caller-supplied users wordlist and return a sanitized temp-file path
+/// with AD built-in always-disabled accounts (Guest, krbtgt, DefaultAccount,
+/// WDAGUtilityAccount) stripped. Returns `(sanitized_path, owns_temp)` where
+/// `owns_temp` indicates the caller must delete the path on exit.
+///
+/// If the file can't be read or no entries are filtered, the original path is
+/// returned unchanged so callers don't pay the rewrite cost.
+fn sanitize_spray_userlist(users_file: &str) -> (String, bool) {
+    let Ok(contents) = std::fs::read_to_string(users_file) else {
+        return (users_file.to_string(), false);
+    };
+    let mut filtered_any = false;
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            let user = line.trim();
+            if user.is_empty() {
+                return true;
+            }
+            if is_always_disabled_account(user) {
+                filtered_any = true;
+                return false;
+            }
+            true
+        })
+        .collect();
+    if !filtered_any {
+        return (users_file.to_string(), false);
+    }
+    let tmp = format!("/tmp/spray_users_filtered_{}.txt", std::process::id());
+    if std::fs::write(&tmp, kept.join("\n")).is_err() {
+        return (users_file.to_string(), false);
+    }
+    (tmp, true)
+}
 
 /// Minimum jitter (seconds) between spray attempts when caller does not
 /// supply `delay_seconds`. Keeps at least a small gap between authentication
@@ -424,10 +461,15 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
         return Ok(refusal);
     }
 
-    // Use provided file or generate a default wordlist
+    // Use provided file or generate a default wordlist. When the caller
+    // supplies a users_file, strip AD built-in always-disabled accounts so
+    // we don't burn badPwdCount budget on Guest et al.
     let tmp_file;
+    let mut owns_filtered = false;
     let wordlist_path = if let Some(uf) = users_file {
-        uf.to_string()
+        let (path, owns) = sanitize_spray_userlist(uf);
+        owns_filtered = owns;
+        path
     } else {
         tmp_file = format!("/tmp/spray_pw_{}.txt", std::process::id());
         std::fs::write(&tmp_file, DEFAULT_SPRAY_USERNAMES)?;
@@ -464,7 +506,7 @@ pub async fn password_spray(args: &Value) -> Result<ToolOutput> {
         .await;
 
     // Clean up temp file if we created one
-    if users_file.is_none() {
+    if users_file.is_none() || owns_filtered {
         let _ = std::fs::remove_file(&wordlist_path);
     }
     if password.is_none() && use_common_passwords {
@@ -520,8 +562,12 @@ fn spray_refusal(message: String) -> ToolOutput {
 }
 
 /// Common AD usernames for fallback when no users_file is provided.
+///
+/// `guest`, `defaultaccount`, `wdagutilityaccount`, `krbtgt` are intentionally
+/// excluded — they ship `userAccountControl & ACCOUNTDISABLE` set, so spraying
+/// them never succeeds and just bumps badPwdCount on shared lockout policies.
 const DEFAULT_SPRAY_USERNAMES: &str = "\
-Administrator\nadmin\nguest\n\
+Administrator\nadmin\n\
 sql_svc\nsvc_sql\nsqlservice\nsvc_mssql\n\
 svc_backup\nbackup\n\
 svc_web\nwebservice\n\
@@ -562,20 +608,42 @@ P@ssw0rd!\n\
 Password1\n";
 
 /// Test each username as its own password via `netexec smb --no-bruteforce`.
+///
+/// `excluded_users` (optional) is a comma- or whitespace-separated list of
+/// usernames the orchestrator already saw locked out. They are dropped from
+/// the wordlist before netexec runs so a re-spray doesn't keep pinging an
+/// already-locked principal (each ping bumps badPwdCount and prolongs the
+/// AD lockout window).
 pub async fn username_as_password(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let users_file = optional_str(args, "users_file");
     let domain = required_str(args, "domain")?;
+    let excluded_users = optional_str(args, "excluded_users").unwrap_or("");
 
-    // Use provided file or generate a default wordlist
+    // Use provided file or generate a default wordlist. Caller-supplied
+    // wordlists are filtered to drop AD built-in always-disabled accounts so
+    // we don't waste badPwdCount budget on Guest et al.
     let tmp_file;
-    let wordlist_path = if let Some(uf) = users_file {
-        uf.to_string()
+    let mut owns_filtered = false;
+    let mut wordlist_path = if let Some(uf) = users_file {
+        let (path, owns) = sanitize_spray_userlist(uf);
+        owns_filtered = owns;
+        path
     } else {
         tmp_file = format!("/tmp/spray_users_{}.txt", std::process::id());
         std::fs::write(&tmp_file, DEFAULT_SPRAY_USERNAMES)?;
         tmp_file
     };
+
+    // Drop any usernames the orchestrator already observed locked out.
+    let (after_excl, owns_excluded) = drop_excluded_users(&wordlist_path, excluded_users);
+    if owns_excluded {
+        if owns_filtered {
+            let _ = std::fs::remove_file(&wordlist_path);
+        }
+        wordlist_path = after_excl;
+        owns_filtered = true;
+    }
 
     let result = CommandBuilder::new("netexec")
         .arg("smb")
@@ -589,12 +657,59 @@ pub async fn username_as_password(args: &Value) -> Result<ToolOutput> {
         .execute()
         .await;
 
-    // Clean up temp file if we created one
-    if users_file.is_none() {
+    // Clean up temp file if we created one (default fallback or filtered copy)
+    if users_file.is_none() || owns_filtered {
         let _ = std::fs::remove_file(&wordlist_path);
     }
 
     result
+}
+
+/// Drop usernames listed in `excluded_users` (comma/whitespace separated)
+/// from the wordlist at `path`. Returns `(path_to_use, owns_new_file)`.
+/// Case-insensitive match; preserves original line order. If `excluded_users`
+/// is empty or no entries match, returns the input path unchanged.
+fn drop_excluded_users(path: &str, excluded_users: &str) -> (String, bool) {
+    let excluded: std::collections::HashSet<String> = excluded_users
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_lowercase())
+        .collect();
+    if excluded.is_empty() {
+        return (path.to_string(), false);
+    }
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return (path.to_string(), false);
+    };
+    let mut filtered_any = false;
+    let kept: Vec<&str> = contents
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                return true;
+            }
+            if excluded.contains(&trimmed.to_lowercase()) {
+                filtered_any = true;
+                return false;
+            }
+            true
+        })
+        .collect();
+    if !filtered_any {
+        return (path.to_string(), false);
+    }
+    // Make the temp filename unique per call: parallel callers (and parallel
+    // unit tests) share the process and would otherwise overwrite each other.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = format!("/tmp/spray_users_excl_{}_{}.txt", std::process::id(), nanos);
+    if std::fs::write(&tmp, kept.join("\n")).is_err() {
+        return (path.to_string(), false);
+    }
+    (tmp, true)
 }
 
 /// Enumerate Credential Manager entries via `netexec smb -x "cmdkey /list"`.
@@ -827,6 +942,21 @@ mod tests {
     fn default_spray_usernames_contains_service_accounts() {
         assert!(super::DEFAULT_SPRAY_USERNAMES.contains("sql_svc"));
         assert!(super::DEFAULT_SPRAY_USERNAMES.contains("svc_backup"));
+    }
+
+    #[test]
+    fn default_spray_usernames_excludes_disabled_builtins() {
+        let entries: Vec<&str> = super::DEFAULT_SPRAY_USERNAMES
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| !l.is_empty())
+            .collect();
+        for disabled in ["guest", "krbtgt", "defaultaccount", "wdagutilityaccount"] {
+            assert!(
+                !entries.iter().any(|e| e.eq_ignore_ascii_case(disabled)),
+                "disabled built-in {disabled} must not appear in default spray wordlist"
+            );
+        }
     }
 
     // --- password_spray ---
@@ -1252,6 +1382,78 @@ mod tests {
         assert!(super::check_spray_budget(Some(0), 100, false).is_none());
     }
 
+    // --- sanitize_spray_userlist ---
+
+    #[test]
+    fn sanitize_spray_userlist_strips_disabled_accounts() {
+        let pid = std::process::id();
+        let src = format!("/tmp/sanitize_src_{pid}.txt");
+        std::fs::write(
+            &src,
+            "Administrator\nGuest\nkrbtgt\njdoe\nDefaultAccount\nWDAGUtilityAccount\nsvc_sql\n",
+        )
+        .unwrap();
+
+        let (path, owns) = super::sanitize_spray_userlist(&src);
+        assert!(owns, "filtered list should be in a freshly owned temp file");
+        assert_ne!(
+            path, src,
+            "owned filter should not return the original path"
+        );
+
+        let filtered = std::fs::read_to_string(&path).unwrap();
+        assert!(filtered.contains("Administrator"));
+        assert!(filtered.contains("jdoe"));
+        assert!(filtered.contains("svc_sql"));
+        for disabled in ["Guest", "krbtgt", "DefaultAccount", "WDAGUtilityAccount"] {
+            assert!(
+                !filtered.lines().any(|l| l.trim() == disabled),
+                "{disabled} should be filtered out"
+            );
+        }
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sanitize_spray_userlist_passes_through_when_clean() {
+        let pid = std::process::id();
+        let src = format!("/tmp/sanitize_clean_{pid}.txt");
+        std::fs::write(&src, "Administrator\njdoe\nsvc_sql\n").unwrap();
+
+        let (path, owns) = super::sanitize_spray_userlist(&src);
+        assert!(!owns, "clean list should not be rewritten");
+        assert_eq!(path, src, "clean list should return original path");
+
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn sanitize_spray_userlist_handles_missing_file() {
+        let path = "/tmp/sanitize_missing_does_not_exist.txt";
+        let _ = std::fs::remove_file(path);
+        let (returned, owns) = super::sanitize_spray_userlist(path);
+        assert!(!owns);
+        assert_eq!(returned, path);
+    }
+
+    #[test]
+    fn sanitize_spray_userlist_case_insensitive() {
+        let pid = std::process::id();
+        let src = format!("/tmp/sanitize_case_{pid}.txt");
+        std::fs::write(&src, "GUEST\nguest\nGuest\nadmin\n").unwrap();
+
+        let (path, owns) = super::sanitize_spray_userlist(&src);
+        assert!(owns);
+        let filtered = std::fs::read_to_string(&path).unwrap();
+        assert!(filtered.contains("admin"));
+        assert!(!filtered.to_lowercase().contains("guest"));
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[tokio::test]
     async fn username_as_password_with_file_executes() {
         mock::push(mock::success());
@@ -1260,6 +1462,69 @@ mod tests {
             "users_file": "/tmp/users.txt"
         });
         assert!(super::username_as_password(&args).await.is_ok());
+    }
+
+    #[test]
+    fn drop_excluded_users_strips_listed_entries() {
+        let pid = std::process::id();
+        let src = format!("/tmp/excl_src_{pid}.txt");
+        std::fs::write(&src, "Administrator\ntestuser1\ntestuser2\nguest\n").unwrap();
+
+        let (path, owns) = super::drop_excluded_users(&src, "testuser1, guest");
+        assert!(owns);
+        assert_ne!(path, src);
+        let filtered = std::fs::read_to_string(&path).unwrap();
+        assert!(filtered.contains("Administrator"));
+        assert!(filtered.contains("testuser2"));
+        assert!(!filtered
+            .lines()
+            .any(|l| l.trim().eq_ignore_ascii_case("testuser1")));
+        assert!(!filtered.lines().any(|l| l.trim().eq_ignore_ascii_case("guest")));
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn drop_excluded_users_empty_list_passes_through() {
+        let pid = std::process::id();
+        let src = format!("/tmp/excl_empty_{pid}.txt");
+        std::fs::write(&src, "Administrator\ntestuser1\n").unwrap();
+
+        let (path, owns) = super::drop_excluded_users(&src, "");
+        assert!(!owns);
+        assert_eq!(path, src);
+
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn drop_excluded_users_no_matches_passes_through() {
+        let pid = std::process::id();
+        let src = format!("/tmp/excl_nomatch_{pid}.txt");
+        std::fs::write(&src, "Administrator\ntestuser1\n").unwrap();
+
+        let (path, owns) = super::drop_excluded_users(&src, "testuser2,testuser3");
+        assert!(!owns);
+        assert_eq!(path, src);
+
+        let _ = std::fs::remove_file(&src);
+    }
+
+    #[test]
+    fn drop_excluded_users_case_insensitive() {
+        let pid = std::process::id();
+        let src = format!("/tmp/excl_case_{pid}.txt");
+        std::fs::write(&src, "TESTUSER1\ntestuser1\nadmin\n").unwrap();
+
+        let (path, owns) = super::drop_excluded_users(&src, "testuser1");
+        assert!(owns);
+        let filtered = std::fs::read_to_string(&path).unwrap();
+        assert!(filtered.contains("admin"));
+        assert!(!filtered.to_lowercase().contains("testuser1"));
+
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]
