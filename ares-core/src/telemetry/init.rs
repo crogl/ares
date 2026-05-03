@@ -82,6 +82,7 @@ pub fn init_telemetry(config: TelemetryConfig) -> TelemetryGuard {
         .unwrap_or_else(|_| EnvFilter::new(&config.default_filter));
 
     let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
         .with_target(config.show_target)
         .with_thread_ids(false)
         .with_file(false)
