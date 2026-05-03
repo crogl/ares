@@ -63,12 +63,6 @@ provisioners:
     source: ${sources.ares}
     destination: /tmp/ares
 
-  - type: shell
-    inline:
-      - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
-      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
-      - rm -rf /tmp/ares
-
   # Attack Box - all red team tools + Alloy telemetry. The cracking_tools
   # role handles the full NVIDIA stack (driver, DKMS, CUDA toolkit, OpenCL
   # ICD) — driving it through ansible keeps Recommends enabled (so dkms +
@@ -77,9 +71,20 @@ provisioners:
   # kernel, and verifies nvidia-smi/clinfo at build time.
   # NOTE: Using shell instead of ansible provisioner because the playbook
   # exceeds EC2 Image Builder's 16000 character component limit.
+  # ORDER MATTERS: galaxy install resolves transitive deps (workstation/
+  # arsenal pull dreadnode.nimbus_range from galaxy.com), so we must
+  # overlay the ares-repo copy AFTER galaxy install, otherwise --force
+  # overwrites our local edits with the published 1.5.x release.
   - type: shell
     inline:
+      - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
+      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
       - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
+      - rm -rf /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
+      - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
+      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
+      - rm -rf /tmp/ares
+      - grep -E '^- name:' /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml | head -15
       - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=true -e cracking_tools_install_cuda_toolkit=true
 
   # Cleanup
