@@ -85,11 +85,21 @@ provisioners:
   - type: shell
     inline:
       - set -euxo pipefail
+      - echo "=== /tmp/ares source tree ==="
+      - ls -la /tmp/ares/ /tmp/ares/ansible/ /tmp/ares/ansible/roles/cracking_tools/tasks/ 2>&1 || true
+      - echo "=== /tmp/ares linux.yml stat + head ==="
+      - stat /tmp/ares/ansible/roles/cracking_tools/tasks/linux.yml 2>&1 || true
+      - head -60 /tmp/ares/ansible/roles/cracking_tools/tasks/linux.yml 2>&1 || true
       - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
       - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
+      - echo "=== overlay linux.yml after cp ==="
+      - stat /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
+      - head -60 /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
       - mkdir -p /opt/ansible-galaxy-deps
       - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --collections-path /opt/ansible-galaxy-deps --no-deps
       - rm -rf /opt/ansible-galaxy-deps/ansible_collections/dreadnode/nimbus_range
+      - echo "=== overlay linux.yml after galaxy install ==="
+      - stat /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
       - rm -rf /tmp/ares
       - test -f /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
       - grep -q "Install NVIDIA driver and OpenCL runtime" /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
