@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
+use crate::orchestrator::dispatcher::CredentialInflight;
 use crate::orchestrator::routing::ActiveTaskTracker;
 use crate::orchestrator::task_queue::{TaskQueue, TaskResult};
 
@@ -29,6 +30,7 @@ pub struct CompletedTask {
 pub fn spawn_result_consumer(
     queue: TaskQueue,
     tracker: ActiveTaskTracker,
+    credential_inflight: CredentialInflight,
     config: Arc<OrchestratorConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> (tokio::task::JoinHandle<()>, mpsc::Receiver<CompletedTask>) {
@@ -48,7 +50,7 @@ pub fn spawn_result_consumer(
                 break;
             }
 
-            match consume_cycle(&queue, &tracker, &tx).await {
+            match consume_cycle(&queue, &tracker, &credential_inflight, &tx).await {
                 Ok(found) => {
                     if consecutive_failures > 0 {
                         info!(
@@ -124,6 +126,7 @@ pub fn spawn_result_consumer(
 async fn consume_cycle(
     queue: &TaskQueue,
     tracker: &ActiveTaskTracker,
+    credential_inflight: &CredentialInflight,
     tx: &mpsc::Sender<CompletedTask>,
 ) -> Result<usize> {
     let task_ids = tracker.task_ids().await;
@@ -139,8 +142,15 @@ async fn consume_cycle(
     let mut found = 0_usize;
     for (task_id, maybe_result) in results {
         if let Some(result) = maybe_result {
-            // Remove from tracker
-            tracker.remove(&task_id).await;
+            // Remove from tracker and release the per-credential inflight
+            // slot the task was holding (if any). The slot is now bound to
+            // the tracker entry's lifetime, so a hung tokio future never
+            // pins the slot indefinitely.
+            if let Some(removed) = tracker.remove(&task_id).await {
+                if let Some(ref key) = removed.credential_key {
+                    credential_inflight.release(key).await;
+                }
+            }
 
             // Send to main loop
             let completed = CompletedTask {

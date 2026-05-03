@@ -15,6 +15,14 @@ pub struct ActiveTask {
     pub task_type: String,
     pub role: String,
     pub submitted_at: std::time::Instant,
+    /// `"user@domain"` when the task is gated by `CredentialInflight`. The
+    /// caller that successfully removes this task from the tracker is
+    /// responsible for releasing the corresponding slot. Carrying it on the
+    /// task makes the release happen even when stale-task cleanup evicts a
+    /// task whose spawned future is still hung — otherwise the slot leaks
+    /// and every subsequent task with the same credential gets deferred
+    /// forever.
+    pub credential_key: Option<String>,
 }
 
 /// Thread-safe tracker for all in-flight tasks.
@@ -137,6 +145,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: None,
             })
             .await;
 
@@ -172,6 +181,7 @@ mod tests {
                     task_type: task_type.into(),
                     role: role.into(),
                     submitted_at: std::time::Instant::now(),
+                    credential_key: None,
                 })
                 .await;
         }
@@ -190,6 +200,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now() - std::time::Duration::from_secs(120),
+                credential_key: None,
             })
             .await;
 
@@ -199,6 +210,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: None,
             })
             .await;
 
@@ -218,6 +230,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: None,
             })
             .await;
         tracker
@@ -226,6 +239,7 @@ mod tests {
                 task_type: "exploit".into(),
                 role: "privesc".into(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: None,
             })
             .await;
 
@@ -244,6 +258,7 @@ mod tests {
                 task_type: "recon".into(),
                 role: "recon".into(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: None,
             })
             .await;
         tracker.remove("t1").await;

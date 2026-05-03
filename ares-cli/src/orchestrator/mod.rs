@@ -411,6 +411,7 @@ async fn run_inner() -> Result<()> {
         queue.clone(),
         registry.clone(),
         tracker.clone(),
+        dispatcher.credential_inflight.clone(),
         config.clone(),
         shutdown_rx.clone(),
     );
@@ -418,6 +419,7 @@ async fn run_inner() -> Result<()> {
     let (_result_handle, mut result_rx) = spawn_result_consumer(
         queue.clone(),
         tracker.clone(),
+        dispatcher.credential_inflight.clone(),
         config.clone(),
         shutdown_rx.clone(),
     );
@@ -665,6 +667,7 @@ async fn run_inner() -> Result<()> {
                         let (_new_handle, new_rx) = spawn_result_consumer(
                             queue.clone(),
                             tracker.clone(),
+                            dispatcher.credential_inflight.clone(),
                             config.clone(),
                             shutdown_rx.clone(),
                         );

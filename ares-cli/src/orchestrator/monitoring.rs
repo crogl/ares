@@ -13,6 +13,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
+use crate::orchestrator::dispatcher::CredentialInflight;
 use crate::orchestrator::routing::ActiveTaskTracker;
 use crate::orchestrator::task_queue::TaskQueue;
 
@@ -193,6 +194,7 @@ pub fn spawn_heartbeat_monitor(
     queue: TaskQueue,
     registry: AgentRegistry,
     tracker: ActiveTaskTracker,
+    credential_inflight: CredentialInflight,
     config: Arc<OrchestratorConfig>,
     mut shutdown: watch::Receiver<bool>,
 ) -> tokio::task::JoinHandle<()> {
@@ -227,7 +229,9 @@ pub fn spawn_heartbeat_monitor(
             consecutive_failures = 0;
 
             // Clean up stale tasks (salvage any pending results first)
-            if let Err(e) = cleanup_stale_tasks(&tracker, &queue, &config).await {
+            if let Err(e) =
+                cleanup_stale_tasks(&tracker, &queue, &credential_inflight, &config).await
+            {
                 warn!(err = %e, "Stale task cleanup failed");
             }
         }
@@ -282,6 +286,7 @@ async fn run_heartbeat_sweep(
 async fn cleanup_stale_tasks(
     tracker: &ActiveTaskTracker,
     queue: &TaskQueue,
+    credential_inflight: &CredentialInflight,
     config: &OrchestratorConfig,
 ) -> Result<()> {
     let llm_count = tracker.llm_task_count().await;
@@ -317,7 +322,16 @@ async fn cleanup_stale_tasks(
                 "Removing stale task"
             );
         }
-        tracker.remove(&task.task_id).await;
+        // Release the per-credential inflight slot if the stale task held
+        // one. Without this the slot leaks: the spawned LLM future may
+        // still be running long after the task was declared stale, and
+        // every subsequent task with the same credential gets deferred
+        // until the future eventually returns.
+        if let Some(removed) = tracker.remove(&task.task_id).await {
+            if let Some(ref key) = removed.credential_key {
+                credential_inflight.release(key).await;
+            }
+        }
     }
 
     if !stale.is_empty() {
@@ -344,7 +358,7 @@ pub(crate) const CRITICAL_TOOLS: &[(&str, &[&str])] = &[
     ),
     ("privesc", &["impacket-findDelegation", "impacket-getST"]),
     (
-        "lateral",
+        "lateral_movement",
         &[
             "impacket-psexec",
             "impacket-smbexec",
@@ -363,7 +377,10 @@ pub(crate) async fn preflight_tool_check(
     let mut problems = Vec::new();
 
     for &(role, critical) in CRITICAL_TOOLS {
-        let agent_key = format!("ares:tools:ares-{role}-agent");
+        // Worker publishes inventory under hyphenated agent name
+        // (see ares-cli/src/worker/config.rs: agent_name = format!("ares-{}-agent", role.replace('_', "-"))).
+        // Mirror that here so role names with underscores resolve correctly.
+        let agent_key = format!("ares:tools:ares-{}-agent", role.replace('_', "-"));
         let available: Vec<String> = match conn.get::<_, Option<String>>(&agent_key).await {
             Ok(Some(json)) => serde_json::from_str(&json).unwrap_or_default(),
             _ => {
@@ -545,7 +562,12 @@ mod tests {
 
     #[test]
     fn critical_tools_have_valid_roles() {
-        let known_roles = ["recon", "credential_access", "privesc", "lateral"];
+        let known_roles = [
+            "recon",
+            "credential_access",
+            "privesc",
+            "lateral_movement",
+        ];
         for &(role, tools) in CRITICAL_TOOLS {
             assert!(
                 known_roles.contains(&role),
@@ -578,7 +600,7 @@ mod tests {
             .unwrap_or(false);
         let has_lateral = CRITICAL_TOOLS
             .iter()
-            .find(|&&(r, _)| r == "lateral")
+            .find(|&&(r, _)| r == "lateral_movement")
             .map(|&(_, tools)| tools.contains(&"impacket-secretsdump"))
             .unwrap_or(false);
         assert!(has_cred);

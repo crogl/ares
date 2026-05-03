@@ -128,6 +128,11 @@ impl TaskQueue {
     /// Create a dedicated (non-shared) multiplexed connection for blocking
     /// commands like BRPOP. Each call opens a fresh TCP connection so
     /// concurrent BRPOP calls from different agent loops do not serialize.
+    ///
+    /// Disables the redis-rs default 500ms response_timeout — BRPOP for tool
+    /// results blocks for up to `tool_timeout` (1500s default), so the
+    /// per-command socket timeout would fire long before the result arrives,
+    /// surfacing as `Io: timed out` errors.
     pub async fn dedicated_connection(&self) -> Result<redis::aio::MultiplexedConnection> {
         let url = self
             .redis_url
@@ -135,8 +140,10 @@ impl TaskQueue {
             .ok_or_else(|| anyhow::anyhow!("No redis_url stored (test backend?)"))?;
         let client =
             redis::Client::open(url).with_context(|| format!("Invalid Redis URL: {url}"))?;
+        let config = redis::AsyncConnectionConfig::new()
+            .set_response_timeout(Some(Duration::from_secs(1800)));
         let conn = client
-            .get_multiplexed_async_connection()
+            .get_multiplexed_async_connection_with_config(&config)
             .await
             .with_context(|| "Failed to open dedicated Redis connection for BRPOP")?;
         Ok(conn)

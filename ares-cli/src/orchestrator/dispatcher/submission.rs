@@ -199,6 +199,7 @@ impl Dispatcher {
                 task_type: task_type.to_string(),
                 role: target_role.to_string(),
                 submitted_at: std::time::Instant::now(),
+                credential_key: cred_key.clone(),
             })
             .await;
 
@@ -257,8 +258,6 @@ impl Dispatcher {
         let queue = self.queue.clone();
         let tid = task_id.clone();
         let tt = task_type.to_string();
-        let cred_inflight = self.credential_inflight.clone();
-        let cred_key_owned = cred_key.clone();
         tokio::spawn(async move {
             let outcome = runner.execute_task(&tt, &tid, role, &payload).await;
 
@@ -519,10 +518,12 @@ impl Dispatcher {
                 }
             }
 
-            // Release per-credential concurrency slot
-            if let Some(ref key) = cred_key_owned {
-                cred_inflight.release(key).await;
-            }
+            // The CredentialInflight slot is released by whichever caller
+            // evicts this task from `ActiveTaskTracker` — either the result
+            // consumer when it picks up the result, or the stale-task
+            // cleanup when this future has hung past the timeout. That
+            // mirrors the slot to the tracker entry's lifetime, so a hung
+            // future doesn't pin the slot indefinitely.
 
             // Push result to the normal result queue so the result consumer picks it up
             if let Err(e) = queue.send_result(&tid, &result).await {
