@@ -229,13 +229,16 @@
     - ansible_facts['distribution'] != 'Kali'
     - lateral_movement_tools_install_evil_winrm
 
-# Per-gem loop (not `gem update a b c d e`) to avoid OOM kill (rc=-9) during
-# parallel native-extension compile on the AMI build instance. `--no-document`
-# skips rdoc/ri generation, which is the heaviest memory hog.
-- name: Update vulnerable ruby gem dependencies (per-gem to bound memory)
+# `gem update` is skipped on Kali: evil-winrm ships via apt and Kali tracks
+# CVE patches for net-imap/rexml/uri/zlib through its `ruby-*` debs. On
+# AMI builders, `gem update` here also tends to SIGKILL (rc=-9) inside the
+# Image Builder runner regardless of `--no-document`, so we keep it
+# best-effort with `failed_when: false` and limit it to non-Kali Debian.
+- name: Update vulnerable ruby gem dependencies (Ubuntu only - Kali patches via apt)
   ansible.builtin.command: gem update --no-document {{ item }}
   become: true
   changed_when: true
+  failed_when: false
   loop:
     - net-imap
     - resolv
@@ -244,6 +247,7 @@
     - zlib
   when:
     - ansible_facts['os_family'] == 'Debian'
+    - ansible_facts['distribution'] != 'Kali'
     - lateral_movement_tools_install_evil_winrm
 
 - name: Install pth-toolkit (Kali only - may not be available in all repos)
