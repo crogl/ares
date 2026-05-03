@@ -139,7 +139,10 @@ Base requirements for Ares AI agents
 - **Fail when break-system-packages is required but disabled** (ansible.builtin.fail) - Conditional
 - **Fail when break-system-packages is required but unsupported by pip** (ansible.builtin.fail) - Conditional
 - **Upgrade pip to latest (CVE fixes)** (ansible.builtin.command)
-- **Install Ares Python dependencies** (ansible.builtin.pip)
+- **Install Ares Python dependencies (with full log)** (ansible.builtin.shell)
+- **Show pip install log tail on failure** (ansible.builtin.command) - Conditional
+- **Print pip install tail** (ansible.builtin.debug) - Conditional
+- **Fail if pip install failed** (ansible.builtin.fail) - Conditional
 - **Create Ares workspace directory** (ansible.builtin.file) - Conditional
 
 ### main.yml
