@@ -71,21 +71,30 @@ provisioners:
   # kernel, and verifies nvidia-smi/clinfo at build time.
   # NOTE: Using shell instead of ansible provisioner because the playbook
   # exceeds EC2 Image Builder's 16000 character component limit.
-  # ORDER MATTERS: galaxy install resolves transitive deps (workstation/
-  # arsenal pull dreadnode.nimbus_range from galaxy.com), so we must
-  # overlay the ares-repo copy AFTER galaxy install, otherwise --force
-  # overwrites our local edits with the published 1.5.x release.
+  #
+  # nimbus_range MUST come from this repo's ansible/ subtree, NEVER from
+  # galaxy.com. The published `dreadnode.nimbus_range` 1.5.x lags this
+  # branch's role edits (e.g. NVIDIA driver/CUDA tasks). Strategy:
+  #   1. Galaxy deps go to /opt/ansible-galaxy-deps (isolated path).
+  #   2. Local nimbus_range overlay lives at /root/.ansible/collections.
+  #   3. ANSIBLE_COLLECTIONS_PATH lists local first, galaxy deps second —
+  #      so even if a transitive dep pulls nimbus_range into the galaxy
+  #      path, the local copy wins.
+  #   4. Defense-in-depth: rm any nimbus_range that ends up in the galaxy
+  #      path, and assert a known-local marker before running the playbook.
   - type: shell
     inline:
+      - set -euxo pipefail
       - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
       - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
-      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
-      - rm -rf /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
-      - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
-      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
+      - mkdir -p /opt/ansible-galaxy-deps
+      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --collections-path /opt/ansible-galaxy-deps --no-deps
+      - rm -rf /opt/ansible-galaxy-deps/ansible_collections/dreadnode/nimbus_range
       - rm -rf /tmp/ares
-      - grep -E '^- name:' /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml | head -15
-      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=true -e cracking_tools_install_cuda_toolkit=true
+      - test -f /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
+      - grep -q "Install NVIDIA driver and OpenCL runtime" /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
+      - grep -q "Show GPU/OpenCL detection summary" /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
+      - HOME=/root ANSIBLE_COLLECTIONS_PATH=/root/.ansible/collections:/opt/ansible-galaxy-deps ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=true -e cracking_tools_install_cuda_toolkit=true
 
   # Cleanup
   - type: shell
