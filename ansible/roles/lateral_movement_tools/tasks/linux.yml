@@ -229,10 +229,19 @@
     - ansible_facts['distribution'] != 'Kali'
     - lateral_movement_tools_install_evil_winrm
 
-- name: Update vulnerable ruby gem dependencies (net-imap, resolv, rexml, uri, zlib)
-  ansible.builtin.command: gem update net-imap resolv rexml uri zlib
+# Per-gem loop (not `gem update a b c d e`) to avoid OOM kill (rc=-9) during
+# parallel native-extension compile on the AMI build instance. `--no-document`
+# skips rdoc/ri generation, which is the heaviest memory hog.
+- name: Update vulnerable ruby gem dependencies (per-gem to bound memory)
+  ansible.builtin.command: gem update --no-document {{ item }}
   become: true
   changed_when: true
+  loop:
+    - net-imap
+    - resolv
+    - rexml
+    - uri
+    - zlib
   when:
     - ansible_facts['os_family'] == 'Debian'
     - lateral_movement_tools_install_evil_winrm
