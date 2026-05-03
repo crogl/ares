@@ -24,6 +24,29 @@
     mode: '0755'
   become: true
 
+# Kali rolling ships kernel 6.19.x, which the Kali archive's NVIDIA driver
+# (550.163.01) cannot compile against — DKMS exits 2. NVIDIA's official
+# CUDA Debian repo carries 575+ which supports modern kernels and offers
+# `nvidia-open-kernel-dkms` (open-source kernel module) for Turing+ GPUs.
+# We add this repo first so the apt install below resolves to fresh
+# packages instead of the stale Kali ones.
+- name: Add NVIDIA CUDA apt repository (Kali ships 550.x which fails on kernel 6.19+)
+  ansible.builtin.shell: |
+    set -euxo pipefail
+    cd /tmp
+    curl -fsSLo cuda-keyring.deb \
+      https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+    apt-get install -y ./cuda-keyring.deb
+    apt-get update -q
+    rm -f cuda-keyring.deb
+  args:
+    creates: /usr/share/keyrings/cuda-archive-keyring.gpg
+    executable: /bin/bash
+  become: true
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - ansible_facts['os_family'] == 'Debian'
+
 # Driven through shell+tee instead of ansible.builtin.apt: the apt module
 # captures dpkg stderr but truncates large stdout (DKMS kernel-module build
 # errors land deep in apt-get's output, well after the cutoff). With tee we

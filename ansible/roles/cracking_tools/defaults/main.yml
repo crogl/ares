@@ -62,15 +62,18 @@ cracking_tools_install_nvidia_driver: false
 cracking_tools_install_cuda_toolkit: false
 # Recommends are intentionally enabled — DKMS, libcuda1, and the kernel
 # module build chain come in via Recommends on Debian/Kali.
-# Kali AMIs ship with the `+kali-cloud-amd64` kernel, so DKMS needs the
-# `cloud` headers meta-package — `linux-headers-amd64` brings in headers
-# for the non-cloud kernel and DKMS module-build fails with a header/kernel
-# mismatch (dpkg returns 1 mid-install).
+# Kali AMIs ship `+kali-cloud-amd64` kernel — needs the `cloud` headers
+# meta-package. We pull driver + open-source kernel module from NVIDIA's
+# CUDA Debian repo (added in tasks/linux.yml) because Kali's archive
+# nvidia-driver (550.163.01) does not build against kernel 6.19+.
+# `nvidia-open-kernel-dkms` is required for Turing+ (T4 included) on
+# modern kernels; legacy `nvidia-kernel-dkms` is a dead-end here.
 cracking_tools_nvidia_driver_packages:
   - linux-headers-cloud-amd64
   - dkms
   - firmware-misc-nonfree
-  - nvidia-driver
+  - cuda-drivers
+  - nvidia-open-kernel-dkms
   - nvidia-opencl-icd
   - nvidia-opencl-common
 cracking_tools_nvidia_cuda_toolkit_packages:
