@@ -35,7 +35,7 @@
     set -euxo pipefail
     cd /tmp
     curl -fsSLo cuda-keyring.deb \
-      https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb
+      https://developer.download.nvidia.com/compute/cuda/repos/debian13/x86_64/cuda-keyring_1.1-1_all.deb
     apt-get install -y ./cuda-keyring.deb
     apt-get update -q
     rm -f cuda-keyring.deb
