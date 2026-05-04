@@ -78,9 +78,23 @@ pub(crate) fn generate_credential_access_prompt(
         .or_else(|| payload.get("target_ip"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let domain = payload.get("domain").and_then(|v| v.as_str()).unwrap_or("");
-    // Read from nested "credential" object first (dispatchers nest it), flat fallback
+    // Read from nested "credential" object first (dispatchers nest it), flat fallback.
+    // Domain falls back to `credential.domain` so secretsdump dispatches that
+    // only nest the auth realm (request_secretsdump / request_secretsdump_hash)
+    // still surface a real domain in the prompt. Without this fallback the
+    // template emits `domain=''`, the LLM faithfully calls the tool with an
+    // empty realm, and downstream auth fails STATUS_LOGON_FAILURE.
     let cred_obj = payload.get("credential");
+    let domain = payload
+        .get("domain")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            cred_obj
+                .and_then(|c| c.get("domain"))
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
     let username = cred_obj
         .and_then(|c| c.get("username"))
         .and_then(|v| v.as_str())
