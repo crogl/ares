@@ -57,6 +57,7 @@
     name:
       - linux-headers-cloud-amd64
       - dkms
+      - build-essential
       - firmware-misc-nonfree
     state: present
     install_recommends: true
@@ -100,6 +101,33 @@
 - name: Print NVIDIA install tail
   ansible.builtin.debug:
     var: cracking_tools_nvidia_install_tail.stdout_lines
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - cracking_tools_nvidia_install_result.rc | default(0) != 0
+
+- name: Dump DKMS make.log on failure
+  ansible.builtin.shell: |
+    set +e
+    for f in /var/lib/dkms/nvidia/*/build/make.log; do
+      echo "==== $f ===="
+      tail -150 "$f" 2>&1 || true
+    done
+    echo "==== build env ===="
+    which gcc cc make 2>&1 || true
+    gcc --version 2>&1 || true
+    dpkg -l build-essential gcc make 2>&1 | tail -10 || true
+  args:
+    executable: /bin/bash
+  register: cracking_tools_dkms_make_log
+  changed_when: false
+  failed_when: false
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - cracking_tools_nvidia_install_result.rc | default(0) != 0
+
+- name: Print DKMS make.log
+  ansible.builtin.debug:
+    var: cracking_tools_dkms_make_log.stdout_lines
   when:
     - cracking_tools_install_nvidia_driver | bool
     - cracking_tools_nvidia_install_result.rc | default(0) != 0
