@@ -47,6 +47,24 @@
     - cracking_tools_install_nvidia_driver | bool
     - ansible_facts['os_family'] == 'Debian'
 
+# Install kernel headers + dkms FIRST in their own apt transaction, so they
+# are fully configured before NVIDIA's dpkg postinst runs `dkms autoinstall`.
+# When mixed in a single apt-get call, dpkg may configure
+# `nvidia-kernel-open-dkms` before `linux-headers-cloud-amd64` finishes
+# setting up, and DKMS exits 2 because the headers aren't yet in place.
+- name: Install kernel headers and DKMS prerequisites
+  ansible.builtin.apt:
+    name:
+      - linux-headers-cloud-amd64
+      - dkms
+      - firmware-misc-nonfree
+    state: present
+    install_recommends: true
+  become: true
+  when:
+    - cracking_tools_install_nvidia_driver | bool
+    - ansible_facts['os_family'] == 'Debian'
+
 # Driven through shell+tee instead of ansible.builtin.apt: the apt module
 # captures dpkg stderr but truncates large stdout (DKMS kernel-module build
 # errors land deep in apt-get's output, well after the cutoff). With tee we
