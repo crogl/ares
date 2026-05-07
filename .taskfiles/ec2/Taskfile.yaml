@@ -36,9 +36,6 @@ vars:
   ARES_REMOTE_BIN: '/usr/local/bin'
   ARES_REMOTE_CONFIG: '/etc/ares/config.yaml'
   ARES_LOG_DIR: '/var/log/ares'
-  # Build config
-  RUST_TARGET: '{{.RUST_TARGET | default "x86_64-unknown-linux-gnu"}}'
-  BIN_DIR: 'target/{{.RUST_TARGET}}/{{.BUILD_PROFILE | default "dev-deploy"}}'
   # Build tool: auto (cross on macOS due to aws-lc-sys, zigbuild on Linux), cross, zigbuild, cargo, remote
   # remote: builds natively on EC2 (fastest for iteration, no cross-compilation)
   BUILD_TOOL: '{{.BUILD_TOOL | default "auto"}}'
@@ -88,6 +85,7 @@ tasks:
     desc: "Cross-compile Rust binaries and deploy to EC2 via S3 staging (usage: task ec2:deploy [EC2_NAME=ares-tools])"
     silent: true
     vars:
+      RUST_TARGET: '{{.RUST_TARGET | default "x86_64-unknown-linux-gnu"}}'
       MAX_OPEN_FILES: '{{.MAX_OPEN_FILES | default "65536"}}'
       CARGO_BUILD_JOBS: '{{.CARGO_BUILD_JOBS | default "0"}}'
       S3_DEPLOY_PREFIX: 'ares-deploy'
