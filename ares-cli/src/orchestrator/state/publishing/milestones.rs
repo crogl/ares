@@ -14,14 +14,20 @@ use crate::orchestrator::task_queue::TaskQueueCore;
 
 impl SharedState {
     /// Set has_golden_ticket flag and persist to Redis.
+    ///
+    /// Per-domain dedup: re-entry for the same domain is a no-op, but a
+    /// different domain proceeds even when the global `has_golden_ticket`
+    /// bool is already true. The global bool is kept as a "any GT forged"
+    /// summary for legacy persistence/CLI surfaces.
     pub async fn set_golden_ticket(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
         domain: &str,
     ) -> Result<()> {
+        let vuln_id = format!("golden_ticket_{}", domain.to_lowercase());
         {
             let state = self.inner.read().await;
-            if state.has_golden_ticket {
+            if state.exploited_vulnerabilities.contains(&vuln_id) {
                 return Ok(());
             }
         }
@@ -55,7 +61,6 @@ impl SharedState {
         drop(state);
 
         // Synthesize a golden_ticket vulnerability so loot reflects the achievement
-        let vuln_id = format!("golden_ticket_{}", domain.to_lowercase());
         let mut details = HashMap::new();
         details.insert(
             "domain".into(),
@@ -204,6 +209,36 @@ mod tests {
 
         let s = state.inner.read().await;
         assert!(s.has_golden_ticket);
+    }
+
+    #[tokio::test]
+    async fn set_golden_ticket_records_each_domain() {
+        // Multi-domain op: forging GT for child must not block forging GT
+        // for parent. Per-domain dedup keys off `golden_ticket_<domain>`,
+        // not the global `has_golden_ticket` bool.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        state
+            .set_golden_ticket(&q, "child.contoso.local")
+            .await
+            .unwrap();
+        state.set_golden_ticket(&q, "contoso.local").await.unwrap();
+
+        let s = state.inner.read().await;
+        assert!(s.has_golden_ticket);
+        assert!(s
+            .exploited_vulnerabilities
+            .contains("golden_ticket_child.contoso.local"));
+        assert!(s
+            .exploited_vulnerabilities
+            .contains("golden_ticket_contoso.local"));
+        assert!(s
+            .discovered_vulnerabilities
+            .contains_key("golden_ticket_child.contoso.local"));
+        assert!(s
+            .discovered_vulnerabilities
+            .contains_key("golden_ticket_contoso.local"));
     }
 
     #[tokio::test]

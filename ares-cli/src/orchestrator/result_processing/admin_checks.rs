@@ -209,12 +209,9 @@ pub(crate) async fn check_golden_ticket_completion(
     if !task_id.contains("exploit") && !task_id.contains("golden") {
         return;
     }
-    {
-        let state = dispatcher.state.read().await;
-        if state.has_golden_ticket {
-            return;
-        }
-    }
+    // Per-domain dedup happens after we resolve `domain` below — a forge
+    // for one domain must not block recording another (multi-domain ops
+    // routinely capture krbtgt for parent + child or both forests).
     let mut found_ticket = false;
     let mut domain = String::new();
     if let Some(arr) = payload.get("tool_outputs").and_then(|v| v.as_array()) {
@@ -277,6 +274,17 @@ pub(crate) async fn check_golden_ticket_completion(
     }
     if domain.is_empty() {
         return;
+    }
+    // Per-domain dedup: skip the timeline-event emit + set_golden_ticket
+    // call when this specific domain's GT vuln is already exploited. The
+    // global `has_golden_ticket` bool is not consulted here — it would
+    // suppress legitimate forges for additional domains.
+    {
+        let state = dispatcher.state.read().await;
+        let vuln_id = format!("golden_ticket_{}", domain.to_lowercase());
+        if state.exploited_vulnerabilities.contains(&vuln_id) {
+            return;
+        }
     }
     if let Err(e) = dispatcher
         .state
