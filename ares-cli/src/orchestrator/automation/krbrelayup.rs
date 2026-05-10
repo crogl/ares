@@ -62,11 +62,18 @@ fn collect_krbrelayup_work(state: &StateInner) -> Vec<KrbRelayUpWork> {
             .map(|i| host.hostname[i + 1..].to_lowercase())
             .unwrap_or_default();
 
+        // Domain match is required: krbrelayup binds the credential to the
+        // host's domain controller; a foreign-domain cred fails with
+        // invalidCredentials before any work happens. The previous
+        // `.or_else(|| state.credentials.first())` fallback paired hosts
+        // with whatever cred happened to be first in state, which routinely
+        // dispatched a foreign-forest cred against an unrelated host and
+        // burned ~30k LLM tokens per failed task. Skip when no matching
+        // cred exists; the next tick will retry once one lands.
         let cred = state
             .credentials
             .iter()
             .find(|c| !domain.is_empty() && c.domain.to_lowercase() == domain)
-            .or_else(|| state.credentials.first())
             .cloned();
 
         let cred = match cred {
@@ -331,7 +338,14 @@ mod tests {
     }
 
     #[test]
-    fn collect_bare_hostname_uses_fallback_cred() {
+    fn collect_bare_hostname_skips_when_no_domain_match() {
+        // Bare hostname yields domain="" (no FQDN dot to split on); the
+        // credential filter then can't pair any cred with the host.
+        // Previously the dispatcher fell back to credentials.first() and
+        // dispatched a wrong-domain task that always failed at LDAP bind.
+        // Now the host is skipped — an FQDN-resolving recon pass must
+        // populate `host.hostname` with a domain suffix before dispatch
+        // becomes eligible.
         let mut state = StateInner::new("test-op".into());
         state.hosts.push(make_host("192.168.58.30", "ws01", false));
         state
@@ -341,9 +355,25 @@ mod tests {
             .discovered_vulnerabilities
             .insert("v1".into(), make_ldap_vuln());
         let work = collect_krbrelayup_work(&state);
-        assert_eq!(work.len(), 1);
-        assert_eq!(work[0].domain, "");
-        assert_eq!(work[0].credential.username, "admin");
+        assert!(work.is_empty());
+    }
+
+    #[test]
+    fn collect_skips_when_no_cred_for_host_domain() {
+        // A host in fabrikam.local with only a contoso.local credential
+        // should be skipped, not paired with the cross-forest cred.
+        let mut state = StateInner::new("test-op".into());
+        state
+            .hosts
+            .push(make_host("192.168.58.31", "srv01.fabrikam.local", false));
+        state
+            .credentials
+            .push(make_credential("admin", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
+        state
+            .discovered_vulnerabilities
+            .insert("v1".into(), make_ldap_vuln());
+        let work = collect_krbrelayup_work(&state);
+        assert!(work.is_empty());
     }
 
     #[test]

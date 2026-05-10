@@ -345,6 +345,16 @@ fn resolve_principal_credentials(
                 "credential_resolver: injected hash from state"
             );
         }
+        // Tools that expose the field as `hashes` (impacket-style — certipy_find,
+        // any wrapper passing `-hashes` directly) won't pick up `hash`. Inject
+        // both spellings so the tool wrapper finds whichever key it reads.
+        // Without this, certipy_find sees no hashes, falls through to its
+        // password branch, fails with `missing required argument: password`,
+        // and the LLM bails with "Assistance requested" — burning ~30k input
+        // tokens per failed dispatch.
+        if !args.contains_key("hashes") && !h.hash_value.is_empty() {
+            args.insert("hashes".to_string(), Value::String(h.hash_value.clone()));
+        }
         if !args.contains_key("nt_hash") && !h.hash_value.is_empty() {
             let nt = nt_hash_only(&h.hash_value).to_string();
             if !nt.is_empty() {

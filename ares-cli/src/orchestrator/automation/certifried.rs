@@ -16,9 +16,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use serde_json::json;
 use tokio::sync::watch;
-use tracing::{debug, info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -27,6 +25,12 @@ use crate::orchestrator::state::*;
 ///
 /// Pure logic extracted from `auto_certifried` so it can be unit-tested
 /// without needing a `Dispatcher` or async runtime.
+///
+/// Currently unused: the dispatch path in `auto_certifried` is short-
+/// circuited because no exploit primitive is registered. Kept (with
+/// `dead_code` allowed) so re-enabling becomes a one-line change once
+/// a `certifried`/CVE-2022-26923 tool lands.
+#[allow(dead_code)]
 fn collect_certifried_work(state: &StateInner) -> Vec<CertifriedWork> {
     if state.credentials.is_empty() {
         return Vec::new();
@@ -87,62 +91,24 @@ pub async fn auto_certifried(dispatcher: Arc<Dispatcher>, mut shutdown: watch::R
             break;
         }
 
+        // Certifried (CVE-2022-26923) has no exploit primitive registered in
+        // the LLM tool registry — there's no `certifried` tool, only the
+        // `certipy_*` family which doesn't include the machine-account-rename
+        // + cert-request chain this CVE requires. Dispatching here always
+        // failed with the LLM raising "Cannot execute Certifried with provided
+        // toolset" after burning ~30k input tokens per attempt. Short-circuit
+        // until a primitive lands; the dedup/work collection helpers below
+        // are kept so re-enabling is a one-line change. Vulnerability
+        // detection still flows through `auto_adcs_enumeration`; only the
+        // auto-exploit dispatch is suppressed.
         if !dispatcher.is_technique_allowed("certifried") {
             continue;
         }
-
-        let work = {
-            let state = dispatcher.state.read().await;
-            collect_certifried_work(&state)
-        };
-
-        for item in work {
-            let payload = json!({
-                "technique": "certifried",
-                "cve": "CVE-2022-26923",
-                "target_ip": item.dc_ip,
-                "domain": item.domain,
-                "dc_hostname": item.dc_hostname,
-                "credential": {
-                    "username": item.credential.username,
-                    "password": item.credential.password,
-                    "domain": item.credential.domain,
-                },
-            });
-
-            let priority = dispatcher.effective_priority("certifried");
-            match dispatcher
-                .throttled_submit("exploit", "privesc", payload, priority)
-                .await
-            {
-                Ok(Some(task_id)) => {
-                    info!(
-                        task_id = %task_id,
-                        domain = %item.domain,
-                        dc = %item.dc_ip,
-                        "Certifried (CVE-2022-26923) dispatched"
-                    );
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_CERTIFRIED, item.dedup_key.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_CERTIFRIED, &item.dedup_key)
-                        .await;
-                }
-                Ok(None) => {
-                    debug!(domain = %item.domain, "Certifried deferred");
-                }
-                Err(e) => {
-                    warn!(err = %e, domain = %item.domain, "Failed to dispatch certifried");
-                }
-            }
-        }
+        continue;
     }
 }
 
+#[allow(dead_code)]
 struct CertifriedWork {
     dedup_key: String,
     domain: String,

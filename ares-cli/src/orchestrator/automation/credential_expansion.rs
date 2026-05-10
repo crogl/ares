@@ -318,11 +318,24 @@ pub async fn auto_credential_expansion(
 
             // 4. Hash→secretsdump: try pass-the-hash secretsdump against DCs.
             // This is the fastest path from hash → krbtgt → DA.
+            //
+            // Filter DCs to those in the same forest as the hash's domain
+            // (exact match or child-of). Cross-forest PTH secretsdump fails
+            // at DRSUAPI with `rpc_s_access_denied` and burns a
+            // CredentialInflight slot plus ~30k LLM tokens per failed attempt.
+            // The password-cred path above already filters this way; the hash
+            // path was missing the gate, dispatching foreign-forest creds
+            // against unrelated DCs.
             {
                 let state = dispatcher.state.read().await;
+                let hash_domain = item.hash.domain.to_lowercase();
                 let dc_ips: Vec<String> = state
                     .all_domains_with_dcs()
                     .into_iter()
+                    .filter(|(domain, _)| {
+                        let d = domain.to_lowercase();
+                        d == hash_domain || d.ends_with(&format!(".{hash_domain}"))
+                    })
                     .map(|(_, ip)| ip)
                     .collect();
                 drop(state);
