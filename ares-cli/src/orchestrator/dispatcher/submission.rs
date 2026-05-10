@@ -69,6 +69,30 @@ impl Dispatcher {
         priority: i32,
         span: tracing::Span,
     ) -> Result<SubmissionOutcome> {
+        // Hard rate cap: if this (task_type, target, principal) pattern
+        // already ended with `RequestAssistance` once this op, refuse to
+        // redispatch. The pattern is doomed — usually a missing tool
+        // primitive, a wrong-realm cred pairing, or a stale automation
+        // entry — and each re-attempt burns ~30k input tokens loading the
+        // LLM context only for the agent to bail with the same complaint.
+        // Re-enabling requires the operator to manually clear the dedup
+        // (or starts a new op with a wiped Redis).
+        let assist_key = assist_pattern_key(task_type, &payload);
+        if let Some(ref key) = assist_key {
+            let state = self.state.read().await;
+            if state.is_processed(crate::orchestrator::state::DEDUP_ASSIST_ABANDONED, key) {
+                drop(state);
+                span.record("automation.decision", "drop_assist_abandoned");
+                debug!(
+                    task_type,
+                    target_role,
+                    pattern = %key,
+                    "Refusing dispatch — task pattern previously ended with RequestAssistance",
+                );
+                return Ok(SubmissionOutcome::Dropped);
+            }
+        }
+
         let decision = self
             .throttler
             .check(task_type, target_role, Some(&payload))
@@ -347,6 +371,10 @@ impl Dispatcher {
         let queue = self.queue.clone();
         let tid = task_id.clone();
         let tt = task_type.to_string();
+        // Capture the assist-abandon pattern key + state handle so the
+        // spawn can record on RequestAssistance without re-resolving them.
+        let state_for_assist = self.state.clone();
+        let assist_key_for_spawn = assist_pattern_key(&tt, &payload);
         tokio::spawn(async move {
             let outcome = runner.execute_task(&tt, &tid, role, &payload).await;
 
@@ -460,6 +488,30 @@ impl Dispatcher {
                             if !tool_outputs_json.is_empty() {
                                 result_json["tool_outputs"] =
                                     Value::Array(tool_outputs_json.clone());
+                            }
+                            // Record this pattern as abandoned so future
+                            // dispatches of (task_type, target, user, domain)
+                            // get refused at throttled_submit. One failure is
+                            // enough — re-running an LLM round on a doomed
+                            // task costs ~30k input tokens for a guaranteed
+                            // repeat of the same "Assistance requested".
+                            if let Some(ref key) = assist_key_for_spawn {
+                                state_for_assist.write().await.mark_processed(
+                                    crate::orchestrator::state::DEDUP_ASSIST_ABANDONED,
+                                    key.clone(),
+                                );
+                                let _ = state_for_assist
+                                    .persist_dedup(
+                                        &queue,
+                                        crate::orchestrator::state::DEDUP_ASSIST_ABANDONED,
+                                        key,
+                                    )
+                                    .await;
+                                warn!(
+                                    task_id = %tid,
+                                    pattern = %key,
+                                    "Marked task pattern as assist-abandoned — future dispatches will be dropped",
+                                );
                             }
                             TaskResult {
                                 task_id: tid.clone(),
@@ -625,5 +677,64 @@ impl Dispatcher {
         });
 
         Ok(SubmissionOutcome::Submitted(task_id))
+    }
+}
+
+/// Canonical key identifying a task pattern for the assist-abandon dedup
+/// set. Keys off (task_type, target_ip-or-dc_ip, username, domain) — the
+/// fields most automations vary by. When all are missing the function
+/// returns `None` (no pattern to dedup on, e.g. a free-form recon task);
+/// the dispatch proceeds without the abandon check in that case.
+///
+/// The set is read at `throttled_submit_outcome_inner` and written by the
+/// post-task spawn when the LLM returns `RequestAssistance`. After one
+/// matching failure, future dispatches of this exact pattern are dropped.
+pub(crate) fn assist_pattern_key(task_type: &str, payload: &serde_json::Value) -> Option<String> {
+    let obj = payload.as_object()?;
+    let pick = |k: &str| -> &str { obj.get(k).and_then(|v| v.as_str()).unwrap_or("") };
+    let target = {
+        let t = pick("target_ip");
+        if !t.is_empty() {
+            t.to_string()
+        } else {
+            pick("dc_ip").to_string()
+        }
+    };
+    let username = pick("username");
+    let domain = pick("domain");
+    if target.is_empty() && username.is_empty() && domain.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "{task_type}|{target}|{u}|{d}",
+        u = username.to_lowercase(),
+        d = domain.to_lowercase(),
+    ))
+}
+
+#[cfg(test)]
+mod assist_key_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn pattern_key_includes_target_user_domain() {
+        let p =
+            json!({"target_ip": "192.168.58.10", "username": "Alice", "domain": "Contoso.LOCAL"});
+        let k = assist_pattern_key("smb_login_check", &p).unwrap();
+        assert_eq!(k, "smb_login_check|192.168.58.10|alice|contoso.local");
+    }
+
+    #[test]
+    fn pattern_key_falls_back_to_dc_ip() {
+        let p = json!({"dc_ip": "192.168.58.10", "username": "alice", "domain": "contoso.local"});
+        let k = assist_pattern_key("certipy_find", &p).unwrap();
+        assert!(k.starts_with("certipy_find|192.168.58.10|"));
+    }
+
+    #[test]
+    fn pattern_key_none_when_no_identifying_fields() {
+        let p = json!({"technique": "recon"});
+        assert!(assist_pattern_key("recon", &p).is_none());
     }
 }

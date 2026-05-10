@@ -629,14 +629,37 @@ fn string_field(args: &Map<String, Value>, key: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Split a possibly-UPN-suffixed username (`user@realm.tld`) into bare-user
+/// and realm hint. The LLM regularly passes the UPN form in the `username`
+/// argument even when the task `domain` is set to the target's domain
+/// (e.g. `username=alice@home.local` with `domain=target.local`). The
+/// resolver must match on the bare user to find the credential record in
+/// state, and the realm suffix is a useful fallback when the caller's
+/// `domain` is empty.
+fn split_user_realm(raw: &str) -> (String, Option<String>) {
+    if let Some(at) = raw.find('@') {
+        let user = raw[..at].to_lowercase();
+        let realm = raw[at + 1..].to_lowercase();
+        let realm = if realm.is_empty() { None } else { Some(realm) };
+        (user, realm)
+    } else {
+        (raw.to_lowercase(), None)
+    }
+}
+
 fn find_credential<'a>(
     credentials: &'a [Credential],
     username: &str,
     domain: &str,
     realm_strict: bool,
 ) -> Option<&'a Credential> {
-    let user_l = username.to_lowercase();
-    let domain_l = domain.to_lowercase();
+    let (user_l, upn_realm) = split_user_realm(username);
+    let mut domain_l = domain.to_lowercase();
+    if domain_l.is_empty() {
+        if let Some(r) = upn_realm.as_deref() {
+            domain_l = r.to_string();
+        }
+    }
     let domain_empty = domain_l.is_empty();
 
     let mut exact: Option<&Credential> = None;
@@ -727,8 +750,16 @@ fn find_hash<'a>(
     domain: &str,
     realm_strict: bool,
 ) -> Option<&'a Hash> {
-    let user_l = username.to_lowercase();
-    let domain_l = domain.to_lowercase();
+    // Same UPN handling as find_credential — strip @realm to match bare-user
+    // hash records and fall back to the realm suffix when caller domain is
+    // empty.
+    let (user_l, upn_realm) = split_user_realm(username);
+    let mut domain_l = domain.to_lowercase();
+    if domain_l.is_empty() {
+        if let Some(r) = upn_realm.as_deref() {
+            domain_l = r.to_string();
+        }
+    }
     let domain_empty = domain_l.is_empty();
 
     let mut exact: Option<&Hash> = None;
@@ -1069,6 +1100,59 @@ mod tests {
         strip_placeholder_credentials(&mut args);
         assert!(args.contains_key("password"));
         assert!(args.contains_key("hash"));
+    }
+
+    #[test]
+    fn split_user_realm_bare_username() {
+        let (u, r) = split_user_realm("alice");
+        assert_eq!(u, "alice");
+        assert_eq!(r, None);
+    }
+
+    #[test]
+    fn split_user_realm_upn_form() {
+        let (u, r) = split_user_realm("alice@CONTOSO.LOCAL");
+        assert_eq!(u, "alice");
+        assert_eq!(r.as_deref(), Some("contoso.local"));
+    }
+
+    #[test]
+    fn find_credential_upn_username_finds_bare_record() {
+        // LLM passes UPN-suffixed username while caller domain is the target
+        // domain — find_credential should still locate the bare-user cred via
+        // its cross-realm fallback (any_user matches on stripped username).
+        let creds = vec![Credential {
+            id: "c1".into(),
+            username: "alice".into(),
+            password: "P@ss!".into(),
+            domain: "contoso.local".into(),
+            source: "test".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }];
+        let got = find_credential(&creds, "alice@contoso.local", "fabrikam.local", false);
+        assert!(got.is_some(), "should find bare-user record despite UPN");
+    }
+
+    #[test]
+    fn find_hash_upn_username_finds_bare_record() {
+        let hashes = vec![Hash {
+            id: "h1".into(),
+            username: "alice".into(),
+            domain: "contoso.local".into(),
+            hash_value: "aad3b435b51404eeaad3b435b51404ee:5af3107a4077a8bdde9c8b58b4e1c0e7".into(),
+            hash_type: "NTLM".into(),
+            source: "test".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            cracked_password: None,
+        }];
+        let got = find_hash(&hashes, "alice@contoso.local", "fabrikam.local", false);
+        assert!(got.is_some(), "should find bare-user hash despite UPN");
     }
 
     #[test]

@@ -775,6 +775,7 @@ mod tests {
             DEDUP_CROSS_REALM_LATERAL,
             DEDUP_GOLDEN_CERT,
             DEDUP_MSSQL_RETRY,
+            DEDUP_ASSIST_ABANDONED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
         for name in expected {

@@ -103,10 +103,27 @@ pub async fn lsassy(args: &Value) -> Result<ToolOutput> {
 pub async fn smb_login_check(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let domain = required_str(args, "domain")?;
-
-    let cred_args = credentials::netexec_creds(Some(username), Some(password), None, Some(domain));
+    // password OR hash — both optional. The worker credential_resolver
+    // injects whichever exists in state; if neither does (the LLM probed a
+    // username for which no cred has been discovered), fail soft with a
+    // structured stdout message instead of throwing. Hard-erroring caused
+    // the LLM to "Assistance requested" and burn ~30k tokens reasoning about
+    // a missing-credential field; returning a quiet zero-result line lets
+    // the agent move on without a tool failure escalation.
+    let password = optional_str(args, "password");
+    let hash = optional_str(args, "hash");
+    if password.is_none() && hash.is_none() {
+        return Ok(ToolOutput {
+            stdout: format!(
+                "smb_login_check: no credential resolved for {username}@{domain} (neither password nor hash in state); skipping login attempt.\n"
+            ),
+            stderr: String::new(),
+            exit_code: Some(0),
+            success: true,
+        });
+    }
+    let cred_args = credentials::netexec_creds(Some(username), password, hash, Some(domain));
 
     CommandBuilder::new("netexec")
         .arg("smb")

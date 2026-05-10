@@ -82,6 +82,14 @@ pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
 /// a new cred for the vuln's domain becomes available after the initial
 /// LLM attempt failed (e.g. cred-timing race in cross-forest pivots).
 pub const DEDUP_MSSQL_RETRY: &str = "mssql_retry";
+/// Task patterns that ended with `RequestAssistance` are recorded here and
+/// refused on re-dispatch. Each entry is a canonical key of
+/// `(task_type, target_ip, username, domain)` — enough to identify a
+/// repeating doomed dispatch without false-positiving unrelated work
+/// against the same target. Caps token burn from automations that keep
+/// firing the same impossible task (e.g. missing tool primitive, no auth
+/// resolvable for the principal, wrong-realm pairing).
+pub const DEDUP_ASSIST_ABANDONED: &str = "assist_abandoned";
 
 /// Vuln queue ZSET key suffix.
 pub const KEY_VULN_QUEUE: &str = "vuln_queue";
@@ -150,6 +158,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_CROSS_REALM_LATERAL,
     DEDUP_GOLDEN_CERT,
     DEDUP_MSSQL_RETRY,
+    DEDUP_ASSIST_ABANDONED,
 ];
 
 #[cfg(test)]
