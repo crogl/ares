@@ -368,7 +368,12 @@ mod tests {
         let mut discovered = HashMap::new();
         discovered.insert(
             "mssql_192_168_58_254".to_string(),
-            vuln("mssql_192_168_58_254", "mssql_access", "192.168.58.254", &[]),
+            vuln(
+                "mssql_192_168_58_254",
+                "mssql_access",
+                "192.168.58.254",
+                &[],
+            ),
         );
         let lsid = "mssql_linked_server_192.168.58.254_SQL".to_string();
         discovered.insert(
@@ -503,9 +508,18 @@ mod tests {
     #[tokio::test]
     async fn record_exploit_failure_increments_counter() {
         let state = SharedState::new("op-1".to_string());
-        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 1);
-        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 2);
-        assert_eq!(state.record_exploit_failure("mssql_192_168_58_254").await, 3);
+        assert_eq!(
+            state.record_exploit_failure("mssql_192_168_58_254").await,
+            1
+        );
+        assert_eq!(
+            state.record_exploit_failure("mssql_192_168_58_254").await,
+            2
+        );
+        assert_eq!(
+            state.record_exploit_failure("mssql_192_168_58_254").await,
+            3
+        );
         // Different vuln tracked independently.
         assert_eq!(state.record_exploit_failure("other_vuln").await, 1);
     }

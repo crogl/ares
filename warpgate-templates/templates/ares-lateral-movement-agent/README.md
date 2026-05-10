@@ -1,9 +1,9 @@
 # Ares Lateral Movement Agent Warp Gate Template
 
 This template builds **Ares Lateral Movement Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The build provisions
-lateral movement and credential extraction tools using Ansible roles from the nimbus_range
-collection, plus a compiled Rust worker binary with embedded Python.
+building **Docker images** (for `amd64` and `arm64`). The build installs
+lateral movement and credential extraction tools via Ansible roles from the nimbus_range
+collection, plus a compiled Rust worker binary.
 
 ---
 

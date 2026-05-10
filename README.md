@@ -530,13 +530,7 @@ via the [Grafana MCP](docs/grafana_mcp_usage.md) server.
 
 ## Contributing
 
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Make your changes with tests
-4. Run pre-commit checks
-5. Submit a pull request
+Open a PR against `main`. Run `pre-commit` before pushing — the CI will reject commits that fail the hooks. Include tests for any new tool or agent behavior.
 
 ## License
 

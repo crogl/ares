@@ -1136,12 +1136,7 @@ mod tests {
 
     #[test]
     fn find_hash_realm_strict_blocks_cross_realm_fallback() {
-        let hashes = vec![hash(
-            "bob",
-            "child.contoso.local",
-            "deadbeef",
-            None,
-        )];
+        let hashes = vec![hash("bob", "child.contoso.local", "deadbeef", None)];
         let found = find_hash(&hashes, "bob", "fabrikam.local", true);
         assert!(
             found.is_none(),
@@ -1226,12 +1221,7 @@ mod tests {
         // Same intent as find_credential_cross_realm_fallback: the LLM passes
         // the target domain but the only stored hash for the user is in their
         // home realm. Return the home-realm hash rather than nothing.
-        let hashes = vec![hash(
-            "alice",
-            "child.contoso.local",
-            "deadbeef",
-            None,
-        )];
+        let hashes = vec![hash("alice", "child.contoso.local", "deadbeef", None)];
         let found = find_hash(&hashes, "alice", "fabrikam.local", false).unwrap();
         assert_eq!(found.hash_value, "deadbeef");
         assert_eq!(found.domain, "child.contoso.local");

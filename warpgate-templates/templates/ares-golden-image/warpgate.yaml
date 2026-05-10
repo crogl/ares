@@ -18,13 +18,12 @@ metadata:
     - acl
     - coercion
   requires:
-    warpgate: '>=1.0.0'
+    warpgate: '>=4.7.0'
 
 name: ares-golden-image
 version: latest
 
 base:
-  image: kalilinux/kali-rolling@sha256:dddc31e0f4bc57b4b91e9027762544506bf91c7cdd7ff52104daaa4449b4c726:latest
   ami_filters:
     owners:
       - "679593333241"
@@ -34,17 +33,12 @@ base:
     most_recent: true
 
 sources:
-  # Clone the ares repo and use its ansible/ subtree as the nimbus_range
-  # collection. This keeps the AMI tracking the same branch as the rest of
-  # the project — role edits ship together, no second repo to publish to.
-  # Mirrors the pattern in ares-golden-azure/warpgate.yaml.
-  - name: ares
-    git:
-      repository: https://github.com/dreadnode/ares.git
-      ref: feat/more-attack-cov
-      depth: 1
-      auth:
-        token: ${GITHUB_TOKEN}
+  # Use the in-repo ansible/ tree directly so builds match the working copy
+  # (no GITHUB_TOKEN, no branch ref drift). Path is relative to this template's
+  # directory; requires warpgate >= v4.7.0 (local source type).
+  - name: ansible
+    local:
+      path: ../../../ansible
 
 provisioners:
   # Install pipx and Ansible
@@ -57,54 +51,35 @@ provisioners:
       - pipx install --force ansible-core
       - pipx ensurepath
 
-  # Copy the ansible/ subtree of the ares repo into the nimbus_range
-  # collection path on the build instance.
+  # Copy the in-repo ansible/ subtree (the dreadnode.nimbus_range collection) into the build.
+  # The destination keeps the `nimbus_range` name because the collection is published as
+  # `dreadnode.nimbus_range`; subsequent steps install it under that namespace.
   - type: file
-    source: ${sources.ares}
-    destination: /tmp/ares
+    source: ${sources.ansible}
+    destination: /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
 
-  # Attack Box - all red team tools + Alloy telemetry. The cracking_tools
-  # role handles the full NVIDIA stack (driver, DKMS, CUDA toolkit, OpenCL
-  # ICD) — driving it through ansible keeps Recommends enabled (so dkms +
-  # libcuda1 come along), uses linux-headers-amd64 (the meta-package, kept
-  # in sync with the running kernel) instead of pinning to the AMI builder's
-  # kernel, and verifies nvidia-smi/clinfo at build time.
-  # NOTE: Using shell instead of ansible provisioner because the playbook
-  # exceeds EC2 Image Builder's 16000 character component limit.
-  #
-  # nimbus_range MUST come from this repo's ansible/ subtree, NEVER from
-  # galaxy.com. The published `dreadnode.nimbus_range` 1.5.x lags this
-  # branch's role edits (e.g. NVIDIA driver/CUDA tasks). Strategy:
-  #   1. Galaxy deps go to /opt/ansible-galaxy-deps (isolated path).
-  #   2. Local nimbus_range overlay lives at /root/.ansible/collections.
-  #   3. ANSIBLE_COLLECTIONS_PATH lists local first, galaxy deps second —
-  #      so even if a transitive dep pulls nimbus_range into the galaxy
-  #      path, the local copy wins.
-  #   4. Defense-in-depth: rm any nimbus_range that ends up in the galaxy
-  #      path, and assert a known-local marker before running the playbook.
+  # Install NVIDIA drivers for GPU-accelerated hashcat on g4dn (T4 GPU)
   - type: shell
     inline:
-      - set -euxo pipefail
-      - echo "=== /tmp/ares source tree ==="
-      - ls -la /tmp/ares/ /tmp/ares/ansible/ /tmp/ares/ansible/roles/cracking_tools/tasks/ 2>&1 || true
-      - echo "=== /tmp/ares linux.yml stat + head ==="
-      - stat /tmp/ares/ansible/roles/cracking_tools/tasks/linux.yml 2>&1 || true
-      - head -60 /tmp/ares/ansible/roles/cracking_tools/tasks/linux.yml 2>&1 || true
-      - mkdir -p /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range
-      - cp -r /tmp/ares/ansible/. /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/
-      - echo "=== overlay linux.yml after cp ==="
-      - stat /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
-      - head -60 /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
-      - mkdir -p /opt/ansible-galaxy-deps
-      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --collections-path /opt/ansible-galaxy-deps --no-deps
-      - rm -rf /opt/ansible-galaxy-deps/ansible_collections/dreadnode/nimbus_range
-      - echo "=== overlay linux.yml after galaxy install ==="
-      - stat /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml 2>&1 || true
-      - rm -rf /tmp/ares
-      - test -f /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
-      - grep -q "Install NVIDIA driver and OpenCL runtime" /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
-      - grep -q "Show GPU/OpenCL detection summary" /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/roles/cracking_tools/tasks/linux.yml
-      - HOME=/root ANSIBLE_COLLECTIONS_PATH=/root/.ansible/collections:/opt/ansible-galaxy-deps ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true -e cracking_tools_install_nvidia_driver=true -e cracking_tools_install_cuda_toolkit=true
+      - apt-get update
+      - apt-get install -y --no-install-recommends nvidia-driver firmware-misc-nonfree
+      - nvidia-smi || echo "nvidia-smi not available during AMI build (expected if no GPU attached)"
+
+  # Attack Box - all red team tools + Alloy telemetry
+  # NOTE: Using shell instead of ansible provisioner because the playbook
+  # exceeds EC2 Image Builder's 16000 character component limit.
+  - type: shell
+    inline:
+      - PATH=/root/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-galaxy collection install -r /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/requirements.yml --force
+      - HOME=/root ANSIBLE_REMOTE_TMP=/tmp/ansible-tmp-$USER PATH=/root/.local/bin:/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin ansible-playbook /root/.ansible/collections/ansible_collections/dreadnode/nimbus_range/playbooks/ares/goad_attack_box.yml -i localhost, -c local -e ansible_shell_executable=/bin/bash -e ansible_python_interpreter=/usr/bin/python3 -e cracking_tools_gpu_support=true -e cracking_tools_hashcat_from_source=true -e cracking_tools_nvidia_opencl_icd=true
+
+  # NVIDIA GPU drivers + CUDA toolkit for hashcat GPU acceleration.
+  # Kernel headers + dkms are required so the nvidia module builds for the
+  # running kernel. The AMI then works on GPU instances (e.g. g4dn.xlarge)
+  # without manual driver setup.
+  - type: shell
+    inline:
+      - DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends linux-headers-$(uname -r) dkms nvidia-driver nvidia-cuda-toolkit
 
   # Cleanup
   - type: shell

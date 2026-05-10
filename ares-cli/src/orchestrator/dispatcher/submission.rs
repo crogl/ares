@@ -6,7 +6,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use chrono::Utc;
 use serde_json::{json, Value};
-use tracing::{debug, info, warn};
+use tracing::{debug, field::Empty, info, info_span, warn, Instrument};
 
 use crate::orchestrator::deferred::DeferredTask;
 use crate::orchestrator::llm_runner::LlmTaskRunner;
@@ -48,6 +48,27 @@ impl Dispatcher {
         payload: serde_json::Value,
         priority: i32,
     ) -> Result<SubmissionOutcome> {
+        let span = info_span!(
+            "automation.dispatch",
+            task_type = task_type,
+            target_role = target_role,
+            priority = priority,
+            "task.id" = Empty,
+            "automation.decision" = Empty,
+        );
+        self.throttled_submit_outcome_inner(task_type, target_role, payload, priority, span.clone())
+            .instrument(span)
+            .await
+    }
+
+    async fn throttled_submit_outcome_inner(
+        &self,
+        task_type: &str,
+        target_role: &str,
+        payload: serde_json::Value,
+        priority: i32,
+        span: tracing::Span,
+    ) -> Result<SubmissionOutcome> {
         let decision = self
             .throttler
             .check(task_type, target_role, Some(&payload))
@@ -55,14 +76,22 @@ impl Dispatcher {
 
         match decision {
             ThrottleDecision::Allow => {
-                self.do_submit_outcome(task_type, target_role, payload, priority)
-                    .await
+                span.record("automation.decision", "allow");
+                let outcome = self
+                    .do_submit_outcome(task_type, target_role, payload, priority)
+                    .await?;
+                if let SubmissionOutcome::Submitted(ref tid) = outcome {
+                    span.record("task.id", tid.as_str());
+                }
+                Ok(outcome)
             }
             ThrottleDecision::Defer => {
+                span.record("automation.decision", "defer");
                 self.enqueue_deferred(task_type, target_role, payload, priority)
                     .await
             }
             ThrottleDecision::Wait(dur) => {
+                span.record("automation.decision", "wait");
                 tokio::time::sleep(dur).await;
                 let retry_decision = self
                     .throttler
@@ -70,10 +99,17 @@ impl Dispatcher {
                     .await;
                 match retry_decision {
                     ThrottleDecision::Allow => {
-                        self.do_submit_outcome(task_type, target_role, payload, priority)
-                            .await
+                        span.record("automation.decision", "wait_allow");
+                        let outcome = self
+                            .do_submit_outcome(task_type, target_role, payload, priority)
+                            .await?;
+                        if let SubmissionOutcome::Submitted(ref tid) = outcome {
+                            span.record("task.id", tid.as_str());
+                        }
+                        Ok(outcome)
                     }
                     _ => {
+                        span.record("automation.decision", "wait_defer");
                         self.enqueue_deferred(task_type, target_role, payload, priority)
                             .await
                     }

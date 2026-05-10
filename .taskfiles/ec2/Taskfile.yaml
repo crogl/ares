@@ -233,11 +233,14 @@ tasks:
 
         echo -e "{{.INFO}} Cross-compiling for {{.RUST_TARGET}} (profile: $PROFILE, jobs: {{.CARGO_BUILD_JOBS}})..."
 
-        # zig 0.15+ cannot handle RLIM_INFINITY — it needs a concrete fd limit.
-        CURRENT_FD_LIMIT=$(ulimit -n 2>/dev/null || echo "256")
-        if [ "$CURRENT_FD_LIMIT" = "unlimited" ] || [ "$CURRENT_FD_LIMIT" -lt "{{.MAX_OPEN_FILES}}" ] 2>/dev/null; then
-          ulimit -n {{.MAX_OPEN_FILES}} 2>/dev/null || ulimit -n 10240 2>/dev/null || ulimit -n 4096 2>/dev/null || true
-        fi
+        # Zig 0.15+ rejects RLIM_INFINITY on the *hard* fd limit (returns
+        # ProcessFdQuotaExceeded mid-link). On macOS, default zsh/bash sessions
+        # have soft=1048576 but hard=RLIM_INFINITY (`getrlimit` returns INT64_MAX),
+        # so even a high soft limit isn't enough — Zig sees the unlimited hard
+        # limit and bails. `ulimit -n N` sets both soft and hard to N, which is
+        # exactly what we want. Always pin to a concrete value, regardless of
+        # the current setting.
+        ulimit -n {{.MAX_OPEN_FILES}} 2>/dev/null || ulimit -n 10240 2>/dev/null || ulimit -n 4096 2>/dev/null || true
 
         JOBS="{{.CARGO_BUILD_JOBS}}"
         if [ "$JOBS" = "0" ]; then
@@ -594,6 +597,7 @@ tasks:
         PARAMS_FILE=$(mktemp)
         trap "rm -f $PARAMS_FILE" EXIT
         START_CMD="systemctl start redis-server 2>/dev/null || systemctl start redis; sleep 1; redis-cli ping; "
+        START_CMD+="systemctl start nats-server; sleep 1; curl -fsS http://127.0.0.1:8222/varz >/dev/null && echo 'NATS OK' || echo 'NATS NOT RUNNING'; "
         START_CMD+="systemctl start $WORKER_UNITS; sleep 2; echo Worker status:; "
         START_CMD+='for role in recon credential_access cracker acl privesc lateral coercion; do '
         START_CMD+='st=$(systemctl is-active ares@${role} 2>/dev/null || echo dead); '
@@ -1090,6 +1094,7 @@ tasks:
           ENV_FILE_CMD="$ENV_FILE_CMD; echo 'LOKI_URL=${LOKI_URL_VAL}' >> /etc/ares/env"
         fi
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'ARES_DEPLOYMENT={{.EC2_DEPLOYMENT}}' >> /etc/ares/env"
+        ENV_FILE_CMD="$ENV_FILE_CMD; echo 'NATS_URL=nats://127.0.0.1:4222' >> /etc/ares/env"
         # OTEL: send traces to Alloy OTLP gateway → Tempo via HTTP/protobuf
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=${OTEL_TRACES_ENDPOINT}' >> /etc/ares/env"
         ENV_FILE_CMD="$ENV_FILE_CMD; echo 'OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf' >> /etc/ares/env"
@@ -1109,6 +1114,7 @@ tasks:
         export GRAFANA_SERVICE_ACCOUNT_TOKEN='${GRAFANA_TOKEN_VAL}'
         export LOKI_URL='${LOKI_URL_VAL}'
         export ARES_REDIS_URL=redis://127.0.0.1:6379
+        export NATS_URL=nats://127.0.0.1:4222
         {{- if .LLM_MODEL}}
         export ARES_LLM_MODEL='{{.LLM_MODEL}}'
         {{- end}}

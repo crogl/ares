@@ -10,7 +10,9 @@ use crate::orchestrator::task_queue::TaskQueue;
 use crate::worker::credential_resolver::resolve_credentials;
 
 use super::domain_validator::check_domain_arg;
-use super::{extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle};
+use super::{
+    extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
+};
 
 /// Dispatches tool calls directly via `ares_tools::dispatch` without Redis.
 ///

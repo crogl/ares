@@ -1,9 +1,9 @@
 # Ares Base Warp Gate Template
 
 This template builds **Ares Base** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The build provisions
-Python 3.13.7, uv package manager, the Ares framework package, and core
-dependencies using Ansible roles from the nimbus_range collection.
+building **Docker images** (for `amd64` and `arm64`). The build installs
+Python 3.13.7, uv, the Ares framework, and core dependencies via Ansible roles
+from the nimbus_range collection.
 
 ---
 

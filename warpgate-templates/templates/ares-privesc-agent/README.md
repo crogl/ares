@@ -1,9 +1,9 @@
 # Ares PrivEsc Agent Warp Gate Template
 
 This template builds **Ares PrivEsc Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The build provisions
-privilege escalation tools for Windows and Linux targets using Ansible roles
-from the nimbus_range collection, plus a compiled Rust worker binary with embedded Python.
+building **Docker images** (for `amd64` and `arm64`). The build installs
+privilege escalation tools for Windows and Linux targets via Ansible roles
+from the nimbus_range collection, plus a compiled Rust worker binary.
 
 ---
 

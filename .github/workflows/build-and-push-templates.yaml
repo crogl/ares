@@ -30,7 +30,7 @@ env:
   PYTHON_VERSION: 3.13.7
   TASK_VERSION: 3.45.5
   TASK_X_REMOTE_TASKFILES: 1
-  WARPGATE_VERSION: "v4.4.0"
+  WARPGATE_VERSION: "v4.7.0"
 
 jobs:
   discover-templates:
@@ -78,7 +78,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -192,15 +192,16 @@ jobs:
           DEPENDENCY_MAP="{}"
           PLATFORMS_MAP="{}"
           ANSIBLE_MAP="{}"
-          AMI_TEMPLATES=()
+          NON_CONTAINER_TEMPLATES=()
           for template_dir in "$GITHUB_WORKSPACE"/warpgate-templates/templates/*/; do
             if [ -f "${template_dir}warpgate.yaml" ]; then
               template_name=$(basename "$template_dir")
 
-              # Skip AMI-only templates - they cannot be built as containers
-              if grep -q "type: ami" "${template_dir}warpgate.yaml" && ! grep -q "type: container" "${template_dir}warpgate.yaml"; then
-                echo "  $template_name: SKIPPED (AMI-only template)"
-                AMI_TEMPLATES+=("$template_name")
+              # Skip templates without a container target (e.g. AMI-only, Azure-only)
+              # — this workflow builds and pushes container images.
+              if ! grep -q "type: container" "${template_dir}warpgate.yaml"; then
+                echo "  $template_name: SKIPPED (no container target)"
+                NON_CONTAINER_TEMPLATES+=("$template_name")
                 continue
               fi
 
@@ -282,13 +283,13 @@ jobs:
             ]
           }')
 
-          # Remove AMI-only templates from matrix (they have no dependency/platform maps)
-          if [ ${#AMI_TEMPLATES[@]} -gt 0 ]; then
-            AMI_JSON=$(printf '%s\n' "${AMI_TEMPLATES[@]}" | jq -R . | jq -s .)
-            FULL_MATRIX=$(echo "$FULL_MATRIX" | jq --argjson ami "$AMI_JSON" '{
-              include: [.include[] | select(.name as $n | $ami | index($n) | not)]
+          # Remove non-container templates from matrix (they have no dependency/platform maps)
+          if [ ${#NON_CONTAINER_TEMPLATES[@]} -gt 0 ]; then
+            EXCLUDE_JSON=$(printf '%s\n' "${NON_CONTAINER_TEMPLATES[@]}" | jq -R . | jq -s .)
+            FULL_MATRIX=$(echo "$FULL_MATRIX" | jq --argjson exclude "$EXCLUDE_JSON" '{
+              include: [.include[] | select(.name as $n | $exclude | index($n) | not)]
             }')
-            echo "Excluded AMI-only templates from container build matrix: ${AMI_TEMPLATES[*]}"
+            echo "Excluded non-container templates from container build matrix: ${NON_CONTAINER_TEMPLATES[*]}"
           fi
 
           # Apply template filter if provided via workflow_dispatch
@@ -542,7 +543,7 @@ jobs:
           docker system prune -af || true
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -716,7 +717,7 @@ jobs:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: base-digests-${{ matrix.name }}-tag-${{ matrix.architecture.arch }}
           path: ${{ github.workspace }}/digest-${{ matrix.name }}-${{ matrix.architecture.arch }}.txt
@@ -756,7 +757,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1033,7 +1034,7 @@ jobs:
           docker system prune -af || true
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1207,7 +1208,7 @@ jobs:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: dependent-digests-${{ matrix.name }}-tag-${{ matrix.architecture.arch }}
           path: ${{ github.workspace }}/digest-${{ matrix.name }}-${{ matrix.architecture.arch }}.txt
@@ -1251,7 +1252,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1501,7 +1502,7 @@ jobs:
           docker system prune -af || true
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1607,7 +1608,7 @@ jobs:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gpu-base-digests-${{ matrix.name }}-tag-${{ matrix.architecture.arch }}
           path: ${{ github.workspace }}/digest-${{ matrix.name }}-${{ matrix.architecture.arch }}.txt
@@ -1637,7 +1638,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1836,7 +1837,7 @@ jobs:
           docker system prune -af || true
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate
@@ -1942,7 +1943,7 @@ jobs:
           BUILDX_NO_DEFAULT_ATTESTATIONS: 1
 
       - name: Upload digest
-        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: gpu-dependent-digests-${{ matrix.name }}-tag-${{ matrix.architecture.arch }}
           path: ${{ github.workspace }}/digest-${{ matrix.name }}-${{ matrix.architecture.arch }}.txt
@@ -1976,7 +1977,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Cache Warpgate binary
-        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae # v5.0.5
         id: warpgate-cache
         with:
           path: ~/.local/bin/warpgate

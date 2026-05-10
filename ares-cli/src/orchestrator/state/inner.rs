@@ -927,9 +927,10 @@ mod tests {
     #[test]
     fn quarantined_users_in_domain_skips_expired() {
         let mut state = StateInner::new("op-1".into());
-        state
-            .quarantined_users
-            .insert("expired@contoso.local".into(), Utc::now() - chrono::Duration::seconds(1));
+        state.quarantined_users.insert(
+            "expired@contoso.local".into(),
+            Utc::now() - chrono::Duration::seconds(1),
+        );
         state.quarantine_user("fresh", "contoso.local");
 
         let users = state.quarantined_users_in_domain("contoso.local");

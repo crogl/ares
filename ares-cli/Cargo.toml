@@ -21,6 +21,9 @@ serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tokio = { workspace = true }
 redis = { workspace = true }
+async-nats = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
 chrono = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -41,4 +44,5 @@ serde_yaml = "0.9"
 [dev-dependencies]
 tokio = { workspace = true }
 rstest = "0.26"
+tempfile = "3"
 ares-core = { path = "../ares-core", features = ["test-utils", "blue", "telemetry"] }

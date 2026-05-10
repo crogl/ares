@@ -40,7 +40,16 @@ fn sanitize_spray_userlist(users_file: &str) -> (String, bool) {
     if !filtered_any {
         return (users_file.to_string(), false);
     }
-    let tmp = format!("/tmp/spray_users_filtered_{}.txt", std::process::id());
+    // Per-call counter so concurrent calls within the same process (tests,
+    // overlapping spray dispatches) don't race on the same tmp path and
+    // overwrite each other's filtered userlists.
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = format!(
+        "/tmp/spray_users_filtered_{}_{}.txt",
+        std::process::id(),
+        seq
+    );
     if std::fs::write(&tmp, kept.join("\n")).is_err() {
         return (users_file.to_string(), false);
     }
@@ -1479,7 +1488,9 @@ mod tests {
         assert!(!filtered
             .lines()
             .any(|l| l.trim().eq_ignore_ascii_case("testuser1")));
-        assert!(!filtered.lines().any(|l| l.trim().eq_ignore_ascii_case("guest")));
+        assert!(!filtered
+            .lines()
+            .any(|l| l.trim().eq_ignore_ascii_case("guest")));
 
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&path);

@@ -1,9 +1,9 @@
 # Ares Credential Access Agent Warp Gate Template
 
 This template builds **Ares Credential Access Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The build provisions
-Kerberos attack tools and credential dumping utilities using Ansible roles from the nimbus_range
-collection, plus a compiled Rust worker binary with embedded Python.
+building **Docker images** (for `amd64` and `arm64`). The build installs
+Kerberos attack tools and credential dumping utilities via Ansible roles from the nimbus_range
+collection, plus a compiled Rust worker binary.
 
 ---
 

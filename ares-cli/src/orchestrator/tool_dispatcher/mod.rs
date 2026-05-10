@@ -1,21 +1,22 @@
-//! Redis-backed tool dispatcher for the LLM agent loop.
+//! NATS-backed tool dispatcher for the LLM agent loop.
 //!
-//! Implements `ares_llm::ToolDispatcher` by pushing individual tool calls
-//! to a Redis queue (`ares:tool_exec:{role}`) and waiting for results
-//! on a per-call mailbox (`ares:tool_results:{call_id}`).
+//! Implements `ares_llm::ToolDispatcher` by issuing a NATS request to
+//! `ares.tools.exec.{role}` and awaiting the worker reply on the
+//! auto-generated reply inbox.
 //!
-//! Rust workers run a tool executor that BRPOPs from `tool_exec`,
-//! invokes the tool via `ares_tools::dispatch`, and LPUSHes the result.
+//! Rust workers subscribe to `ares.tools.exec.{role}` as a queue group,
+//! invoke the tool via `ares_tools::dispatch`, and reply on the inbox.
 //!
 //! Also provides [`LocalToolDispatcher`] for in-process execution without
-//! going through Redis, useful for testing or single-binary deployments.
+//! going through NATS, useful for testing or single-binary deployments.
 
+use redis::aio::ConnectionLike;
 use redis::AsyncCommands;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::orchestrator::state::{SharedState, DISCOVERY_KEY_PREFIX};
-use crate::orchestrator::task_queue::TaskQueue;
+use crate::orchestrator::task_queue::TaskQueueCore;
 
 mod auth_throttle;
 mod domain_validator;
@@ -53,15 +54,6 @@ pub struct ToolExecResponse {
     #[serde(default)]
     pub discoveries: Option<serde_json::Value>,
 }
-
-/// Prefix for tool execution request queues.
-pub(super) const TOOL_EXEC_PREFIX: &str = "ares:tool_exec";
-
-/// Prefix for per-call result mailboxes.
-pub(super) const TOOL_RESULT_PREFIX: &str = "ares:tool_results";
-
-/// TTL for result keys (1 hour).
-pub(super) const RESULT_TTL_SECS: u64 = 3600;
 
 /// Default timeout waiting for a tool result (25 minutes).
 /// Must exceed queue wait time + longest tool runtime (hashcat can queue
@@ -153,10 +145,8 @@ pub(super) async fn inject_excluded_users(
         .get("excluded_users")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let mut set: std::collections::BTreeSet<String> = quarantined
-        .iter()
-        .map(|u| u.to_lowercase())
-        .collect();
+    let mut set: std::collections::BTreeSet<String> =
+        quarantined.iter().map(|u| u.to_lowercase()).collect();
     for u in existing.split(',') {
         let trimmed = u.trim();
         if !trimmed.is_empty() {
@@ -215,13 +205,15 @@ pub(super) fn resolve_queue_role<'a>(role: &'a str, tool_name: &str) -> &'a str 
 ///
 /// `tool_args` carries the tool call's input arguments — used to extract
 /// the authenticating credential (username/domain) for lineage tracking.
-pub(super) async fn push_realtime_discoveries(
-    queue: &TaskQueue,
+pub(super) async fn push_realtime_discoveries<C>(
+    queue: &TaskQueueCore<C>,
     operation_id: &str,
     discoveries: &serde_json::Value,
     tool_name: &str,
     tool_args: &serde_json::Value,
-) {
+) where
+    C: ConnectionLike + Clone + Send + Sync + 'static,
+{
     let discovery_key = format!("{DISCOVERY_KEY_PREFIX}:{operation_id}");
     let mut conn = queue.connection();
 

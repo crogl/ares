@@ -59,9 +59,9 @@ Install and configure password cracking tools for Ares agents
 | `cracking_tools_nvidia_driver_packages.0` | str | <code>linux-headers-cloud-amd64</code> | No description |
 | `cracking_tools_nvidia_driver_packages.1` | str | <code>dkms</code> | No description |
 | `cracking_tools_nvidia_driver_packages.2` | str | <code>firmware-misc-nonfree</code> | No description |
-| `cracking_tools_nvidia_driver_packages.3` | str | <code>nvidia-driver</code> | No description |
-| `cracking_tools_nvidia_driver_packages.4` | str | <code>nvidia-opencl-icd</code> | No description |
-| `cracking_tools_nvidia_driver_packages.5` | str | <code>nvidia-opencl-common</code> | No description |
+| `cracking_tools_nvidia_driver_packages.3` | str | <code>nvidia-kernel-open-dkms</code> | No description |
+| `cracking_tools_nvidia_driver_packages.4` | str | <code>nvidia-driver-cuda</code> | No description |
+| `cracking_tools_nvidia_driver_packages.5` | str | <code>nvidia-opencl-icd</code> | No description |
 | `cracking_tools_nvidia_cuda_toolkit_packages` | list | <code>&#91;&#93;</code> | No description |
 | `cracking_tools_nvidia_cuda_toolkit_packages.0` | str | <code>nvidia-cuda-toolkit</code> | No description |
 | `cracking_tools_update_cache` | bool | <code>True</code> | No description |
@@ -105,9 +105,13 @@ Install and configure password cracking tools for Ares agents
 - **Set DEBIAN_FRONTEND to noninteractive** (ansible.builtin.lineinfile) - Conditional
 - **Update apt cache** (ansible.builtin.apt) - Conditional
 - **Create wordlist directory** (ansible.builtin.file)
+- **Add NVIDIA CUDA apt repository (Kali ships 550.x which fails on kernel 6.19+)** (ansible.builtin.shell) - Conditional
+- **Install kernel headers and DKMS prerequisites** (ansible.builtin.apt) - Conditional
 - **Install NVIDIA driver and OpenCL runtime (with full log)** (ansible.builtin.shell) - Conditional
 - **Show NVIDIA install log tail on failure** (ansible.builtin.command) - Conditional
 - **Print NVIDIA install tail** (ansible.builtin.debug) - Conditional
+- **Dump DKMS make.log on failure** (ansible.builtin.shell) - Conditional
+- **Print DKMS make.log** (ansible.builtin.debug) - Conditional
 - **Fail if NVIDIA install failed** (ansible.builtin.fail) - Conditional
 - **Install NVIDIA CUDA toolkit** (ansible.builtin.apt) - Conditional
 - **Install GPU support packages** (ansible.builtin.apt) - Conditional

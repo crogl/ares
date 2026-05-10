@@ -40,19 +40,60 @@ impl SharedState {
         // account (which keep the badPwdCount climbing on shared lockout
         // policies). The state's own resolvers already filter
         // is_credential_quarantined for automation paths; this filter does
-        // the same for the LLM-facing snapshot.
+        // the same for the LLM-facing snapshot. Both the failed-auth
+        // quarantine (is_credential_quarantined) and the enumeration-observed
+        // quarantine (is_user_quarantined) are checked — they track the same
+        // class of "don't auth as this principal right now" signal, just
+        // populated by different code paths.
+        let suppress = |username: &str, domain: &str| {
+            s.is_credential_quarantined(username, domain) || s.is_user_quarantined(username, domain)
+        };
         let credentials: Vec<_> = s
             .credentials
             .iter()
-            .filter(|c| !s.is_credential_quarantined(&c.username, &c.domain))
+            .filter(|c| !suppress(&c.username, &c.domain))
             .cloned()
             .collect();
         let hashes: Vec<_> = s
             .hashes
             .iter()
-            .filter(|h| !s.is_credential_quarantined(&h.username, &h.domain))
+            .filter(|h| !suppress(&h.username, &h.domain))
             .cloned()
             .collect();
+
+        let target_domain = s
+            .target
+            .as_ref()
+            .map(|t| t.domain.clone())
+            .filter(|d| !d.is_empty())
+            .or_else(|| s.domains.first().cloned())
+            .unwrap_or_default();
+        // Prefer the DC IP for the primary target_domain; fall back to the
+        // configured Target's IP (which is the seed IP from operation config).
+        let target_dc_ip = s
+            .domain_controllers
+            .get(&target_domain)
+            .cloned()
+            .or_else(|| s.target.as_ref().map(|t| t.ip.clone()))
+            .unwrap_or_default();
+        // Prefer the configured Target's hostname (already an FQDN); else find
+        // the first discovered DC host whose hostname matches target_domain.
+        let target_dc_fqdn = s
+            .target
+            .as_ref()
+            .map(|t| t.hostname.clone())
+            .filter(|h| !h.is_empty() && h.contains('.'))
+            .or_else(|| {
+                s.hosts
+                    .iter()
+                    .find(|h| {
+                        h.is_dc
+                            && !h.hostname.is_empty()
+                            && h.hostname.to_lowercase().ends_with(&target_domain)
+                    })
+                    .map(|h| h.hostname.to_lowercase())
+            })
+            .unwrap_or_else(|| target_domain.clone());
 
         ares_llm::prompt::StateSnapshot {
             credentials,
@@ -82,6 +123,10 @@ impl SharedState {
                         .map(|s| s.to_lowercase())
                 })
                 .collect(),
+            target_domain,
+            target_dc_ip,
+            target_dc_fqdn,
+            listener_ip: std::env::var("ARES_LISTENER_IP").unwrap_or_default(),
         }
     }
 

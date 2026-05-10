@@ -1,33 +1,20 @@
 # Grafana MCP Integration for Ares
 
-This document describes how the Ares SOC agent uses Grafana MCP (Model Context
-Protocol) tools to query Loki datasources and investigate security incidents.
+How the Ares SOC agent uses Grafana MCP tools to query Loki and investigate incidents.
 
 ## Overview
 
-Ares blue team agents use Grafana MCP (Model Context Protocol) tools to query
-observability data during investigations. The tool registry at
-`ares-llm/src/tool_registry/blue/grafana.rs` defines individual tool
-definitions that wrap the native `mcp__grafana__*` tools. These enable:
-
-- Label discovery (finding available labels and their values)
-- Log volume statistics
-- LogQL queries for searching logs
-- Pre-built queries for common attack indicators
-
-## How Agents Use Grafana MCP
-
-Blue team agents interact with Grafana through two paths:
+Blue team agents query observability data through two paths:
 
 1. **Direct Loki/Prometheus tools** — `query_loki_logs`, `query_logs_around_timestamp`,
-   `execute_parallel_queries`, etc. These are defined in the tool registry and executed
-   via HTTP against the Loki/Prometheus APIs.
+   `execute_parallel_queries`, etc. Defined in `ares-llm/src/tool_registry/blue/grafana.rs`
+   and executed via HTTP against the Loki/Prometheus APIs.
 
-2. **Native MCP tools** — `mcp__grafana__*` tools provided by the Grafana MCP server.
-   These handle label discovery, log stats, dashboard access, and annotation management.
+2. **Native MCP tools** — `mcp__grafana__*` tools from the Grafana MCP server.
+   Used for label discovery, log stats, dashboard access, and annotation management.
 
-The tool descriptions include usage guidance so the LLM agent knows when to use
-each tool and how to construct efficient queries.
+Tool descriptions embed usage guidance directly so agents know when to use each
+tool and how to build efficient queries.
 
 ## Integration with Investigation Workflow
 
@@ -143,16 +130,14 @@ Grafana tools are registered in the blue team tool registry at
 `ares-llm/src/tool_registry/blue/grafana.rs`. The datasource UID defaults to
 `"loki"` and can be overridden via environment variables or the config file.
 
-## Benefits
+## Notes
 
-- **Guided Discovery**: Tool definitions include usage guidance to help the
-  LLM agent use the native MCP tools correctly
-- **Pre-built Queries**: Common security queries are provided for faster
-  investigation via detection templates
-- **Best Practices**: Tool descriptions include best practices like checking
-  stats before querying logs
-- **Flexibility**: Agents can use both MCP tools and direct Loki HTTP API calls
-- **Integration**: Works alongside the existing investigation workflow
+Tool descriptions embed usage guidance directly, so the agent knows to check
+label stats before issuing broad queries. Detection templates cover the most
+common attack patterns (credential dumping, lateral movement, Kerberoasting)
+so agents don't have to construct those queries from scratch. Both the native
+MCP tools and the direct Loki/Prometheus HTTP tools are available; agents pick
+whichever fits the query.
 
 ## Next Steps
 

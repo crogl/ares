@@ -19,6 +19,7 @@ pub mod lateral;
 pub mod parsers;
 pub mod privesc;
 pub mod recon;
+pub mod scope;
 
 use anyhow::Result;
 use serde_json::Value;
@@ -64,17 +65,17 @@ impl ToolOutput {
 
 /// Dispatch a tool call by name, executing the corresponding CLI command.
 ///
-/// Returns the tool output or an error if the tool is unknown or execution fails.
-///
-/// Validates that no credential argument carries a placeholder value before
-/// dispatching — a defense-in-depth backstop for the worker credential
-/// resolver that catches anything missed upstream (schema strip, prompt
-/// sanitization, worker resolver). See [`credentials::validate_arguments`].
+/// Returns the tool output or an error if the tool is unknown or execution
+/// fails. Validates that no credential argument carries a placeholder value
+/// (see [`credentials::validate_arguments`]) and that any `target` / `target_ip`
+/// IP is within the configured operation scope (see [`scope::validate_in_scope`])
+/// before any subprocess runs.
 pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> {
     credentials::validate_arguments(tool_name, arguments)?;
+    scope::validate_in_scope(tool_name, arguments)?;
 
     // Cap concurrent spider_plus dispatches process-wide to prevent the
-    // netexec fork-storm OOM observed on EC2 (bug_orch_oom_spider_plus.md).
+    // netexec fork-storm OOM observed on EC2.
     // The permit is held for the duration of the tool execution and dropped
     // when this function returns.
     let _spider_permit = if concurrency::is_spider_plus_tool(tool_name) {

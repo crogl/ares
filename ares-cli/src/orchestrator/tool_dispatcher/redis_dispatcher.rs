@@ -1,9 +1,19 @@
-//! Redis-backed tool dispatcher.
+//! NATS-backed tool dispatcher.
+//!
+//! Each tool call becomes a NATS request to `ares.tools.exec.{role}` with
+//! an auto-generated reply inbox; the worker subscribes to that subject as
+//! a queue group and replies on the inbox. This replaces the old Redis
+//! BRPOP pattern, eliminating the dedicated-connection-per-waiter
+//! requirement (a single multiplexed NATS connection handles arbitrary
+//! concurrent request/reply pairs).
+
+use std::time::Duration;
 
 use anyhow::{Context, Result};
-use redis::AsyncCommands;
+use bytes::Bytes;
 use tracing::{debug, warn, Instrument};
 
+use ares_core::nats;
 use ares_core::telemetry::propagation::inject_traceparent;
 use ares_core::telemetry::spans::{producer_span, Team};
 use ares_llm::{ToolCall, ToolExecResult};
@@ -14,10 +24,10 @@ use crate::orchestrator::task_queue::TaskQueue;
 use super::domain_validator::check_domain_arg;
 use super::{
     extract_credential_key, inject_excluded_users, push_realtime_discoveries, AuthThrottle,
-    ToolExecRequest, ToolExecResponse, RESULT_TTL_SECS, TOOL_EXEC_PREFIX, TOOL_RESULT_PREFIX,
+    ToolExecRequest, ToolExecResponse,
 };
 
-/// Dispatches tool calls to workers via Redis queues.
+/// Dispatches tool calls to workers via NATS request/reply.
 ///
 /// When tool results contain structured discoveries (hosts, credentials, etc.),
 /// they are pushed to the `ares:discoveries:{op_id}` list for real-time
@@ -25,7 +35,7 @@ use super::{
 /// immediately rather than waiting for the task result consumer.
 pub struct RedisToolDispatcher {
     pub(super) queue: TaskQueue,
-    pub(super) tool_timeout: std::time::Duration,
+    pub(super) tool_timeout: Duration,
     pub(super) operation_id: String,
     pub(super) auth_throttle: AuthThrottle,
     pub(super) state: Option<SharedState>,
@@ -35,7 +45,7 @@ impl RedisToolDispatcher {
     pub fn new(queue: TaskQueue, operation_id: String, auth_throttle: AuthThrottle) -> Self {
         Self {
             queue,
-            tool_timeout: std::time::Duration::from_secs(super::DEFAULT_TOOL_TIMEOUT_SECS),
+            tool_timeout: Duration::from_secs(super::DEFAULT_TOOL_TIMEOUT_SECS),
             operation_id,
             auth_throttle,
             state: None,
@@ -47,6 +57,68 @@ impl RedisToolDispatcher {
     pub fn with_state(mut self, state: SharedState) -> Self {
         self.state = Some(state);
         self
+    }
+}
+
+/// Synthetic ToolExecResult returned when the NATS request itself fails
+/// (broker disconnect, no responders, etc.). Free function so the wording
+/// is testable and stays in lock-step with the agent-facing error message.
+pub(super) fn dispatch_error_result(
+    tool_name: &str,
+    err: impl std::fmt::Display,
+) -> ToolExecResult {
+    ToolExecResult {
+        output: String::new(),
+        error: Some(format!("Tool '{tool_name}' dispatch error: {err}")),
+        discoveries: None,
+    }
+}
+
+/// Synthetic ToolExecResult returned when the request times out waiting for
+/// a worker to reply.
+pub(super) fn dispatch_timeout_result(tool_name: &str, timeout: Duration) -> ToolExecResult {
+    ToolExecResult {
+        output: String::new(),
+        error: Some(format!(
+            "Tool '{tool_name}' timed out after {}s",
+            timeout.as_secs()
+        )),
+        discoveries: None,
+    }
+}
+
+/// Per-call request id for correlating worker replies with outstanding calls.
+pub(super) fn build_call_id(tool_name: &str) -> String {
+    format!("{tool_name}_{}", uuid::Uuid::new_v4().simple())
+}
+
+/// Build the wire request that `dispatch_tool` sends to the worker. Pulled
+/// out so the request shape can be unit-tested without a NATS broker.
+pub(super) fn build_tool_exec_request(
+    call_id: String,
+    task_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    traceparent: Option<String>,
+    operation_id: Option<String>,
+) -> ToolExecRequest {
+    ToolExecRequest {
+        call_id,
+        task_id: task_id.to_string(),
+        tool_name: tool_name.to_string(),
+        arguments,
+        traceparent,
+        operation_id,
+    }
+}
+
+/// Convert a deserialized worker reply into the [`ToolExecResult`] returned
+/// to the LLM agent loop.
+pub(super) fn tool_exec_result_from_response(response: ToolExecResponse) -> ToolExecResult {
+    ToolExecResult {
+        output: response.output,
+        error: response.error,
+        discoveries: response.discoveries,
     }
 }
 
@@ -70,9 +142,7 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
             // Reject calls whose `domain` argument doesn't match a known
             // domain — catches LLM typos before they pollute credential
             // records or misroute downstream tooling.
-            if let Some(rejection) =
-                check_domain_arg(&self.queue, &self.operation_id, call).await
-            {
+            if let Some(rejection) = check_domain_arg(&self.queue, &self.operation_id, call).await {
                 return Ok(rejection);
             }
 
@@ -87,119 +157,91 @@ impl ares_llm::ToolDispatcher for RedisToolDispatcher {
             let mut arguments = call.arguments.clone();
             inject_excluded_users(&self.state, &call.name, &mut arguments).await;
 
-            let call_id = format!("{}_{}", call.name, uuid::Uuid::new_v4().simple());
+            let call_id = build_call_id(&call.name);
 
             // Inject trace context for cross-service span linking
             let traceparent = inject_traceparent(&tracing::Span::current());
 
-            let request = ToolExecRequest {
-                call_id: call_id.clone(),
-                task_id: task_id.to_string(),
-                tool_name: call.name.clone(),
+            let request = build_tool_exec_request(
+                call_id.clone(),
+                task_id,
+                &call.name,
                 arguments,
                 traceparent,
-                operation_id: Some(self.operation_id.clone()),
-            };
+                Some(self.operation_id.clone()),
+            );
 
-            let queue_key = format!("{TOOL_EXEC_PREFIX}:{effective_role}");
-            let result_key = format!("{TOOL_RESULT_PREFIX}:{call_id}");
+            let subject = nats::tool_exec_subject(effective_role);
             let payload =
-                serde_json::to_string(&request).context("Failed to serialize tool exec request")?;
+                serde_json::to_vec(&request).context("Failed to serialize tool exec request")?;
 
             debug!(
                 tool = %call.name,
                 call_id = %call_id,
-                queue = %queue_key,
+                subject = %subject,
                 effective_role = %effective_role,
                 "Dispatching tool call to worker"
             );
 
-            // Push request to worker queue (shared multiplexed connection is fine for LPUSH)
-            let mut conn = self.queue.connection();
-            conn.lpush::<_, _, ()>(&queue_key, &payload)
-                .await
-                .context("Failed to push tool exec request to Redis")?;
+            let nats = self
+                .queue
+                .nats_broker()
+                .context("ToolDispatcher requires NATS broker")?;
+            let client = nats.client().clone();
 
-            // BRPOP needs a dedicated connection: it blocks its TCP connection
-            // until a result arrives, so a shared multiplexed connection would
-            // serialize all concurrent agent loops behind one waiter.
-            let timeout_secs = self.tool_timeout.as_secs().max(1) as f64;
-            let brpop_result: Option<(String, String)> = match self.queue.dedicated_connection().await {
-                Ok(mut dedicated) => {
-                    redis::cmd("BRPOP")
-                        .arg(&result_key)
-                        .arg(timeout_secs)
-                        .query_async(&mut dedicated)
-                        .await
-                        .context("BRPOP failed for tool result")?
-                }
-                Err(e) => {
-                    // Fall back to shared connection if dedicated fails
-                    warn!(err = %e, "Failed to open dedicated BRPOP connection, falling back to shared");
-                    redis::cmd("BRPOP")
-                        .arg(&result_key)
-                        .arg(timeout_secs)
-                        .query_async(&mut conn)
-                        .await
-                        .context("BRPOP failed for tool result")?
-                }
-            };
-
-            match brpop_result {
-                Some((_key, value)) => {
-                    let response: ToolExecResponse = serde_json::from_str(&value)
-                        .context("Failed to deserialize tool exec response")?;
-
-                    debug!(
-                        tool = %call.name,
-                        call_id = %call_id,
-                        has_error = response.error.is_some(),
-                        "Tool result received"
-                    );
-
-                    // Push discoveries to the real-time discovery list so
-                    // the discovery poller publishes them to state immediately,
-                    // independent of the task result consumer.
-                    if let Some(ref disc) = response.discoveries {
-                        push_realtime_discoveries(
-                            &self.queue,
-                            &self.operation_id,
-                            disc,
-                            &call.name,
-                            &call.arguments,
-                        )
-                        .await;
-                    }
-
-                    Ok(ToolExecResult {
-                        output: response.output,
-                        error: response.error,
-                        discoveries: response.discoveries,
-                    })
-                }
-                None => {
+            let timeout = self.tool_timeout;
+            let response_msg = match tokio::time::timeout(
+                timeout,
+                client.request(subject.clone(), Bytes::from(payload)),
+            )
+            .await
+            {
+                Ok(Ok(msg)) => msg,
+                Ok(Err(e)) => {
                     warn!(
                         tool = %call.name,
                         call_id = %call_id,
-                        timeout_secs = timeout_secs,
+                        err = %e,
+                        "NATS request failed"
+                    );
+                    return Ok(dispatch_error_result(&call.name, e));
+                }
+                Err(_) => {
+                    warn!(
+                        tool = %call.name,
+                        call_id = %call_id,
+                        timeout_secs = timeout.as_secs(),
                         "Tool execution timed out"
                     );
-
-                    // Clean up any late result
-                    let _: Result<(), _> = conn
-                        .expire::<_, ()>(&result_key, RESULT_TTL_SECS as i64)
-                        .await;
-
-                    Ok(ToolExecResult {
-                        output: String::new(),
-                        error: Some(format!(
-                            "Tool '{}' timed out after {timeout_secs}s",
-                            call.name
-                        )),
-                        discoveries: None,
-                    })
+                    return Ok(dispatch_timeout_result(&call.name, timeout));
                 }
+            };
+
+            let response: ToolExecResponse = serde_json::from_slice(&response_msg.payload)
+                .context("Failed to deserialize tool exec response")?;
+
+            debug!(
+                tool = %call.name,
+                call_id = %call_id,
+                has_error = response.error.is_some(),
+                "Tool result received"
+            );
+
+            // Push discoveries to the real-time discovery list so the
+            // discovery poller publishes them to state immediately,
+            // independent of the task result consumer.
+            if let Some(ref disc) = response.discoveries {
+                push_realtime_discoveries(
+                    &self.queue,
+                    &self.operation_id,
+                    disc,
+                    &call.name,
+                    &call.arguments,
+                )
+                .await;
             }
+
+            Ok(tool_exec_result_from_response(response))
         }
         .instrument(span)
         .await

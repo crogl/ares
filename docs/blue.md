@@ -8,16 +8,15 @@ findings to MITRE ATT&CK, and writes investigation reports.
 
 **Key Capabilities:**
 
-- Automated alert triage and investigation
-- Multi-stage investigation workflow (triage → causation → lateral → synthesis)
-- Intelligent query optimization and rate limiting
+- Alert triage and multi-stage investigation (triage → causation → lateral → synthesis)
+- LogQL/PromQL query optimization with rate limiting and retry
 - Evidence extraction using the Pyramid of Pain framework
 - MITRE ATT&CK technique mapping and gap analysis
 - Lateral movement detection and scope expansion
 - Attack precursor identification (root cause analysis)
-- Learning from historical investigations
-- Red-Blue correlation for detection gap analysis
-- Comprehensive markdown report generation
+- Historical investigation store for pattern matching and false-positive tracking
+- Red-Blue correlation to surface detection gaps
+- Markdown report generation with timeline, evidence inventory, and recommendations
 
 ## Core Architecture
 
@@ -34,7 +33,7 @@ The investigation orchestrator manages the full investigation lifecycle:
 - Chains follow-up investigations based on discovered evidence types
 - Enforces hard timeout watchdog (1 min/step + 2 min buffer)
 - Generates partial reports on timeout
-- Handles investigation state persistence via Redis
+- Handles investigation state persistence via Redis (task queues run on NATS JetStream)
 
 #### Blue Worker Task Loop
 
@@ -832,7 +831,7 @@ task red:ec2:multi TARGET=dreadgoad DOMAIN=contoso.local BLUE_ENABLED=1
 The **Ares Blue Agent** handles autonomous SOC investigation:
 
 1. Picks up alerts from Grafana
-2. Queries Loki and Prometheus with intelligent rate limiting
+2. Queries Loki and Prometheus with rate limiting and retry
 3. Extracts evidence using the Pyramid of Pain framework
 4. Maps to MITRE ATT&CK for tactical context and gap analysis
 5. Identifies attack precursors to build complete attack chains
@@ -843,5 +842,5 @@ The **Ares Blue Agent** handles autonomous SOC investigation:
 10. Posts annotations back to Grafana
 
 The blue agent cuts investigation time by automating the triage-to-report
-pipeline, and the Red-Blue correlation loop surfaces detection gaps that
+pipeline. The Red-Blue correlation loop surfaces detection gaps that
 manual review tends to miss.

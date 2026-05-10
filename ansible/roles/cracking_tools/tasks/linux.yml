@@ -107,6 +107,7 @@
 
 - name: Dump DKMS make.log on failure
   ansible.builtin.shell: |
+    set -o pipefail
     set +e
     for f in /var/lib/dkms/nvidia/*/build/make.log; do
       echo "==== $f ===="

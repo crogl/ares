@@ -71,6 +71,28 @@ fn ntlm_dedup_key_part(hash_value: &str) -> &str {
     }
 }
 
+/// Parse an NTLM dedup key back into `(domain, user, hash_prefix)`.
+///
+/// The key format is `ntlm:{domain}:{user}:{hash_prefix}`. The domain segment
+/// may be empty (when no prefix was attributed). User and hash prefix never
+/// contain `:` after lowercase/trim, so a right-anchored split is unambiguous.
+///
+/// Used by the hash store to collapse qualified vs unqualified domain
+/// duplicates at insert time — e.g. `DC01$` (empty domain) and
+/// `contoso.local\DC01$` (qualified) both reach the store as separate
+/// fields, but represent the same secret.
+pub fn parse_ntlm_dedup_key(field: &str) -> Option<(&str, &str, &str)> {
+    let rest = field.strip_prefix("ntlm:")?;
+    let mut iter = rest.rsplitn(3, ':');
+    let hash_prefix = iter.next()?;
+    let user = iter.next()?;
+    let domain = iter.next()?;
+    if user.is_empty() || hash_prefix.is_empty() {
+        return None;
+    }
+    Some((domain, user, hash_prefix))
+}
+
 /// Extract SPN and encryption type from a Kerberoast hash for deduplication.
 ///
 /// Hash format: `$krb5tgs$ETYPE$*user$realm$spn*$checksum$encrypted`
@@ -316,5 +338,46 @@ mod tests {
     #[test]
     fn extract_kerberoast_spn_key_too_few_parts() {
         assert!(extract_kerberoast_spn_key("$krb5tgs$").is_none());
+    }
+
+    // ─── parse_ntlm_dedup_key ────────────────────────────────────────────
+
+    #[test]
+    fn parse_ntlm_dedup_key_qualified() {
+        let h = make_hash(
+            "DC01$",
+            "contoso.local",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:a3f11b5a18f97db9",
+        );
+        let key = build_hash_dedup_key(&h);
+        let (domain, user, hash_prefix) = parse_ntlm_dedup_key(&key).unwrap();
+        assert_eq!(domain, "contoso.local");
+        assert_eq!(user, "dc01$");
+        // NT half is used for dedup — the LM half is always the empty
+        // placeholder `aad3b435b51404eeaad3b435b51404ee` and would collapse
+        // every user's hashes into one slot.
+        assert_eq!(hash_prefix, "a3f11b5a18f97db9");
+    }
+
+    #[test]
+    fn parse_ntlm_dedup_key_empty_domain() {
+        let h = make_hash(
+            "Administrator",
+            "",
+            "NTLM",
+            "aad3b435b51404eeaad3b435b51404ee:2e993405ab82e445",
+        );
+        let key = build_hash_dedup_key(&h);
+        let (domain, user, hash_prefix) = parse_ntlm_dedup_key(&key).unwrap();
+        assert_eq!(domain, "");
+        assert_eq!(user, "administrator");
+        assert_eq!(hash_prefix, "2e993405ab82e445");
+    }
+
+    #[test]
+    fn parse_ntlm_dedup_key_rejects_non_ntlm() {
+        assert!(parse_ntlm_dedup_key("asrep:contoso.local:jsmith").is_none());
+        assert!(parse_ntlm_dedup_key("krb:contoso.local:svc_sql:23:cifs/dc01").is_none());
     }
 }

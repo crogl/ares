@@ -1,9 +1,9 @@
 # Ares Blue Triage Agent Warp Gate Template
 
 This template builds **Ares Blue Triage Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The triage agent performs initial
-incident assessment and alerting using a compiled Rust binary with embedded Python and
-Grafana MCP integration.
+building **Docker images** (for `amd64` and `arm64`). The triage agent handles
+initial alert assessment and IOC extraction, using a compiled Rust binary with
+embedded Python and Grafana MCP integration.
 
 ---
 
@@ -59,6 +59,7 @@ After building the image, you can test it locally:
 # Run the agent container interactively
 docker run -it --rm \
   -e REDIS_URL="redis://localhost:6379" \
+  -e NATS_URL="nats://localhost:4222" \
   -e ANTHROPIC_API_KEY="your-api-key" \
   ares-blue-triage-agent:latest
 

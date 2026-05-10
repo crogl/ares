@@ -364,10 +364,7 @@ pub(crate) fn extract_locked_usernames_from_result(
 /// because LLM summary text frequently contains `word:` tokens that are
 /// not principals (e.g. `Notable:`, `username_as_password:`).
 fn parse_lockout_principal(line: &str) -> Option<(String, Option<String>)> {
-    let marker_pos = LOCKOUT_PATTERNS
-        .iter()
-        .filter_map(|p| line.find(p))
-        .min()?;
+    let marker_pos = LOCKOUT_PATTERNS.iter().filter_map(|p| line.find(p)).min()?;
     let prefix = &line[..marker_pos];
     let token = prefix
         .split_whitespace()

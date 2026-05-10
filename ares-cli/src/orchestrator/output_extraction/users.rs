@@ -6,6 +6,34 @@ use ares_core::models::User;
 static RE_DOMAIN_CONTEXT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\(domain:([^)]+)\)").unwrap());
 
+static RE_NAME_CONTEXT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\(name:([^)]+)\)").unwrap());
+
+/// True when a `(domain:Y)` value paired with `(name:X)` on an SMB banner line
+/// is a workgroup or self-named pseudo-domain rather than a real Kerberos
+/// realm. Mirrors the heuristic in `ares-tools::parsers::smb` — kept local to
+/// avoid a cross-crate dep just for one helper. Non-domain-joined Windows
+/// hosts emit `(domain:WORKGROUP)` or `(domain:WIN-XXX.AUTOGEN.LOCAL)` where
+/// the first label of the domain is the host's own NetBIOS name; pinning
+/// `current_domain` to that string later attributes extracted users (and any
+/// hashes that get tagged from this context) to a phantom AD domain.
+fn is_workgroup_domain(name: &str, domain: &str) -> bool {
+    let domain = domain.trim().trim_end_matches('.');
+    if domain.is_empty() {
+        return false;
+    }
+    if domain.eq_ignore_ascii_case("WORKGROUP") || domain.eq_ignore_ascii_case("MSHOME") {
+        return true;
+    }
+    if !name.is_empty() {
+        let first_label = domain.split('.').next().unwrap_or("");
+        if first_label.eq_ignore_ascii_case(name) {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) static RE_DOMAIN_BACKSLASH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"([A-Za-z0-9_.\-]+)\\([A-Za-z0-9_.\-$]+)").unwrap());
 
@@ -98,16 +126,22 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
         let stripped = line.trim();
 
         if let Some(caps) = RE_DOMAIN_CONTEXT.captures(stripped) {
-            let captured = caps
+            let candidate = caps
                 .get(1)
                 .unwrap()
                 .as_str()
                 .trim_end_matches('.')
                 .to_string();
-            // Don't let machine hostnames (e.g. from Kali's own SMB banner)
-            // override the task's default domain.
-            if !is_machine_hostname_domain(&captured) {
-                current_domain = captured;
+            let line_name = RE_NAME_CONTEXT
+                .captures(stripped)
+                .map(|c| c.get(1).unwrap().as_str().trim().to_string())
+                .unwrap_or_default();
+            // Don't let machine hostnames (Kali's own SMB banner) or workgroup
+            // self-named pseudo-domains override the task's default domain.
+            if !is_machine_hostname_domain(&candidate)
+                && !is_workgroup_domain(&line_name, &candidate)
+            {
+                current_domain = candidate;
             }
         }
 
@@ -243,8 +277,6 @@ mod tests {
         assert!(extract_users("", "contoso.local").is_empty());
     }
 
-    // --- is_machine_hostname_domain ---
-
     #[test]
     fn machine_hostname_win_prefix() {
         assert!(is_machine_hostname_domain("WIN-G7FPA5ZZXZV"));
@@ -260,7 +292,7 @@ mod tests {
     #[test]
     fn machine_hostname_desktop_prefix() {
         assert!(is_machine_hostname_domain("DESKTOP-ABC1234"));
-        assert!(is_machine_hostname_domain("desktop-xyz.corp.local"));
+        assert!(is_machine_hostname_domain("desktop-xyz.fabrikam.local"));
     }
 
     #[test]
@@ -271,11 +303,8 @@ mod tests {
         assert!(!is_machine_hostname_domain("CHILD"));
     }
 
-    // --- extract_users with machine hostname filtering ---
-
     #[test]
     fn extract_users_smb_banner_machine_domain_ignored() {
-        // SMB banner with Kali machine domain should not override default_domain
         let output = concat!(
             "SMB  192.168.58.10  445  DC01  (domain:WIN-G7FPA5ZZXZV) ...\n",
             "user:[jdoe] rid:[0x44e]\n",
@@ -283,13 +312,11 @@ mod tests {
         let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].username, "jdoe");
-        // Should use default_domain, not the machine hostname
         assert_eq!(users[0].domain, "contoso.local");
     }
 
     #[test]
     fn extract_users_upn_machine_domain_substituted() {
-        // UPN with machine FQDN should substitute default_domain
         let output = "jdoe@win-g7fpa5zzxzv.w5an.local\n";
         let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
@@ -299,10 +326,52 @@ mod tests {
 
     #[test]
     fn extract_users_real_upn_preserved() {
-        // Real UPN should keep its domain
         let output = "jdoe@contoso.local\n";
         let users = extract_users(output, "contoso.local");
         assert_eq!(users.len(), 1);
         assert_eq!(users[0].domain, "contoso.local");
+    }
+
+    #[test]
+    fn extract_users_ignores_workgroup_domain_context() {
+        // SMB banner from a non-domain-joined host (the attacker's own kali
+        // box) appears in the same enumeration output as a real target. The
+        // workgroup `(domain:WIN-ABCDEFGHIJK.WGRP.LOCAL)` must NOT overwrite
+        // `current_domain`, so the user extracted on the next line stays
+        // attributed to the operator's intended `default_domain` rather than
+        // a phantom AD realm.
+        let output = "\
+SMB  192.168.58.178  445  WIN-ABCDEFGHIJK  [*] Windows 10 (name:WIN-ABCDEFGHIJK) (domain:WIN-ABCDEFGHIJK.WGRP.LOCAL) (signing:False)
+SMB  192.168.58.178  445  WIN-ABCDEFGHIJK  [+] user:[svc_local]";
+        let users = extract_users(output, "contoso.local");
+        let svc = users
+            .iter()
+            .find(|u| u.username == "svc_local")
+            .expect("svc_local should be extracted");
+        assert_eq!(
+            svc.domain, "contoso.local",
+            "workgroup banner must not overwrite default_domain"
+        );
+    }
+
+    #[test]
+    fn extract_users_keeps_real_domain_context() {
+        let output = "\
+SMB  192.168.58.10  445  DC01  [*] Windows Server 2019 (name:DC01) (domain:contoso.local) (signing:True)
+SMB  192.168.58.10  445  DC01  [+] user:[alice]";
+        let users = extract_users(output, "");
+        let alice = users.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(alice.domain, "contoso.local");
+    }
+
+    #[test]
+    fn is_workgroup_domain_detects_self_named() {
+        assert!(is_workgroup_domain(
+            "WIN-ABCDEFGHIJK",
+            "WIN-ABCDEFGHIJK.WGRP.LOCAL"
+        ));
+        assert!(is_workgroup_domain("anything", "WORKGROUP"));
+        assert!(!is_workgroup_domain("DC01", "contoso.local"));
+        assert!(!is_workgroup_domain("DC01", ""));
     }
 }

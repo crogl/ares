@@ -31,7 +31,7 @@ jobs:
     name: 🚨 Semgrep Analysis
     runs-on: ubuntu-latest
     container:
-      image: returntocorp/semgrep@sha256:a3d49dc967b8534a6a76628e50c51cbfe33eb7195dc2feab1fdc0f100852c8ef
+      image: returntocorp/semgrep@sha256:326e5f41cc972bb423b764a14febbb62bbad29ee1c01820805d077dd868fea48
 
     # Skip any PR created by dependabot to avoid permission issues:
     if: (github.actor != 'dependabot[bot]')
@@ -65,7 +65,7 @@ jobs:
 
       - name: Upload SARIF to GitHub Security tab
         if: always()
-        uses: github/codeql-action/upload-sarif@fca7ace96b7d713c7035871441bd52efbe39e27e # v3.28.19
+        uses: github/codeql-action/upload-sarif@e46ed2cbd01164d986452f91f178727624ae40d7 # v4.35.3
         with:
           sarif_file: semgrep-results.sarif
         env:

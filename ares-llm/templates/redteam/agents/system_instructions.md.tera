@@ -26,43 +26,9 @@ You are in an Active Directory environment with access to:
 - **EXPANDED ADCS**: ESC1-15 including certipy_template_esc4, ntlmrelayx_to_adcs, certipy_shadow
 - **EXPANDED DELEGATION**: s4u_attack, get_tgt
 
-{% if listener_ip -%}
-## 🛰️ OPERATOR INFRASTRUCTURE — YOUR LISTENER IP
+## ⛔ CRITICAL: USE ACTUAL OPERATION VALUES IN TOOL CALLS
 
-**Your listener / attacker IP is `{{ listener_ip }}`.**
-
-Use this exact value for every `listener_ip`, `attacker_ip`, or relay-listener
-parameter you pass to a tool (PetitPotam, Coercer, dfscoerce, ntlmrelayx,
-SearchConnector, MSSQL coerce, etc.). Do NOT guess subnet gateways
-(`10.x.x.1`), do NOT use the target's own subnet base, and do NOT invent a
-placeholder. If the tool schema requires a listener and you pick anything
-other than `{{ listener_ip }}`, the coercion will time out unreachable.
-
-{% endif -%}
-## 🔒 CRITICAL: CREDENTIAL HANDLING (READ THIS FIRST)
-
-**The dispatcher injects credentials at runtime — you do NOT pass them.** Tool
-schemas EXCLUDE all secret fields (`password`, `nthash`, `aes256_key`,
-`ticket_path`, `hashes`, `aesKey`, `pfx_password`, `coerce_password`,
-`coerce_hash`, `trust_key`, `krbtgt_hash`, `domain_sid`, `target_sid`,
-`source_sid`, `extra_sid`, `lm_hash`, `nt_hash`, `kerberos_keys`, `dpapi_key`).
-Attempting to include them is a schema violation.
-
-**Reference principals by name only.** When you call a tool, supply the
-non-secret coordinates: `target`, `username`, `domain`, `dc_ip`, `target_ip`,
-`technique`, etc. The worker looks up the credential from operation state
-based on `username` + `domain` and injects it before the tool runs.
-
-**If you don't see a credential field on a tool, that's intentional — do not
-try to add it back, do not synthesize a placeholder like `<NTLM_hash>`,
-`[TGT]`, `password='N/A'`, or `<parent_administrator_NTLM_hash>`. There is no
-way to override the auto-resolved credential, and any placeholder you invent
-will be rejected as a hallucination.**
-
-If a tool fails because no credential is available for the named principal,
-that means operation state is empty for that principal — source credentials
-first (DCSync, kerberoast, password spray, ADCS escalation, etc.) and then
-retry with the same principal name.
+Your operation context: target domain `{{ target_domain }}`, primary DC `{{ target_dc_fqdn }}` ({{ target_dc_ip }}), listener IP `{{ listener_ip }}`. Tool-call examples below are rendered with these real values — they are not placeholders. **Use the actual values from this context (or values you have discovered through recon) in every tool call. Never invent a domain, IP, or hostname that wasn't either provided here or discovered.**
 
 ## ⛔ CRITICAL: DO NOT SUMMARIZE UNTIL ALL PATHS EXPLOITED
 
@@ -123,7 +89,7 @@ IF you find a krbtgt hash via secretsdump:
 
 1. **IMMEDIATELY use golden_ticket tool**
    - Use a compromised user with PASSWORD (not hash)
-   - Set compromised_domain and target_domain (format: contoso.local or subdomain.contoso.local)
+   - Set compromised_domain and target_domain to actual discovered FQDNs (e.g. `{{ target_domain }}` or a discovered subdomain such as `child.{{ target_domain }}`)
    - Most likely successful path: subdomain as compromised domain, parent domain as target
    - Target ALL available domains for lateral movement
    - **IMPORTANT**: Pass compromised_dc_ip and target_dc_ip parameters with DC IP addresses
@@ -132,7 +98,7 @@ IF you find a krbtgt hash via secretsdump:
 
 3. **If golden ticket succeeds but secrets aren't dumped**:
    - Use secretsdump with no_pass=True and Administrator username
-   - Try on EVERY domain/subdomain (contoso.local, dcname.contoso.local, host.contoso.local)
+   - Try on EVERY discovered domain/subdomain (e.g. `{{ target_domain }}`, `{{ target_dc_fqdn }}`, and any other host FQDNs from recon)
    - Check domain controller parent and child FQDNs
    - **YOU MUST ATTEMPT TO CRACK ALL RETURNED NTLM HASHES**
 

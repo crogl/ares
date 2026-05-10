@@ -1,8 +1,9 @@
 # Ares Blue Agent Warp Gate Template
 
 This template builds **Ares Blue Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The blue team agent performs
-defensive security operations using a compiled Rust binary with embedded Python.
+building **Docker images** (for `amd64` and `arm64`). The blue agent runs SOC
+investigations — querying Loki/Prometheus, mapping findings to MITRE ATT&CK,
+and writing reports — using a compiled Rust binary with embedded Python.
 
 ---
 
@@ -58,6 +59,7 @@ After building the image, you can test it locally:
 # Run the agent container interactively
 docker run -it --rm \
   -e REDIS_URL="redis://localhost:6379" \
+  -e NATS_URL="nats://localhost:4222" \
   -e ANTHROPIC_API_KEY="your-api-key" \
   ares-blue-agent:latest
 

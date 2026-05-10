@@ -1,10 +1,9 @@
 # Ares Recon Agent Warp Gate Template
 
 This template builds **Ares Recon Agent** images using Warp Gate. It supports
-building **Docker images** (for `amd64` and `arm64`). The build provisions
-comprehensive network reconnaissance and Active Directory enumeration tools
-using Ansible roles from the nimbus_range collection, plus a compiled Rust
-worker binary with embedded Python.
+building **Docker images** (for `amd64` and `arm64`). The build installs
+network reconnaissance and Active Directory enumeration tools via Ansible roles
+from the nimbus_range collection, plus a compiled Rust worker binary.
 
 ---
 
