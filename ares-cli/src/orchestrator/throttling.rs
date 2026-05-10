@@ -21,6 +21,13 @@ use crate::orchestrator::routing::ActiveTaskTracker;
 const CRITICAL_PATH_TASK_TYPES: &[&str] = &["exploit"];
 
 /// High-value exploit subtypes that bypass hard cap.
+///
+/// Forest-pivot vulns (`forest_trust_escalation`, `child_to_parent`) are the
+/// only path off the source forest; if they get parked in the deferred queue
+/// behind ordinary recon/exploit work and stale-evict before running, the op
+/// stalls in a single forest with no signal to the operator. Treat them as
+/// critical-path so the throttler routes them straight to dispatch even when
+/// the LLM concurrency cap is saturated.
 const CRITICAL_PATH_VULN_TYPES: &[&str] = &[
     "constrained_delegation",
     "unconstrained_delegation",
@@ -31,6 +38,8 @@ const CRITICAL_PATH_VULN_TYPES: &[&str] = &[
     "adcs_esc1",
     "adcs_esc4",
     "adcs_esc8",
+    "forest_trust_escalation",
+    "child_to_parent",
 ];
 
 /// Maximum tasks allowed to bypass the hard cap simultaneously.
@@ -423,6 +432,32 @@ mod tests {
             t.check("coercion", "coercion", Some(&payload)).await,
             ThrottleDecision::Allow
         );
+    }
+
+    #[tokio::test]
+    async fn critical_path_forest_trust_escalation_bypasses_hard_cap() {
+        // Forest pivot vulns must not be parked behind ordinary recon work —
+        // they're the only path off the source forest.
+        let (t, tracker) = make_throttler(2);
+        for i in 0..3 {
+            tracker
+                .add(ActiveTask {
+                    task_id: format!("t{i}"),
+                    task_type: "recon".into(),
+                    role: "recon".into(),
+                    submitted_at: Instant::now(),
+                    credential_key: None,
+                })
+                .await;
+        }
+        for vt in ["forest_trust_escalation", "child_to_parent"] {
+            let payload = json!({"vuln_type": vt});
+            assert_eq!(
+                t.check("exploit", "privesc", Some(&payload)).await,
+                ThrottleDecision::Allow,
+                "{vt} should bypass hard cap"
+            );
+        }
     }
 
     #[tokio::test]

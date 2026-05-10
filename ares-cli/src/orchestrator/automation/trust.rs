@@ -1591,22 +1591,26 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // Admins SID (RID 519) as ExtraSid; without it the parent KDC
             // issues a TGS but DRSUAPI on the parent DC rejects the
             // replication call as `rpc_s_access_denied` and nxc dumps zero
-            // hashes (exit 0, hiding the failure).
+            // hashes (exit 0, hiding the failure). For child→parent the SID
+            // resolution is a hard precondition — defer dispatch when it
+            // fails so the next 30s tick can retry.
             //
-            // For cross-forest forges, the target domain SID is required for
-            // ticketer.py to build a PAC the target KDC will accept (without
-            // it the inter-realm TGT is rejected and forge_inter_realm_and_dump
-            // returns 0 hashes, locking dedup permanently). Resolve the target
-            // SID on-demand via lookupsid against the target DC using source
-            // admin creds (cross-trust SAMR works post-DA) when it isn't
-            // cached. Defer dispatch (no dedup mark) when resolution fails so
-            // the next 30s tick can retry once sid_enumeration populates it
-            // via lsaquery.
+            // For cross-forest forges, the target domain SID is NOT required
+            // by `forge_inter_realm_and_dump` — the tool reads `target_sid`
+            // into a discarded `_target_sid` (see ares-tools/src/privesc/
+            // trust.rs: "currently unused by ticketer; accepted for API
+            // parity"). Gating cross-forest dispatch on a SAMR lookupsid
+            // call against the target DC was a phantom requirement that
+            // also tends to fail (we have no target-realm creds yet —
+            // that's the whole point of the forge), parking the work
+            // indefinitely on the deferred queue. Cross-forest now passes
+            // the cached SID through if known but never blocks on it.
             let source_l = item.source_domain.to_lowercase();
             let target_l = item.target_domain.to_lowercase();
             let is_child_to_parent =
                 source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
-            let needs_target_sid = source_l != target_l;
+            let is_cross_domain = source_l != target_l;
+            let needs_target_sid = is_child_to_parent;
             let target_domain_sid: Option<String> =
                 if !needs_target_sid || item.target_domain_sid.is_some() {
                     item.target_domain_sid.clone()
@@ -1642,15 +1646,10 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     )
                     .await;
                     if let Some((sid, admin_name)) = resolved {
-                        let label = if is_child_to_parent {
-                            "Resolved parent domain SID for child→parent forge ExtraSid"
-                        } else {
-                            "Resolved target domain SID for cross-forest forge"
-                        };
                         info!(
                             target_domain = %item.target_domain,
                             sid = %sid,
-                            "{}", label
+                            "Resolved parent domain SID for child→parent forge ExtraSid"
                         );
                         let op_id = { dispatcher.state.read().await.operation_id.clone() };
                         let reader = ares_core::state::RedisStateReader::new(op_id);
@@ -1669,16 +1668,11 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                         }
                         Some(sid)
                     } else {
-                        let label = if is_child_to_parent {
-                            "Could not resolve parent SID — deferring child→parent forge"
-                        } else {
-                            "Could not resolve target SID — deferring cross-forest forge"
-                        };
                         warn!(
                             source = %item.source_domain,
                             target = %item.target_domain,
                             target_dc_ip = %target_dc_ip,
-                            "{}", label
+                            "Could not resolve parent SID — deferring child→parent forge"
                         );
                         None
                     }
@@ -1699,7 +1693,7 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             // second secretsdump can land. After that, dispatch with NTLM-only
             // as a last resort (some target DCs accept RC4 still, and the
             // wake_cross_forest_fallbacks path is the real safety net).
-            let resolved_aes_key: Option<String> = if needs_target_sid {
+            let resolved_aes_key: Option<String> = if is_cross_domain {
                 let from_state = {
                     let s = dispatcher.state.read().await;
                     s.hashes
