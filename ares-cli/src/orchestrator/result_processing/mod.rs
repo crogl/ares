@@ -759,11 +759,26 @@ async fn extract_from_raw_text(
         let _ = dispatcher.state.publish_host(&dispatcher.queue, host).await;
     }
 
-    // Users intentionally NOT published from raw text extraction.
-    // The DOMAIN\user regex matches every wordlist entry in kerbrute/ASREProast
-    // output (e.g. "[-] User sql_svc doesn't have UF_DONT_REQUIRE_PREAUTH set").
-    // Only per-tool parsers (kerberos_enum, netexec_user_enum) produce verified
-    // users gated by KDC response patterns.
+    // Users from raw text extraction are gated by source. The DOMAIN\user /
+    // UPN / user:[name] regexes match wordlist iterations in kerbrute/ASREProast
+    // output (e.g. "[-] User svc_sql doesn't have UF_DONT_REQUIRE_PREAUTH set"),
+    // so users tagged `output_extraction` are dropped here. Users tagged
+    // `ldap_extraction` came from the `sAMAccountName:` regex — that attribute
+    // is only emitted by an LDAP server (ldapsearch/bloodyAD), so it survives
+    // as a verified discovery. Without this, cross-forest LDAP enum via a
+    // forged inter-realm Kerberos ticket discovers users but never persists
+    // them — blocking downstream AS-REP roasting and targeted_kerberoast
+    // against the foreign forest.
+    for user in extracted.users {
+        if user.source != "ldap_extraction" {
+            continue;
+        }
+        match dispatcher.state.publish_user(&dispatcher.queue, user).await {
+            Ok(true) => new_count += 1,
+            Ok(false) => {}
+            Err(e) => warn!(err = %e, "Failed to publish text-extracted user"),
+        }
+    }
 
     for share in extracted.shares {
         match dispatcher

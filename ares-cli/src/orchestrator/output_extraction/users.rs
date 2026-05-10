@@ -175,9 +175,16 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
             found.push((user.to_string(), current_domain.clone()));
         }
 
+        // Track high-confidence matches separately. `sAMAccountName: foo`
+        // only appears in genuine LDAP/ldapsearch output (the attribute is
+        // server-emitted, not user-generated), so RE_SAM matches survive the
+        // kerbrute/asrep wordlist false-positive guard at the publishing
+        // layer. Other regexes match prose like "User foo doesn't have ..."
+        // which iterates wordlist failures and must stay gated.
+        let mut found_ldap = Vec::new();
         if let Some(caps) = RE_SAM.captures(stripped) {
             let user = caps.get(1).unwrap().as_str();
-            found.push((user.to_string(), current_domain.clone()));
+            found_ldap.push((user.to_string(), current_domain.clone()));
         }
 
         if let Some(caps) = RE_SMB_TIMESTAMP.captures(stripped) {
@@ -199,6 +206,26 @@ pub fn extract_users(output: &str, default_domain: &str) -> Vec<User> {
                     description: String::new(),
                     is_admin: false,
                     source: "output_extraction".to_string(),
+                });
+            }
+        }
+
+        for (raw_username, raw_domain) in found_ldap {
+            let username = raw_username.trim().trim_end_matches('.').to_string();
+            let domain = raw_domain.trim().trim_end_matches('.').to_string();
+            if !is_valid_extracted_user(&username, &domain) {
+                continue;
+            }
+            let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
+            if seen.insert(key) {
+                users.push(User {
+                    username,
+                    domain,
+                    description: String::new(),
+                    is_admin: false,
+                    // High-confidence: sAMAccountName attribute is only
+                    // emitted by an LDAP server, not by tool prose.
+                    source: "ldap_extraction".to_string(),
                 });
             }
         }
@@ -301,6 +328,31 @@ mod tests {
         assert!(!is_machine_hostname_domain("child.contoso.local"));
         assert!(!is_machine_hostname_domain("CONTOSO"));
         assert!(!is_machine_hostname_domain("CHILD"));
+    }
+
+    #[test]
+    fn extract_users_samaccountname_tagged_ldap_extraction() {
+        // sAMAccountName: <name> only appears in LDAP/ldapsearch output (server-
+        // emitted attribute), so the matched user is tagged as a verified
+        // ldap_extraction discovery and survives the kerbrute false-positive
+        // guard at the publishing layer.
+        let output = "\
+sAMAccountName: alice
+distinguishedName: CN=alice,DC=contoso,DC=local
+";
+        let users = extract_users(output, "contoso.local");
+        let alice = users.iter().find(|u| u.username == "alice").unwrap();
+        assert_eq!(alice.source, "ldap_extraction");
+    }
+
+    #[test]
+    fn extract_users_domain_backslash_tagged_output_extraction() {
+        // DOMAIN\user matches wordlist iterations in kerbrute output and stays
+        // tagged with the lower-confidence `output_extraction` source so
+        // result_processing can drop them.
+        let users = extract_users("CONTOSO\\bob (SidTypeUser)", "contoso.local");
+        let bob = users.iter().find(|u| u.username == "bob").unwrap();
+        assert_eq!(bob.source, "output_extraction");
     }
 
     #[test]

@@ -72,12 +72,31 @@ impl SharedState {
             let state = self.inner.read().await;
             state.operation_id.clone()
         };
-        let reader = RedisStateReader::new(operation_id);
+        let reader = RedisStateReader::new(operation_id.clone());
         let mut conn = queue.connection();
         let added = reader.add_user(&mut conn, &user).await?;
         if added {
-            let mut state = self.inner.write().await;
-            state.users.push(user);
+            let user_domain = user.domain.clone();
+            {
+                let mut state = self.inner.write().await;
+                state.users.push(user);
+            }
+            // A new user in a domain unblocks AS-REP roasting for that domain:
+            // the first auto_credential_access tick may have fired against the
+            // domain with no usernames in state (cross-forest target where
+            // anonymous SAMR is denied) and dedup'd; clearing the dedup lets
+            // the next tick re-dispatch with the now-known userlist. This is
+            // the load-bearing path for compromising a SID-filtered foreign
+            // forest where DCSync via the trust key won't work — AS-REP roast
+            // of a vulnerable account is the only no-cred-needed entry point.
+            if !user_domain.is_empty() {
+                let mut state = self.inner.write().await;
+                state.unmark_processed(super::super::DEDUP_ASREP_DOMAINS, &user_domain);
+                drop(state);
+                let _ = self
+                    .unpersist_dedup(queue, super::super::DEDUP_ASREP_DOMAINS, &user_domain)
+                    .await;
+            }
         }
         Ok(added)
     }
