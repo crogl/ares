@@ -681,17 +681,34 @@ impl Dispatcher {
 }
 
 /// Canonical key identifying a task pattern for the assist-abandon dedup
-/// set. Keys off (task_type, target_ip-or-dc_ip, username, domain) — the
-/// fields most automations vary by. When all are missing the function
-/// returns `None` (no pattern to dedup on, e.g. a free-form recon task);
-/// the dispatch proceeds without the abandon check in that case.
+/// set. Keys off (task_type, target_ip-or-dc_ip, username, domain).
 ///
-/// The set is read at `throttled_submit_outcome_inner` and written by the
-/// post-task spawn when the LLM returns `RequestAssistance`. After one
-/// matching failure, future dispatches of this exact pattern are dropped.
+/// Only returns a key when the payload identifies a SPECIFIC principal
+/// (non-empty `username`). Generic enum tasks dispatched without a
+/// username — anonymous recon, low-hanging-fruit probes, automation
+/// tasks targeting a host without binding a user — MUST NOT be
+/// abandoned, because (a) they routinely fire many times against the
+/// same target as state accumulates and (b) one transient failure of
+/// an empty-user enum task against a DC would otherwise blacklist all
+/// further enumeration of that host. The previous version of this
+/// function returned a key with empty username embedded
+/// (`task_type|target||domain`); a single assistance failure on a
+/// generic recon task permanently blocked all further enum dispatches
+/// against that target — choking the orchestrator after ~6 such
+/// failures across the 3 DCs in a typical multi-forest run.
+///
+/// With a non-empty username, one failure of (task_type, target, user,
+/// domain) is enough to suppress retries: the same principal failing
+/// the same task against the same target is the "wrong realm cred",
+/// "missing tool primitive", or "no auth resolvable" signature we want
+/// to stop burning tokens on.
 pub(crate) fn assist_pattern_key(task_type: &str, payload: &serde_json::Value) -> Option<String> {
     let obj = payload.as_object()?;
     let pick = |k: &str| -> &str { obj.get(k).and_then(|v| v.as_str()).unwrap_or("") };
+    let username = pick("username");
+    if username.is_empty() {
+        return None;
+    }
     let target = {
         let t = pick("target_ip");
         if !t.is_empty() {
@@ -700,11 +717,7 @@ pub(crate) fn assist_pattern_key(task_type: &str, payload: &serde_json::Value) -
             pick("dc_ip").to_string()
         }
     };
-    let username = pick("username");
     let domain = pick("domain");
-    if target.is_empty() && username.is_empty() && domain.is_empty() {
-        return None;
-    }
     Some(format!(
         "{task_type}|{target}|{u}|{d}",
         u = username.to_lowercase(),
@@ -736,5 +749,24 @@ mod assist_key_tests {
     fn pattern_key_none_when_no_identifying_fields() {
         let p = json!({"technique": "recon"});
         assert!(assist_pattern_key("recon", &p).is_none());
+    }
+
+    #[test]
+    fn pattern_key_none_for_empty_username_generic_enum() {
+        // The dispatcher fires generic enum tasks against a target with
+        // no `username` field; one transient assistance failure must NOT
+        // permanently blacklist all future enumeration of that target.
+        // Regression for: empty-user keys (`recon|target||domain`) earlier
+        // choked the orchestrator after ~6 failures across 3 DCs.
+        let p = json!({"target_ip": "192.168.58.10", "domain": "contoso.local"});
+        assert!(
+            assist_pattern_key("recon", &p).is_none(),
+            "generic-enum task (no username) must never be abandoned"
+        );
+        let p = json!({"dc_ip": "192.168.58.10", "domain": "contoso.local", "username": ""});
+        assert!(
+            assist_pattern_key("credential_access", &p).is_none(),
+            "explicit empty username must never be abandoned"
+        );
     }
 }
