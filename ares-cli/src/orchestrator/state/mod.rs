@@ -82,6 +82,14 @@ pub const DEDUP_GOLDEN_CERT: &str = "golden_cert";
 /// a new cred for the vuln's domain becomes available after the initial
 /// LLM attempt failed (e.g. cred-timing race in cross-forest pivots).
 pub const DEDUP_MSSQL_RETRY: &str = "mssql_retry";
+
+/// Dedup for `auto_mssql_link_pivot` — a deterministic per-linked-server
+/// probe that fires `mssql_exec_linked` directly via the tool dispatcher.
+/// The companion automation deduplicates only after either a confirmed
+/// remote SELECT or attempt-cap exhaustion, so a one-shot transient auth
+/// failure does not permanently bury the cross-forest hop primitive.
+pub const DEDUP_MSSQL_LINK_PIVOT: &str = "mssql_link_pivot";
+
 /// Task patterns that ended with `RequestAssistance` are recorded here and
 /// refused on re-dispatch. Each entry is a canonical key of
 /// `(task_type, target_ip, username, domain)` — enough to identify a
@@ -158,6 +166,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_CROSS_REALM_LATERAL,
     DEDUP_GOLDEN_CERT,
     DEDUP_MSSQL_RETRY,
+    DEDUP_MSSQL_LINK_PIVOT,
     DEDUP_ASSIST_ABANDONED,
 ];
 

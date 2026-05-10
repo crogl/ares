@@ -96,6 +96,12 @@ pub struct StateInner {
     // so we don't defer indefinitely if AES never arrives.
     pub forge_aes_defers: HashMap<String, u32>,
 
+    // Per-(linked_server vuln) failed-attempt counter for
+    // `auto_mssql_link_pivot`. Bounded retries before we mark the
+    // pivot dedup'd — keeps a flaky link from looping forever while
+    // still tolerating transient auth races.
+    pub mssql_link_pivot_attempts: HashMap<String, u32>,
+
     // Forged inter-realm Kerberos tickets (source→target forest, cached path)
     pub kerberos_tickets: Vec<ares_core::models::KerberosTicket>,
 
@@ -145,6 +151,7 @@ impl StateInner {
             completed_tasks: HashMap::new(),
             quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
+            mssql_link_pivot_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,
@@ -775,6 +782,7 @@ mod tests {
             DEDUP_CROSS_REALM_LATERAL,
             DEDUP_GOLDEN_CERT,
             DEDUP_MSSQL_RETRY,
+            DEDUP_MSSQL_LINK_PIVOT,
             DEDUP_ASSIST_ABANDONED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());

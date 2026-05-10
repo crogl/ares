@@ -11,6 +11,23 @@ use crate::orchestrator::state::*;
 
 use super::crack_dedup_key;
 
+/// Cracking-priority bucket for a hash type. Lower is higher priority.
+///
+/// Kerberoast and AS-REP hashes are the high-leverage crack targets in any
+/// op: a cracked SPN often exposes a service account the orchestrator
+/// already knows how to abuse (linked-server pivots, MSSQL impersonation,
+/// cross-forest reuse), and AS-REP plaintext lets us swap an LLM-blind
+/// password into the credential pool. NTLM hashes from secretsdump are
+/// already usable as-is via PtH, so cracking them is the lowest-payoff
+/// work and should never block roastable hashes from the single hashcat
+/// slot.
+fn crack_priority(hash_type: &str) -> u8 {
+    match hash_type.to_ascii_lowercase().as_str() {
+        "kerberoast" | "asrep" | "asreproast" => 0,
+        _ => 1,
+    }
+}
+
 /// Scans for uncracked hashes and submits crack tasks.
 /// Interval: 15s. Matches Python `_auto_crack_dispatch`.
 pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -26,8 +43,13 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             break;
         }
 
-        // Collect unprocessed hashes
-        let work: Vec<(String, ares_core::models::Hash)> = {
+        // Collect unprocessed hashes, then sort by crack priority so the
+        // single hashcat slot serves roastable hashes first. Without this,
+        // a backlog of NTLM machine-account hashes from secretsdump (already
+        // PtH-usable) starves the lone kerberoast/asrep hash that would
+        // unlock a service-account password — exactly the failure mode that
+        // left a kerberoasted sql_svc untouched for hours in op-20260510.
+        let mut work: Vec<(String, ares_core::models::Hash)> = {
             let state = dispatcher.state.read().await;
             state
                 .hashes
@@ -43,6 +65,7 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                 })
                 .collect()
         };
+        work.sort_by_key(|(_, h)| crack_priority(&h.hash_type));
 
         // Serialize crack tasks: hashcat only allows one instance at a time.
         // Skip this tick if a cracker task is already running.
@@ -71,5 +94,40 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
                 Err(e) => warn!(err = %e, "Failed to dispatch crack task"),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::crack_priority;
+
+    #[test]
+    fn roastable_hashes_outrank_ntlm() {
+        assert!(crack_priority("kerberoast") < crack_priority("ntlm"));
+        assert!(crack_priority("asrep") < crack_priority("ntlm"));
+        assert!(crack_priority("asreproast") < crack_priority("ntlm"));
+    }
+
+    #[test]
+    fn roastable_priority_case_insensitive() {
+        assert_eq!(crack_priority("KERBEROAST"), crack_priority("kerberoast"));
+        assert_eq!(crack_priority("AsRep"), crack_priority("asrep"));
+    }
+
+    #[test]
+    fn unknown_hash_types_share_ntlm_bucket() {
+        assert_eq!(crack_priority("ntlm"), crack_priority("netntlmv2"));
+        assert_eq!(crack_priority("ntlm"), crack_priority(""));
+    }
+
+    #[test]
+    fn sort_places_roastable_first() {
+        let mut v = ["ntlm", "kerberoast", "ntlm", "asrep"];
+        v.sort_by_key(|t| crack_priority(t));
+        // First two slots are the roastable ones in some order; last two are ntlm.
+        assert!(matches!(v[0], "kerberoast" | "asrep"));
+        assert!(matches!(v[1], "kerberoast" | "asrep"));
+        assert_eq!(v[2], "ntlm");
+        assert_eq!(v[3], "ntlm");
     }
 }

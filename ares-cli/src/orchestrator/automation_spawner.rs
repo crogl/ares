@@ -55,6 +55,7 @@ pub(crate) fn spawn_automation_tasks(
     spawn_auto!(auto_shadow_credentials);
     spawn_auto!(auto_rbcd_exploitation);
     spawn_auto!(auto_mssql_exploitation);
+    spawn_auto!(auto_mssql_link_pivot);
     spawn_auto!(auto_gpo_abuse);
     spawn_auto!(auto_laps_extraction);
     spawn_auto!(auto_ntlm_relay);
