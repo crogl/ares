@@ -147,7 +147,7 @@ pub async fn auto_unconstrained_exploitation(
                         .find(|c| {
                             !c.password.is_empty()
                                 && c.domain.to_lowercase() == domain.to_lowercase()
-                                && !state.is_credential_quarantined(&c.username, &c.domain)
+                                && !state.is_principal_quarantined(&c.username, &c.domain)
                         })
                         .cloned();
 

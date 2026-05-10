@@ -184,7 +184,7 @@ fn collect_golden_cert_work(state: &StateInner) -> Vec<GoldenCertWork> {
                         && c.domain.to_lowercase() == domain.to_lowercase()
                         && !c.username.starts_with('$')
                         && !state.is_delegation_account(&c.username)
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
                 .cloned();
 

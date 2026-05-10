@@ -46,12 +46,12 @@ fn collect_sid_enum_work(state: &StateInner) -> Vec<SidEnumWork> {
             .find(|c| {
                 !c.password.is_empty()
                     && c.domain.to_lowercase() == domain.to_lowercase()
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .or_else(|| {
                 state.credentials.iter().find(|c| {
                     !c.password.is_empty()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
             }) {
             Some(c) => c.clone(),
@@ -387,7 +387,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_sid_enum_work(&state);
         assert!(work.is_empty());
     }

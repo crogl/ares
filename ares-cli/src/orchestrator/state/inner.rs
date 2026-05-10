@@ -75,19 +75,19 @@ pub struct StateInner {
     pub pending_tasks: HashMap<String, TaskInfo>,
     pub completed_tasks: HashMap<String, ares_core::models::TaskResult>,
 
-    // Credential lockout quarantine: `user@domain` → expiry time.
-    // Credentials that triggered STATUS_ACCOUNT_LOCKED_OUT or
-    // KDC_ERR_CLIENT_REVOKED are quarantined to avoid burning auth budget.
-    pub quarantined_credentials: HashMap<String, DateTime<Utc>>,
-
-    // Username lockout quarantine: `user@domain` → expiry time.
-    // Distinct from quarantined_credentials: tracks principals seen locked
-    // during enumeration paths (username_as_password, password_spray) where
-    // we have no specific cleartext credential to quarantine, only the
-    // principal itself. Used to filter user lists before re-dispatching
-    // enum tools so we don't keep incrementing badPwdCount on already-locked
-    // accounts.
-    pub quarantined_users: HashMap<String, DateTime<Utc>>,
+    // Principal lockout quarantine: `user@domain` → expiry time.
+    // Populated by two write paths that converge on the same semantics:
+    //   - auth attempts that returned STATUS_ACCOUNT_LOCKED_OUT or
+    //     KDC_ERR_CLIENT_REVOKED for a known cleartext credential
+    //   - enumeration paths (username_as_password, password_spray) that
+    //     observed the principal locked even though we don't hold a
+    //     cleartext for them
+    // Both cases carry the same operational meaning at every read site —
+    // "don't authenticate as this principal right now" — so they share one
+    // map. Used by the LLM snapshot filter, automation paths that consume
+    // credential/hash lists, and the spray-injection path that builds
+    // excluded_users.
+    pub quarantined_principals: HashMap<String, DateTime<Utc>>,
 
     // Per-trust counter: how many times the cross-forest forge dispatch
     // has been deferred waiting for the AES256 trust key to upsert.
@@ -143,8 +143,7 @@ impl StateInner {
             dispatched_acl_steps: HashSet::new(),
             pending_tasks: HashMap::new(),
             completed_tasks: HashMap::new(),
-            quarantined_credentials: HashMap::new(),
-            quarantined_users: HashMap::new(),
+            quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
@@ -172,48 +171,35 @@ impl StateInner {
         })
     }
 
-    /// Check if a credential is quarantined due to lockout.
-    /// Expired quarantines are ignored (lazy cleanup).
-    pub fn is_credential_quarantined(&self, username: &str, domain: &str) -> bool {
+    /// Check if a principal (`user@domain`) is quarantined due to lockout —
+    /// either a known cleartext that returned STATUS_ACCOUNT_LOCKED_OUT /
+    /// KDC_ERR_CLIENT_REVOKED, or a principal observed locked during
+    /// enumeration (`username_as_password`, `password_spray`). Expired
+    /// quarantines are ignored (lazy cleanup).
+    pub fn is_principal_quarantined(&self, username: &str, domain: &str) -> bool {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-        self.quarantined_credentials
+        self.quarantined_principals
             .get(&key)
             .map(|expiry| Utc::now() < *expiry)
             .unwrap_or(false)
     }
 
-    /// Quarantine a credential for `QUARANTINE_DURATION_SECS` after lockout.
-    pub fn quarantine_credential(&mut self, username: &str, domain: &str) {
+    /// Quarantine a principal for `QUARANTINE_DURATION_SECS` after a lockout
+    /// signal. See [`is_principal_quarantined`] for which signals feed in.
+    pub fn quarantine_principal(&mut self, username: &str, domain: &str) {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
-        self.quarantined_credentials.insert(key, expiry);
-    }
-
-    /// Check if a user is quarantined due to lockout observed during
-    /// enumeration. Expired quarantines are ignored (lazy cleanup).
-    pub fn is_user_quarantined(&self, username: &str, domain: &str) -> bool {
-        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-        self.quarantined_users
-            .get(&key)
-            .map(|expiry| Utc::now() < *expiry)
-            .unwrap_or(false)
-    }
-
-    /// Quarantine a user for `QUARANTINE_DURATION_SECS` after lockout.
-    pub fn quarantine_user(&mut self, username: &str, domain: &str) {
-        let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
-        let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
-        self.quarantined_users.insert(key, expiry);
+        self.quarantined_principals.insert(key, expiry);
     }
 
     /// Return a deduplicated list of currently-quarantined usernames in
     /// `domain` (case-insensitive). Used to populate `excluded_users` on
     /// outbound spray dispatches so the worker can drop them before auth.
-    pub fn quarantined_users_in_domain(&self, domain: &str) -> Vec<String> {
+    pub fn quarantined_principals_in_domain(&self, domain: &str) -> Vec<String> {
         let domain_l = domain.to_lowercase();
         let now = Utc::now();
         let mut out: Vec<String> = self
-            .quarantined_users
+            .quarantined_principals
             .iter()
             .filter(|(_, expiry)| now < **expiry)
             .filter_map(|(key, _)| {
@@ -316,7 +302,7 @@ impl StateInner {
         // Priority 1: child-domain cred → parent-domain (most reliable)
         if let Some(c) = self.credentials.iter().find(|c| {
             !c.password.is_empty()
-                && !self.is_credential_quarantined(&c.username, &c.domain)
+                && !self.is_principal_quarantined(&c.username, &c.domain)
                 && c.domain.to_lowercase().ends_with(&format!(".{target}"))
         }) {
             return Some(c.clone());
@@ -329,7 +315,7 @@ impl StateInner {
         // LDAP bind will simply fail if there is no actual trust.
         for cred in &self.credentials {
             if cred.password.is_empty()
-                || self.is_credential_quarantined(&cred.username, &cred.domain)
+                || self.is_principal_quarantined(&cred.username, &cred.domain)
             {
                 continue;
             }
@@ -393,7 +379,7 @@ impl StateInner {
 
         let usable = |c: &ares_core::models::Credential| -> bool {
             !c.password.is_empty()
-                && !self.is_credential_quarantined(&c.username, &c.domain)
+                && !self.is_principal_quarantined(&c.username, &c.domain)
                 && c.username.to_lowercase() == name_l
         };
 
@@ -449,7 +435,7 @@ impl StateInner {
         let usable = |h: &ares_core::models::Hash| -> bool {
             !h.hash_value.is_empty()
                 && h.hash_type.eq_ignore_ascii_case("NTLM")
-                && !self.is_credential_quarantined(&h.username, &h.domain)
+                && !self.is_principal_quarantined(&h.username, &h.domain)
                 && h.username.to_lowercase() == name_l
         };
 
@@ -831,15 +817,15 @@ mod tests {
         let mut state = StateInner::new("op-1".into());
 
         // Not quarantined initially
-        assert!(!state.is_credential_quarantined("jdoe", "child.contoso.local"));
+        assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
 
         // Quarantine a credential
-        state.quarantine_credential("jdoe", "child.contoso.local");
-        assert!(state.is_credential_quarantined("jdoe", "child.contoso.local"));
-        assert!(state.is_credential_quarantined("JDOE", "CHILD.CONTOSO.LOCAL")); // case insensitive
+        state.quarantine_principal("jdoe", "child.contoso.local");
+        assert!(state.is_principal_quarantined("jdoe", "child.contoso.local"));
+        assert!(state.is_principal_quarantined("JDOE", "CHILD.CONTOSO.LOCAL")); // case insensitive
 
         // Different credential not affected
-        assert!(!state.is_credential_quarantined("john.smith", "child.contoso.local"));
+        assert!(!state.is_principal_quarantined("john.smith", "child.contoso.local"));
     }
 
     #[test]
@@ -891,49 +877,49 @@ mod tests {
     #[test]
     fn user_quarantine_basic() {
         let mut state = StateInner::new("op-1".into());
-        assert!(!state.is_user_quarantined("testuser1", "contoso.local"));
+        assert!(!state.is_principal_quarantined("testuser1", "contoso.local"));
 
-        state.quarantine_user("testuser1", "contoso.local");
-        assert!(state.is_user_quarantined("testuser1", "contoso.local"));
-        assert!(state.is_user_quarantined("TESTUSER1", "CONTOSO.LOCAL")); // case insensitive
+        state.quarantine_principal("testuser1", "contoso.local");
+        assert!(state.is_principal_quarantined("testuser1", "contoso.local"));
+        assert!(state.is_principal_quarantined("TESTUSER1", "CONTOSO.LOCAL")); // case insensitive
 
         // Different user not affected
-        assert!(!state.is_user_quarantined("testuser2", "contoso.local"));
+        assert!(!state.is_principal_quarantined("testuser2", "contoso.local"));
         // Same user, different domain not affected
-        assert!(!state.is_user_quarantined("testuser1", "fabrikam.local"));
+        assert!(!state.is_principal_quarantined("testuser1", "fabrikam.local"));
     }
 
     #[test]
-    fn quarantined_users_in_domain_filters() {
+    fn quarantined_principals_in_domain_filters() {
         let mut state = StateInner::new("op-1".into());
-        state.quarantine_user("testuser1", "contoso.local");
-        state.quarantine_user("testuser2", "contoso.local");
-        state.quarantine_user("testuser3", "fabrikam.local");
+        state.quarantine_principal("testuser1", "contoso.local");
+        state.quarantine_principal("testuser2", "contoso.local");
+        state.quarantine_principal("testuser3", "fabrikam.local");
 
-        let mut contoso = state.quarantined_users_in_domain("contoso.local");
+        let mut contoso = state.quarantined_principals_in_domain("contoso.local");
         contoso.sort();
         assert_eq!(
             contoso,
             vec!["testuser1".to_string(), "testuser2".to_string()]
         );
 
-        let fabrikam = state.quarantined_users_in_domain("fabrikam.local");
+        let fabrikam = state.quarantined_principals_in_domain("fabrikam.local");
         assert_eq!(fabrikam, vec!["testuser3".to_string()]);
 
-        let unknown = state.quarantined_users_in_domain("unknown.local");
+        let unknown = state.quarantined_principals_in_domain("unknown.local");
         assert!(unknown.is_empty());
     }
 
     #[test]
-    fn quarantined_users_in_domain_skips_expired() {
+    fn quarantined_principals_in_domain_skips_expired() {
         let mut state = StateInner::new("op-1".into());
-        state.quarantined_users.insert(
+        state.quarantined_principals.insert(
             "expired@contoso.local".into(),
             Utc::now() - chrono::Duration::seconds(1),
         );
-        state.quarantine_user("fresh", "contoso.local");
+        state.quarantine_principal("fresh", "contoso.local");
 
-        let users = state.quarantined_users_in_domain("contoso.local");
+        let users = state.quarantined_principals_in_domain("contoso.local");
         assert_eq!(users, vec!["fresh".to_string()]);
     }
 
@@ -944,10 +930,10 @@ mod tests {
         // Insert with an already-expired time
         let key = "jdoe@child.contoso.local".to_string();
         state
-            .quarantined_credentials
+            .quarantined_principals
             .insert(key, Utc::now() - chrono::Duration::seconds(1));
 
         // Should not be quarantined (expired)
-        assert!(!state.is_credential_quarantined("jdoe", "child.contoso.local"));
+        assert!(!state.is_principal_quarantined("jdoe", "child.contoso.local"));
     }
 }

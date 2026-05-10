@@ -136,7 +136,7 @@ pub(super) async fn inject_excluded_users(
     else {
         return;
     };
-    let quarantined = state.read().await.quarantined_users_in_domain(&domain);
+    let quarantined = state.read().await.quarantined_principals_in_domain(&domain);
     if quarantined.is_empty() {
         return;
     }

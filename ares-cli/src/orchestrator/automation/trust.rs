@@ -2084,7 +2084,7 @@ async fn dispatch_post_ticket_user_enumeration(
             .find(|c| {
                 !c.password.is_empty()
                     && is_domain_related(&c.domain, source_domain)
-                    && !s.is_credential_quarantined(&c.username, &c.domain)
+                    && !s.is_principal_quarantined(&c.username, &c.domain)
             })
             .cloned();
         (dc_ip, dc_fqdn, cred)

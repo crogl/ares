@@ -132,7 +132,7 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                         !c.password.is_empty()
                             && c.domain.to_lowercase() == domain_lower
                             && !state.is_delegation_account(&c.username)
-                            && !state.is_credential_quarantined(&c.username, &c.domain)
+                            && !state.is_principal_quarantined(&c.username, &c.domain)
                     })
                     .collect();
                 candidates.extend(state.credentials.iter().filter(|c| {
@@ -141,7 +141,7 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                         && cd != domain_lower
                         && state.forest_root_of(&cd) == target_forest
                         && !state.is_delegation_account(&c.username)
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 }));
                 candidates
                     .into_iter()
@@ -560,7 +560,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_adcs_work(&state);
         assert!(
             work.is_empty(),
@@ -583,7 +583,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("gooduser", "Pass!456", "dev.contoso.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_adcs_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "gooduser");

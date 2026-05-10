@@ -55,12 +55,12 @@ fn collect_smbclient_work(state: &crate::orchestrator::state::StateInner) -> Vec
                 !domain.is_empty()
                     && c.domain.to_lowercase() == domain.to_lowercase()
                     && !c.password.is_empty()
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .or_else(|| {
                 state.credentials.iter().find(|c| {
                     !c.password.is_empty()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
             }) {
             Some(c) => c.clone(),

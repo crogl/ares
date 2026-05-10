@@ -130,14 +130,14 @@ fn collect_rdp_work(state: &crate::orchestrator::state::StateInner) -> Vec<RdpWo
                 c.is_admin
                     && !c.password.is_empty()
                     && (domain.is_empty() || c.domain.to_lowercase() == domain)
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .or_else(|| {
                 // Fall back to any credential with a password
                 state.credentials.iter().find(|c| {
                     !c.password.is_empty()
                         && (domain.is_empty() || c.domain.to_lowercase() == domain)
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
             })
             .cloned();

@@ -49,12 +49,12 @@ fn collect_foreign_group_work(state: &StateInner) -> Vec<ForeignGroupWork> {
             .find(|c| {
                 !c.password.is_empty()
                     && c.domain.to_lowercase() == domain.to_lowercase()
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .or_else(|| {
                 state.credentials.iter().find(|c| {
                     !c.password.is_empty()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
             })
             .cloned();
@@ -420,7 +420,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_foreign_group_work(&state);
         // Both domains should still get work (gooduser fallback for contoso)
         assert_eq!(work.len(), 2);

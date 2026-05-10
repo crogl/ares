@@ -34,30 +34,23 @@ impl SharedState {
             &s.domain_controllers,
         );
 
-        // Hide quarantined credentials from LLM agents. A locked-out
-        // account can't authenticate during the quarantine window, and
-        // surfacing it just invites more failed-auth attempts on the same
-        // account (which keep the badPwdCount climbing on shared lockout
-        // policies). The state's own resolvers already filter
-        // is_credential_quarantined for automation paths; this filter does
-        // the same for the LLM-facing snapshot. Both the failed-auth
-        // quarantine (is_credential_quarantined) and the enumeration-observed
-        // quarantine (is_user_quarantined) are checked — they track the same
-        // class of "don't auth as this principal right now" signal, just
-        // populated by different code paths.
-        let suppress = |username: &str, domain: &str| {
-            s.is_credential_quarantined(username, domain) || s.is_user_quarantined(username, domain)
-        };
+        // Hide quarantined principals from LLM agents. A locked-out account
+        // can't authenticate during the quarantine window, and surfacing it
+        // just invites more failed-auth attempts on the same principal
+        // (which keep the badPwdCount climbing on shared lockout policies).
+        // The state's own resolvers already filter is_principal_quarantined
+        // for automation paths; this filter does the same for the LLM-facing
+        // snapshot.
         let credentials: Vec<_> = s
             .credentials
             .iter()
-            .filter(|c| !suppress(&c.username, &c.domain))
+            .filter(|c| !s.is_principal_quarantined(&c.username, &c.domain))
             .cloned()
             .collect();
         let hashes: Vec<_> = s
             .hashes
             .iter()
-            .filter(|h| !suppress(&h.username, &h.domain))
+            .filter(|h| !s.is_principal_quarantined(&h.username, &h.domain))
             .cloned()
             .collect();
 
@@ -269,7 +262,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn snapshot_hides_quarantined_credentials() {
+    async fn snapshot_hides_quarantined_principals() {
         let state = SharedState::new("op-1".into());
         {
             let mut inner = state.write().await;
@@ -321,7 +314,7 @@ mod tests {
                 parent_id: None,
                 attack_step: 0,
             });
-            inner.quarantine_credential("locked_user", "contoso.local");
+            inner.quarantine_principal("locked_user", "contoso.local");
         }
 
         let snap = state.snapshot().await;

@@ -66,7 +66,7 @@ fn collect_lsassy_work(state: &StateInner) -> Vec<LsassyWork> {
             .find(|c| {
                 !c.password.is_empty()
                     && (domain.is_empty() || c.domain.to_lowercase() == domain)
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .or_else(|| {
                 // Fall back to any admin credential
@@ -316,7 +316,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         state.credentials.push(make_admin_credential(
             "domadmin",
             "Admin!1",
@@ -372,7 +372,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("gooduser", "Pass!456", "contoso.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_lsassy_work(&state);
         assert_eq!(work.len(), 1);
         assert_eq!(work[0].credential.username, "gooduser");

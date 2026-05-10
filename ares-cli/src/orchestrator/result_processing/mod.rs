@@ -256,7 +256,7 @@ pub async fn process_completed_task(
                     .state
                     .write()
                     .await
-                    .quarantine_credential(username, domain);
+                    .quarantine_principal(username, domain);
             }
         }
     }
@@ -283,7 +283,7 @@ pub async fn process_completed_task(
                         task_id = %task_id,
                         "User quarantined for 5 min: enumeration lockout detected"
                     );
-                    state.quarantine_user(user, dom);
+                    state.quarantine_principal(user, dom);
                 }
             }
         }
@@ -304,7 +304,7 @@ pub async fn process_completed_task(
 ///
 /// Returns lower-cased usernames; the domain (if present in the prefix) is
 /// also lowercased. Used by `process_completed_task` to populate
-/// `quarantined_users` for enumeration tasks that lack a `cred_key`.
+/// `quarantined_principals` for enumeration tasks that lack a `cred_key`.
 pub(crate) fn extract_locked_usernames_from_result(
     result: &Option<Value>,
 ) -> Vec<(String, Option<String>)> {

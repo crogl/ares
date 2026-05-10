@@ -52,7 +52,7 @@ pub async fn auto_credential_expansion(
                 // Skip delegation accounts — their auth is reserved for S4U.
                 .filter(|c| c.is_admin || !state.is_delegation_account(&c.username))
                 // Skip quarantined credentials — locked out, retry after expiry.
-                .filter(|c| !state.is_credential_quarantined(&c.username, &c.domain))
+                .filter(|c| !state.is_principal_quarantined(&c.username, &c.domain))
                 .filter_map(|cred| {
                     let dedup = format!(
                         "{}:{}",

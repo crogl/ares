@@ -113,7 +113,7 @@ async fn inject_excluded_users_skips_non_spray_tools() {
     state
         .write()
         .await
-        .quarantine_user("testuser1", "contoso.local");
+        .quarantine_principal("testuser1", "contoso.local");
     let mut args = serde_json::json!({"target": "1.2.3.4", "domain": "contoso.local"});
     inject_excluded_users(&Some(state), "smb_login_check", &mut args).await;
     assert!(args.get("excluded_users").is_none());
@@ -124,9 +124,9 @@ async fn inject_excluded_users_populates_from_state() {
     let state = SharedState::new("op-1".into());
     {
         let mut s = state.write().await;
-        s.quarantine_user("testuser1", "contoso.local");
-        s.quarantine_user("testuser2", "contoso.local");
-        s.quarantine_user("testuser3", "fabrikam.local");
+        s.quarantine_principal("testuser1", "contoso.local");
+        s.quarantine_principal("testuser2", "contoso.local");
+        s.quarantine_principal("testuser3", "fabrikam.local");
     }
     let mut args = serde_json::json!({"target": "1.2.3.4", "domain": "contoso.local"});
     inject_excluded_users(&Some(state), "password_spray", &mut args).await;
@@ -142,7 +142,7 @@ async fn inject_excluded_users_unions_with_existing() {
     state
         .write()
         .await
-        .quarantine_user("testuser1", "contoso.local");
+        .quarantine_principal("testuser1", "contoso.local");
     let mut args = serde_json::json!({
         "target": "1.2.3.4",
         "domain": "contoso.local",
@@ -161,7 +161,7 @@ async fn inject_excluded_users_no_domain_is_noop() {
     state
         .write()
         .await
-        .quarantine_user("testuser1", "contoso.local");
+        .quarantine_principal("testuser1", "contoso.local");
     let mut args = serde_json::json!({"target": "1.2.3.4"});
     inject_excluded_users(&Some(state), "password_spray", &mut args).await;
     assert!(args.get("excluded_users").is_none());

@@ -89,7 +89,7 @@ fn collect_cross_forest_work(state: &StateInner) -> Vec<CrossForestWork> {
             .credentials
             .iter()
             .filter(|c| {
-                !c.password.is_empty() && !state.is_credential_quarantined(&c.username, &c.domain)
+                !c.password.is_empty() && !state.is_principal_quarantined(&c.username, &c.domain)
             })
             .min_by_key(|c| {
                 let c_dom = c.domain.to_lowercase();
@@ -740,7 +740,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_skips_quarantined_credentials() {
+    async fn collect_skips_quarantined_principals() {
         let state = SharedState::new("test".into());
         {
             let mut s = state.write().await;
@@ -756,7 +756,7 @@ mod tests {
                 "contoso.local",
                 true,
             )); // pragma: allowlist secret
-            s.quarantined_credentials.insert(
+            s.quarantined_principals.insert(
                 "baduser@contoso.local".into(),
                 chrono::Utc::now() + chrono::Duration::seconds(300),
             );

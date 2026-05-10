@@ -73,7 +73,7 @@ fn collect_acl_discovery_work(state: &StateInner) -> Vec<AclDiscoveryWork> {
                 .find(|c| {
                     !c.password.is_empty()
                         && c.domain.to_lowercase() == domain.to_lowercase()
-                        && !state.is_credential_quarantined(&c.username, &c.domain)
+                        && !state.is_principal_quarantined(&c.username, &c.domain)
                 })
                 .cloned();
             (c, false)
@@ -710,7 +710,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("baduser", "P@ssw0rd!", "contoso.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         let work = collect_acl_discovery_work(&state);
         assert!(work.is_empty());
     }
@@ -727,7 +727,7 @@ mod tests {
         state
             .credentials
             .push(make_credential("gooduser", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
-        state.quarantine_credential("baduser", "contoso.local");
+        state.quarantine_principal("baduser", "contoso.local");
         // No same-domain cred (quarantined) and no hash → skip
         let work = collect_acl_discovery_work(&state);
         assert_eq!(
@@ -749,8 +749,8 @@ mod tests {
         state
             .credentials
             .push(make_credential("user2", "Pass!456", "fabrikam.local")); // pragma: allowlist secret
-        state.quarantine_credential("user1", "contoso.local");
-        state.quarantine_credential("user2", "fabrikam.local");
+        state.quarantine_principal("user1", "contoso.local");
+        state.quarantine_principal("user2", "fabrikam.local");
         let work = collect_acl_discovery_work(&state);
         assert!(work.is_empty());
     }

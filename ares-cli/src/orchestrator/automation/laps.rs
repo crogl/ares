@@ -134,7 +134,7 @@ pub async fn auto_laps_extraction(
                 !c.domain.is_empty()
                     && !c.password.is_empty()
                     && !state.is_delegation_account(&c.username)
-                    && !state.is_credential_quarantined(&c.username, &c.domain)
+                    && !state.is_principal_quarantined(&c.username, &c.domain)
             }) {
                 let dedup_key = format!(
                     "{DEDUP_LAPS}:sweep:{}:{}",
