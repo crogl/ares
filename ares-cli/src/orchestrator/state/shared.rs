@@ -154,6 +154,33 @@ impl SharedState {
     pub async fn operation_id(&self) -> String {
         self.inner.read().await.operation_id.clone()
     }
+
+    /// Enumerate the orchestrator host's IPv4 interface addresses and stash
+    /// them in `state.self_ips`. Used by `publish_host` to filter the
+    /// attacker's own NIC out of host-discovery results — e.g. an SMB sweep
+    /// from the Kali pivot will respond on the box's own address and would
+    /// otherwise pollute the discovered-host list with a phantom entry.
+    /// Failures (no permission, unsupported platform) degrade gracefully to
+    /// an empty set: filtering is a polish concern, not a correctness gate.
+    pub async fn initialize_self_ips(&self) {
+        let ips: std::collections::HashSet<std::net::IpAddr> =
+            match local_ip_address::list_afinet_netifas() {
+                Ok(ifs) => ifs
+                    .into_iter()
+                    .map(|(_, ip)| ip)
+                    .filter(|ip| matches!(ip, std::net::IpAddr::V4(_)))
+                    .collect(),
+                Err(e) => {
+                    tracing::warn!(err = %e, "Failed to enumerate local interfaces — self-IP filtering disabled");
+                    return;
+                }
+            };
+        tracing::info!(
+            count = ips.len(),
+            "Discovered self IPv4 addresses for host-discovery filter"
+        );
+        self.inner.write().await.self_ips = ips;
+    }
 }
 
 #[cfg(test)]

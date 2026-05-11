@@ -132,6 +132,7 @@ async fn run_inner() -> Result<()> {
     }
 
     let shared_state = SharedState::new(config.operation_id.clone());
+    shared_state.initialize_self_ips().await;
     shared_state
         .load_from_redis(&queue)
         .await

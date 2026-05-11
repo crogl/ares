@@ -38,6 +38,32 @@ impl SharedState {
         if host.hostname.contains('.') && !looks_like_real_domain(&host.hostname) {
             host.hostname = String::new();
         }
+        // Some upstream parsers (esp. Python tool output stringifying `None`)
+        // emit literal placeholder strings as the hostname. These are never a
+        // real machine name — clear them so the display falls back to IP-only
+        // instead of `none / <ip>`.
+        if matches!(
+            host.hostname.as_str(),
+            "none" | "null" | "unknown" | "(none)" | "(null)" | "n/a" | "-"
+        ) {
+            host.hostname = String::new();
+        }
+
+        // Self-IP guard: an SMB sweep from the attacker pivot will hit its own
+        // NIC and produce a "host" record for the pivot box itself. Skip it
+        // silently — we don't want to count, scan, or attack ourselves. The
+        // self_ips set is empty in tests (StateInner::new() default), so this
+        // is a no-op outside of `orchestrator::run`, which calls
+        // `initialize_self_ips()` at startup.
+        if let Ok(parsed) = host.ip.parse::<std::net::IpAddr>() {
+            if self.inner.read().await.self_ips.contains(&parsed) {
+                tracing::debug!(
+                    ip = %host.ip,
+                    "Skipping host publish: IP matches orchestrator's own interface"
+                );
+                return Ok(false);
+            }
+        }
 
         // Auto-extract domain from FQDN hostname (matches Python add_host).
         // e.g. "dc02.child.contoso.local" → "child.contoso.local". Routed
@@ -934,5 +960,66 @@ mod tests {
 
         let s = state.inner.read().await;
         assert_eq!(s.hosts[0].os, "Windows Server 2019");
+    }
+
+    #[tokio::test]
+    async fn publish_host_drops_placeholder_hostnames() {
+        // Upstream Python tool output stringifies `None` into the hostname
+        // field. Without clearing them the display shows e.g. `none / <ip>`.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        for placeholder in &["none", "None", "NULL", "(none)", "n/a", "-"] {
+            let host = make_host("192.168.58.50", placeholder, false);
+            state.publish_host(&q, host).await.unwrap();
+        }
+        let s = state.inner.read().await;
+        let entry = s
+            .hosts
+            .iter()
+            .find(|h| h.ip == "192.168.58.50")
+            .expect("host should be stored");
+        assert_eq!(
+            entry.hostname, "",
+            "placeholder hostnames must be cleared, got: {:?}",
+            entry.hostname
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_filters_self_ip() {
+        // The orchestrator's own NIC must not get counted as a discovered
+        // target — that's the source of the phantom `none / <attacker-ip>`
+        // host in the loot output.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+        {
+            let mut s = state.inner.write().await;
+            s.self_ips
+                .insert("192.168.58.99".parse::<std::net::IpAddr>().unwrap());
+        }
+
+        let host = make_host("192.168.58.99", "", false);
+        let added = state.publish_host(&q, host).await.unwrap();
+        assert!(!added, "self-IP host must be silently dropped");
+
+        let s = state.inner.read().await;
+        assert!(
+            s.hosts.is_empty(),
+            "self-IP must never reach state.hosts, got: {:?}",
+            s.hosts
+        );
+    }
+
+    #[tokio::test]
+    async fn publish_host_self_ip_filter_inactive_when_set_empty() {
+        // StateInner::new() leaves self_ips empty so every publishing test
+        // remains deterministic without mocking interface enumeration.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        let host = make_host("192.168.58.99", "srv01.contoso.local", false);
+        let added = state.publish_host(&q, host).await.unwrap();
+        assert!(added);
     }
 }

@@ -1,6 +1,7 @@
 //! StateInner — the actual mutable state backing SharedState.
 
 use std::collections::{HashMap, HashSet};
+use std::net::IpAddr;
 
 use chrono::{DateTime, Utc};
 
@@ -111,6 +112,15 @@ pub struct StateInner {
     /// Timestamp when all forests were first detected as dominated.
     /// Used by the completion monitor to enforce a post-exploitation grace period.
     pub all_forests_dominated_at: Option<tokio::time::Instant>,
+
+    /// IPv4 addresses bound to the orchestrator's own network interfaces.
+    /// Populated once at orchestrator startup via `SharedState::initialize_self_ips`
+    /// from `local_ip_address::list_afinet_netifas`. `publish_host` skips any
+    /// host whose IP is in this set so the attacker pivot box doesn't get
+    /// counted as a discovered target when an SMB sweep hits its own NIC.
+    /// Empty by default — tests using `StateInner::new` get deterministic
+    /// no-op filtering without needing to mock interface enumeration.
+    pub self_ips: HashSet<IpAddr>,
 }
 
 impl StateInner {
@@ -155,6 +165,7 @@ impl StateInner {
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,
+            self_ips: HashSet::new(),
         }
     }
 
