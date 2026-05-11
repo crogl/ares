@@ -583,18 +583,65 @@ async fn record_timeline_event_disabled() {
 }
 
 #[tokio::test]
-async fn report_cracked_credential_disabled() {
+async fn report_cracked_credential_rejects_hash_shaped_value() {
+    // 32-char NTLM hash mis-reported as a "password" must be refused so the
+    // cleartext credentials set stays clean.
     let handler = make_handler();
     let call = ToolCall {
-        id: "dis-3".into(),
+        id: "rej-1".into(),
         name: "report_cracked_credential".into(),
-        arguments: json!({"hash": "aad3b:beef", "password": "cracked123"}),
+        arguments: json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "831486ac7f26860c9e2f51ac91e1a07a",
+        }),
     };
     let result = handler.handle_callback(&call).await.unwrap().unwrap();
     match result {
         CallbackResult::Continue(msg) => {
-            assert!(msg.contains("disabled"));
-            assert!(msg.contains("automatically extracted"));
+            assert!(
+                msg.contains("Rejected"),
+                "Expected rejection message, got: {msg}"
+            );
+        }
+        other => panic!("Expected Continue, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn report_cracked_credential_rejects_truncated_display() {
+    let handler = make_handler();
+    let call = ToolCall {
+        id: "rej-2".into(),
+        name: "report_cracked_credential".into(),
+        arguments: json!({
+            "username": "alice",
+            "domain": "contoso.local",
+            "password": "ef961e2fd18a412...6bf150",
+        }),
+    };
+    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    match result {
+        CallbackResult::Continue(msg) => assert!(msg.contains("Rejected")),
+        other => panic!("Expected Continue, got: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn report_cracked_credential_requires_non_empty_fields() {
+    let handler = make_handler();
+    let call = ToolCall {
+        id: "rej-3".into(),
+        name: "report_cracked_credential".into(),
+        arguments: json!({"username": "alice", "domain": "", "password": "secret123"}),
+    };
+    let result = handler.handle_callback(&call).await.unwrap().unwrap();
+    match result {
+        CallbackResult::Continue(msg) => {
+            assert!(
+                msg.contains("non-empty"),
+                "Expected validation message, got: {msg}"
+            );
         }
         other => panic!("Expected Continue, got: {:?}", other),
     }

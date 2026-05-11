@@ -70,7 +70,10 @@ pub const CALLBACK_TOOLS: &[&str] = &[
     // Universal callbacks
     "task_complete",
     "request_assistance",
-    // NOTE: report_cracked_credential removed — cracked passwords come from parsed tool output
+    // Re-added as structured fallback when the LLM cracker summarizes the
+    // result instead of piping raw `hashcat --show` stdout. Validator on
+    // the handler side rejects hash-shaped / truncated values.
+    "report_cracked_credential",
     "report_crack_failed",
     "report_finding",
     "report_lateral_success",
@@ -379,10 +382,9 @@ mod tests {
         assert!(is_callback_tool("complete_operation"));
         // Reporting tools are callbacks (not dispatched to workers)
         assert!(is_callback_tool("record_compromised_host"));
-        // Removed: record_weakness, record_timeline_event, report_cracked_credential
         assert!(!is_callback_tool("record_weakness"));
         assert!(!is_callback_tool("record_timeline_event"));
-        assert!(!is_callback_tool("report_cracked_credential"));
+        assert!(is_callback_tool("report_cracked_credential"));
         assert!(!is_callback_tool("list_weaknesses"));
         assert!(is_callback_tool("list_credentials"));
         assert!(!is_callback_tool("nmap_scan"));
@@ -529,7 +531,9 @@ mod tests {
         let tools = tools_for_role(AgentRole::Cracker);
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
         assert!(names.contains(&"crack_with_hashcat"));
-        // report_cracked_credential removed — cracked passwords come from parsed tool output
+        // Structured fallback for the cracker LLM agent when it doesn't pipe
+        // raw `hashcat --show` stdout — see cracker.rs for full rationale.
+        assert!(names.contains(&"report_cracked_credential"));
         assert!(names.contains(&"report_crack_failed"));
     }
 

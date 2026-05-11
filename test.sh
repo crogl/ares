@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# zig 0.16's linker chokes on absurdly high FD limits (e.g. 1048576 from a
+# tuned shell) when the kernel's per-process cap is much lower. Clamp to a
+# concrete value that zig is happy with — task's internal shell (mvdan/sh)
+# doesn't implement `ulimit` so we have to set this here, in real bash.
+ulimit -n 65536 || ulimit -n 10240 || true
+
 EC2_NAME="${EC2_NAME:-kali-ares}"
 TARGET="${TARGET:-dreadgoad}"
 BLUE_ENABLED="${BLUE_ENABLED:-1}"

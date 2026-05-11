@@ -248,7 +248,7 @@ pub async fn wait_for_completion(
                         inner.all_forests_dominated_at = Some(tokio::time::Instant::now());
                         drop(inner);
                         info!(
-                            "All forests dominated — starting 90s post-exploitation grace period"
+                            "All forests dominated — starting 180s post-exploitation grace period"
                         );
                         None
                     }

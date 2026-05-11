@@ -182,7 +182,51 @@ pub(crate) fn is_valid_credential(username: &str, password: &str) -> bool {
     if password.len() > 128 {
         return false;
     }
+    // Reject hash-shaped strings being stored as cleartext credentials.
+    //
+    // Hashes belong in `state.hashes`, not `state.credentials`. When a hash
+    // leaks into the credentials list the credential resolver will inject it
+    // as a `-p <hex>` cleartext password to impacket / netexec / etc., which
+    // is never going to authenticate. Worse, those failed auth attempts
+    // increment badPwdCount on the real account, eventually locking out the
+    // legitimate user before the chain can use the real cracked password.
+    // Hashes are dense hex and have well-known lengths — reject all-hex
+    // passwords at the boundary so they can't pollute the credential set
+    // even if an upstream extractor mistakenly emits them.
+    //
+    // Common shapes we reject:
+    //   32 hex            → NTLM single hash
+    //   16 hex            → LM single hash
+    //   40 hex            → SHA1 / older NT
+    //   64 hex            → SHA256
+    //   65 hex incl ':'   → LM:NTLM with separator
+    //   $-prefixed        → hashcat-style multi-field hashes
+    let pw_no_sep: String = password
+        .chars()
+        .filter(|c| !matches!(*c, ':' | '$'))
+        .collect();
+    if !pw_no_sep.is_empty()
+        && pw_no_sep.chars().all(|c| c.is_ascii_hexdigit())
+        && matches!(
+            pw_no_sep.len(),
+            16 | 32 | 40 | 48 | 56 | 64 | 65 | 80 | 96 | 128
+        )
+    {
+        return false;
+    }
     if password.len() > 40 && password.chars().all(|c| c.is_ascii_hexdigit() || c == '$') {
+        return false;
+    }
+    if password.starts_with("$krb5") || password.starts_with("$NT$") || password.starts_with("$LM$")
+    {
+        return false;
+    }
+    // Reject "ef961e2fd18a412...6bf150" — LLM-truncated hash display being
+    // mis-matched as a cleartext plaintext by the cracker regex. An ellipsis
+    // in the middle of a candidate password is never a real password; it's
+    // a hash that an LLM summarized for human display and an extraction
+    // regex then captured as if it were the cracked plaintext.
+    if password.contains("...") {
         return false;
     }
     true
@@ -258,6 +302,63 @@ mod unit_tests {
         // >40 chars, all hex+$ → hash fragment
         let hash = "aabbccddeeff00112233445566778899aabbccdd$";
         assert!(!is_valid_credential("alice", hash));
+    }
+
+    #[test]
+    fn is_valid_credential_rejects_ntlm_hash() {
+        // 32 hex chars — NTLM hash mis-shoved into the password field
+        assert!(!is_valid_credential(
+            "alice",
+            "831486ac7f26860c9e2f51ac91e1a07a"
+        ));
+    }
+
+    #[test]
+    fn is_valid_credential_rejects_lm_ntlm_with_separator() {
+        // LM:NTLM concatenation — 65 chars including the ':'
+        assert!(!is_valid_credential(
+            "alice",
+            "aad3b435b51404eeaad3b435b51404ee:831486ac7f26860c9e2f51ac91e1a07a"
+        ));
+    }
+
+    #[test]
+    fn is_valid_credential_rejects_sha256_hash() {
+        assert!(!is_valid_credential(
+            "alice",
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        ));
+    }
+
+    #[test]
+    fn is_valid_credential_rejects_krb5asrep_blob() {
+        let blob = "$krb5asrep$23$alice@CONTOSO.LOCAL:hashbody:plaintext";
+        assert!(!is_valid_credential("alice", blob));
+    }
+
+    #[test]
+    fn is_valid_credential_rejects_llm_truncated_hash() {
+        // LLMs summarize hashes with ellipsis when reporting to the orchestrator.
+        // The cracked-AS-REP regex then captures the truncated display as the
+        // "plaintext" group. Reject anything containing "..." — never a real password.
+        assert!(!is_valid_credential("alice", "ef961e2fd18a412...6bf150"));
+    }
+
+    #[test]
+    fn is_valid_credential_accepts_short_hex_word() {
+        // Legitimately short hex-looking password ("decade", "facade" etc.) —
+        // 6 chars, all hex, but NOT a known hash length. Must still accept.
+        assert!(is_valid_credential("alice", "decade"));
+        assert!(is_valid_credential("alice", "facade"));
+    }
+
+    #[test]
+    fn is_valid_credential_accepts_short_hex_at_known_length_but_not_pure_hex() {
+        // 32 chars but contains non-hex — not a hash, should accept.
+        assert!(is_valid_credential(
+            "alice",
+            "P@ssw0rd-with-32-chars-of-stuff!"
+        ));
     }
 
     #[test]

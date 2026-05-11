@@ -310,5 +310,42 @@ pub(crate) async fn resolve_domain_sid(
         }
     }
 
+    // Final fallback: null-session LSARPC lsaquery. Authenticated impacket
+    // cross-domain lookupsid (child-domain creds against the parent DC)
+    // routinely fails — impacket's Kerberos referral chain is buggy
+    // (fortra/impacket#315) and NTLM cross-domain auth gets rejected by
+    // hardened DCs. But `rpcclient -U "" -N <dc_ip> -c "lsaquery"` over a
+    // null session usually succeeds against any DC that allows anonymous
+    // LSA queries — which is most legacy/lab AD deployments. The output is
+    // parsed by `extract_lsaquery_domain_sid`. This unblocks the
+    // child→parent forge path in `auto_trust_follow` when authenticated
+    // lookupsid against the parent DC fails.
+    match tokio::process::Command::new("rpcclient")
+        .arg("-U")
+        .arg("")
+        .arg("-N")
+        .arg(dc_ip)
+        .arg("-c")
+        .arg("lsaquery")
+        .output()
+        .await
+    {
+        Ok(out) => {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            if let Some((_flat, sid)) = ares_core::parsing::extract_lsaquery_domain_sid(&combined) {
+                info!(dc_ip = %dc_ip, sid = %sid, "Resolved domain SID via null-session lsaquery fallback");
+                return Some((sid, None));
+            }
+            warn!(dc_ip = %dc_ip, "Null-session lsaquery returned no parseable SID");
+        }
+        Err(e) => {
+            warn!(err = %e, dc_ip = %dc_ip, "Failed to invoke rpcclient for null-session lsaquery");
+        }
+    }
+
     None
 }

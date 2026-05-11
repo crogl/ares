@@ -190,8 +190,32 @@ fn is_valid_password(password: &str) -> bool {
     if p.is_empty() || p.len() > 128 {
         return false;
     }
-    // Reject hex-only strings that look like hash fragments
-    if p.len() == 32 && p.chars().all(|c| c.is_ascii_hexdigit()) {
+    // Reject hex-only strings at known hash lengths. Hashes belong in
+    // state.hashes — never in state.credentials; a hash stored as a
+    // cleartext password gets injected as `-p <hex>` and lockouts the
+    // real account via failed-auth badPwdCount increments.
+    let p_no_sep: String = p.chars().filter(|c| !matches!(*c, ':' | '$')).collect();
+    if !p_no_sep.is_empty()
+        && p_no_sep.chars().all(|c| c.is_ascii_hexdigit())
+        && matches!(
+            p_no_sep.len(),
+            16 | 32 | 40 | 48 | 56 | 64 | 65 | 80 | 96 | 128
+        )
+    {
+        return false;
+    }
+    // Reject ellipsis-truncated displays. Hashcat / john never emit `...` in
+    // their --show output; the only way a candidate "plaintext" contains `...`
+    // is if something upstream truncated a hash for human display and the
+    // regex then captured that truncation as if it were the cracked password.
+    // This was observed concretely: a Hash record's `cracked_password` got
+    // populated with `ef961e2fd18a412...6bf150` (a 15+...+6 abbreviation of
+    // the actual AS-REP hash) instead of the real cleartext `fr3edom`.
+    if p.contains("...") {
+        return false;
+    }
+    // Reject hashcat-style multi-field hash blobs being mis-captured.
+    if p.starts_with("$krb5") || p.starts_with("$NT$") || p.starts_with("$LM$") {
         return false;
     }
     true
@@ -241,6 +265,38 @@ $krb5asrep$23$michelle@FABRIKAM.LOCAL:8a7a0b3264590ef6:fr3edom
         assert_eq!(creds.len(), 1);
         assert_eq!(creds[0]["username"], "Administrator");
         assert_eq!(creds[0]["password"], "Summer2024!");
+    }
+
+    #[test]
+    fn rejects_truncated_hash_as_plaintext() {
+        // Concrete regression: hashcat (or upstream) emitted a line with a
+        // truncated AS-REP blob (no real plaintext at the end). The optional
+        // hex group in the regex fails to match because `.` is not hex, then
+        // `(.+)$` greedy-captures the truncation itself as if it were the
+        // cleartext password. Validator must drop it.
+        let output = r#"--- hashcat --show ---
+$krb5asrep$23$alice@CONTOSO.LOCAL:ef961e2fd18a412...6bf150
+"#;
+        let params = json!({"domain": "contoso.local"});
+        let creds = parse_cracker_output(output, &params);
+        assert!(
+            creds.is_empty(),
+            "Truncated hash must not be stored as a cracked credential, got: {creds:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_ntlm_hash_as_plaintext() {
+        // Hash:hash mismatch — if for any reason the regex were to capture a
+        // 32-char hex string as the plaintext, the validator must drop it.
+        let output = "--- hashcat --show ---\n\
+                      e19ccf75ee54e06b06a5907af13cef42:831486ac7f26860c9e2f51ac91e1a07a\n";
+        let params = json!({"domain": "contoso.local", "username": "alice"});
+        let creds = parse_cracker_output(output, &params);
+        assert!(
+            creds.is_empty(),
+            "32-char hex must not be stored as a cleartext, got: {creds:?}"
+        );
     }
 
     #[test]

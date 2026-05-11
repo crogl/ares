@@ -332,6 +332,15 @@ impl SharedState {
     }
 
     /// Add a trust relationship to state and Redis.
+    ///
+    /// Also publishes the trust target as an authoritative candidate domain.
+    /// Trust enumeration is the only path that surfaces a foreign forest's
+    /// FQDN before any of its hosts are scanned. Without this, downstream
+    /// per-domain automations (AS-REP roast, SID enum, cross-forest forge)
+    /// that iterate `state.domains` would never see the foreign forest until
+    /// host discovery catches up — which on hardened/segmented networks may
+    /// never happen. Trust enumeration is `AuthenticatedAd` evidence, which
+    /// is authoritative on its own and promotes immediately.
     pub async fn publish_trust_info(
         &self,
         queue: &TaskQueueCore<impl ConnectionLike + Clone + Send + Sync + 'static>,
@@ -346,8 +355,27 @@ impl SharedState {
         let added = reader.add_trusted_domain(&mut conn, &trust).await?;
         if added {
             let domain_key = trust.domain.to_lowercase();
-            let mut state = self.inner.write().await;
-            state.trusted_domains.insert(domain_key, trust);
+            {
+                let mut state = self.inner.write().await;
+                state.trusted_domains.insert(domain_key.clone(), trust);
+            }
+            // Also promote the foreign domain into state.domains so the
+            // per-domain automations pick it up.
+            if let Err(e) = self
+                .publish_candidate_domain(
+                    queue,
+                    &domain_key,
+                    ares_core::models::DomainEvidence::AuthenticatedAd,
+                    None,
+                )
+                .await
+            {
+                tracing::warn!(
+                    domain = %domain_key,
+                    err = %e,
+                    "Failed to promote trust target domain into state.domains"
+                );
+            }
         }
         Ok(added)
     }
