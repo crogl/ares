@@ -1,22 +1,22 @@
 # Ansible Collection Development
 
 This collection lives inside the [ares](https://github.com/dreadnode/ares)
-repository and is consumed directly from the `ansible/` subdirectory — it is
+repository and is consumed directly from the `ansible/` subdirectory - it is
 **not** published to Ansible Galaxy. Changes ship as part of normal ares pull
 requests; there is no separate release tag, changelog generation, or
 `galaxy.yml` version bump flow.
 
 ## Layout
 
-- `ansible/roles/` — role implementations (each with `defaults/`, `tasks/`,
+- `ansible/roles/` - role implementations (each with `defaults/`, `tasks/`,
   `meta/`, optional `molecule/` scenarios, and a generated `README.md`).
-- `ansible/playbooks/ares/` — playbooks that wire roles together for the ares
+- `ansible/playbooks/ares/` - playbooks that wire roles together for the ares
   attack box (e.g. `goad_attack_box.yml`, `recon.yml`, `lateral_movement.yml`).
-- `ansible/playbooks/{linux,windows}/` — generic provisioning playbooks for
+- `ansible/playbooks/{linux,windows}/` - generic provisioning playbooks for
   range hosts.
-- `ansible/plugins/modules/` — custom modules (`vnc_pw`,
+- `ansible/plugins/modules/` - custom modules (`vnc_pw`,
   `merge_list_dicts_into_list`, `getent_passwd`).
-- `ansible/changelogs/` — retained from the upstream collection; no longer
+- `ansible/changelogs/` - retained from the upstream collection; no longer
   updated as part of the ares workflow.
 
 ## Local Development
@@ -39,11 +39,11 @@ pip install -r .hooks/requirements.txt
 
 `.pre-commit-config.yaml` runs the following on any change under `ansible/`:
 
-- `ansible-lint` — config at `.hooks/ansible/ansible-lint.yaml`.
-- `yamllint` / `markdownlint` / `codespell` / `detect-secrets` — repo-wide.
-- `docsible` (`.hooks/ansible/docsible-hook.sh`) — regenerates each
+- `ansible-lint` - config at `.hooks/ansible/ansible-lint.yaml`.
+- `yamllint` / `markdownlint` / `codespell` / `detect-secrets` - repo-wide.
+- `docsible` (`.hooks/ansible/docsible-hook.sh`) - regenerates each
   `roles/*/README.md` from role metadata.
-- `update-architecture-diagram` (`.hooks/ansible/gen-arch-diagram.py`) —
+- `update-architecture-diagram` (`.hooks/ansible/gen-arch-diagram.py`) -
   scans `ansible/{roles,plugins,playbooks}` and rewrites the Mermaid block
   in `ansible/README.md` between the `## Architecture Diagram` and
   `## Requirements` markers. Roles/playbooks with a `molecule/` directory get a
@@ -85,8 +85,8 @@ ARM64 macOS hosts should pass `--container-architecture linux/amd64` to `act`.
 
 Two workflows guard ansible changes:
 
-- `.github/workflows/pre-commit.yaml` — runs the full pre-commit suite on PRs.
-- `.github/workflows/molecule.yaml` — runs molecule scenarios on changes under
+- `.github/workflows/pre-commit.yaml` - runs the full pre-commit suite on PRs.
+- `.github/workflows/molecule.yaml` - runs molecule scenarios on changes under
   `ansible/**`, `.github/workflows/molecule.yaml`, or `.hooks/requirements.txt`.
   Also runs weekly (Sunday 04:00 UTC) and supports `workflow_dispatch` with
   `ROLE` / `SCENARIO` inputs to target a single scenario.
@@ -100,7 +100,7 @@ Two workflows guard ansible changes:
    end-state your role guarantees.
 4. Wire the role into the relevant ares playbook under
    `ansible/playbooks/ares/` if it should run as part of the attack box build.
-5. Commit — the architecture diagram in `ansible/README.md` will regenerate
+5. Commit - the architecture diagram in `ansible/README.md` will regenerate
    automatically.
 
 ## Consuming the Collection

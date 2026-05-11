@@ -198,7 +198,7 @@ Installs and configures the **Mythic C2 framework** and optional agent packages.
 ## Development
 
 This collection lives inside the [ares](https://github.com/dreadnode/ares)
-repository and is consumed directly from this subdirectory — it is not
+repository and is consumed directly from this subdirectory - it is not
 published to Ansible Galaxy. See [docs/development.md](docs/development.md)
 for layout, pre-commit hooks (including the architecture-diagram regen),
 molecule usage, and CI details.

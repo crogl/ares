@@ -2,8 +2,8 @@
 
 This template builds **Ares Blue Agent** images using Warp Gate. It supports
 building **Docker images** (for `amd64` and `arm64`). The blue agent runs SOC
-investigations — querying Loki/Prometheus, mapping findings to MITRE ATT&CK,
-and writing reports — using a compiled Rust binary with embedded Python.
+investigations - querying Loki/Prometheus, mapping findings to MITRE ATT&CK,
+and writing reports - using a compiled Rust binary with embedded Python.
 
 ---
 

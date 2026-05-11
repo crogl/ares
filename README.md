@@ -36,7 +36,7 @@ subcommands (`ares ops`, `ares orchestrator`, `ares worker`, `ares blue`,
 
 | Crate        | Purpose                                                   |
 | ------------ | --------------------------------------------------------- |
-| `ares-cli`   | Unified binary — CLI, orchestrator, and worker            |
+| `ares-cli`   | Unified binary - CLI, orchestrator, and worker            |
 | `ares-core`  | Shared models, state management, Redis schema, telemetry  |
 | `ares-llm`   | LLM providers (Anthropic, OpenAI, Ollama) + tool registry |
 | `ares-tools` | Tool dispatch and execution framework                     |
@@ -440,7 +440,7 @@ task remote:status
 
 The master config lives at `config/ares.yaml`. It defines:
 
-- **[Attack strategy](docs/strategy.md)** — technique weights, path diversity, completion modes
+- **[Attack strategy](docs/strategy.md)** - technique weights, path diversity, completion modes
 - Per-role LLM model assignments
 - Agent capabilities and tool inventories
 - Operation timeouts and limits
@@ -530,7 +530,7 @@ via the [Grafana MCP](docs/grafana_mcp_usage.md) server.
 
 ## Contributing
 
-Open a PR against `main`. Run `pre-commit` before pushing — the CI will reject commits that fail the hooks. Include tests for any new tool or agent behavior.
+Open a PR against `main`. Run `pre-commit` before pushing - the CI will reject commits that fail the hooks. Include tests for any new tool or agent behavior.
 
 ## License
 

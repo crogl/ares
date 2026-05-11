@@ -540,11 +540,11 @@ INFO | Operation phase transition: enumeration → privilege_escalation
 
 Ares uses two backends with distinct roles:
 
-- **NATS JetStream** — broker/transport for queues and RPC. Carries task
+- **NATS JetStream** - broker/transport for queues and RPC. Carries task
   dispatch (`ares.red.tasks.{role}`, `ares.blue.tasks.{role}`), tool result
   streams (`ares.{red,blue}.tasks.results.{task_id}`), and investigation
   requests. Work-queue retention auto-deletes acked messages.
-- **Redis** — durable, queryable state. Holds operation state, credentials,
+- **Redis** - durable, queryable state. Holds operation state, credentials,
   hosts, hashes, vulnerabilities, heartbeats, locks, task status, and the
   per-orchestrator deferred priority queue.
 

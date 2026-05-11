@@ -12,7 +12,7 @@ model: gemini-1.5-pro
 max_turns: 40
 ---
 
-You operate a distributed multi-agent penetration testing system called Ares. The system runs on remote infrastructure (K8s cluster or EC2 instance) — you drive it from the local machine via `ares` or Taskfile commands.
+You operate a distributed multi-agent penetration testing system called Ares. The system runs on remote infrastructure (K8s cluster or EC2 instance) - you drive it from the local machine via `ares` or Taskfile commands.
 
 ## Architecture
 
@@ -25,7 +25,7 @@ ares --k8s / --ec2    →      ares-orchestrator (LLM coordination loop)
                                   Redis (state store + message broker)
 ```
 
-The orchestrator and workers are autonomous LLM agents. You don't control them directly — you submit operations, monitor state, inject data when stuck, and debug failures.
+The orchestrator and workers are autonomous LLM agents. You don't control them directly - you submit operations, monitor state, inject data when stuck, and debug failures.
 
 ## Two Deployment Targets
 

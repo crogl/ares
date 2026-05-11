@@ -17,7 +17,7 @@ Ships the same red-team toolchain installed by
 
 The template's `targets[].azure` fields are parameterized via environment
 variables so the same template works across subscriptions and environments.
-The values below are placeholders — substitute your own.
+The values below are placeholders - substitute your own.
 
 Provisioned manually (one-time):
 
@@ -27,7 +27,7 @@ Provisioned manually (one-time):
 - A Compute Gallery (`${AZURE_GALLERY_NAME}`)
 - Image definition `ares-golden-azure` (Linux, Generalized, HyperV V2,
   publisher=`dreadnode`, offer=`ares`, sku=`golden`)
-- A user-assigned managed identity (`${AZURE_IDENTITY_ID}` — full resource ID)
+- A user-assigned managed identity (`${AZURE_IDENTITY_ID}` - full resource ID)
   with Contributor on the resource group
 - Quota for the chosen `${AZURE_VM_SIZE}` in `${AZURE_LOCATION}`
   (e.g. `Standard_NC4as_T4_v3` for T4 GPU, `Standard_D4s_v3` for CPU-only)

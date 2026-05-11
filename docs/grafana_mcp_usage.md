@@ -6,11 +6,11 @@ How the Ares SOC agent uses Grafana MCP tools to query Loki and investigate inci
 
 Blue team agents query observability data through two paths:
 
-1. **Direct Loki/Prometheus tools** — `query_loki_logs`, `query_logs_around_timestamp`,
+1. **Direct Loki/Prometheus tools** - `query_loki_logs`, `query_logs_around_timestamp`,
    `execute_parallel_queries`, etc. Defined in `ares-llm/src/tool_registry/blue/grafana.rs`
    and executed via HTTP against the Loki/Prometheus APIs.
 
-2. **Native MCP tools** — `mcp__grafana__*` tools from the Grafana MCP server.
+2. **Native MCP tools** - `mcp__grafana__*` tools from the Grafana MCP server.
    Used for label discovery, log stats, dashboard access, and annotation management.
 
 Tool descriptions embed usage guidance directly so agents know when to use each
@@ -101,28 +101,28 @@ Blue team agents have access to the following tool categories:
 
 **Loki Query Tools** (`ares-llm/src/tool_registry/blue/loki.rs`):
 
-- `query_loki_logs` — LogQL queries with time range and limit
-- `query_logs_around_timestamp` — Context-aware log retrieval around an event
-- `query_logs_progressive` — Iterative query refinement
-- `get_loki_label_values` — Label enumeration for filter discovery
-- `execute_parallel_queries` — Concurrent multi-source queries
-- `query_logs_recent` — Quick recent log lookup
-- `combine_query_patterns` — Merge multiple query patterns
+- `query_loki_logs` - LogQL queries with time range and limit
+- `query_logs_around_timestamp` - Context-aware log retrieval around an event
+- `query_logs_progressive` - Iterative query refinement
+- `get_loki_label_values` - Label enumeration for filter discovery
+- `execute_parallel_queries` - Concurrent multi-source queries
+- `query_logs_recent` - Quick recent log lookup
+- `combine_query_patterns` - Merge multiple query patterns
 
 **Grafana Tools** (`ares-llm/src/tool_registry/blue/grafana.rs`):
 
-- `get_grafana_alerts` / `get_alert_history` / `get_alerts_in_time_range` — Alert queries
-- `get_grafana_annotations` — Investigation context from annotations
-- `search_grafana_dashboards` / `get_grafana_dashboard` — Dashboard access
-- `create_annotation` — Write investigation markers back to Grafana
-- `create_detection_rule` — Auto-create alert rules from LogQL queries
-- `post_investigation_started` / `post_investigation_completed` — Investigation lifecycle annotations
+- `get_grafana_alerts` / `get_alert_history` / `get_alerts_in_time_range` - Alert queries
+- `get_grafana_annotations` - Investigation context from annotations
+- `search_grafana_dashboards` / `get_grafana_dashboard` - Dashboard access
+- `create_annotation` - Write investigation markers back to Grafana
+- `create_detection_rule` - Auto-create alert rules from LogQL queries
+- `post_investigation_started` / `post_investigation_completed` - Investigation lifecycle annotations
 
 **Detection Tools** (`ares-llm/src/tool_registry/blue/detection.rs`):
 
-- `run_detection_query` / `run_parallel_detections` — Execute MITRE-mapped detection templates
-- `list_detection_templates` — Browse available templates
-- `get_host_activity` / `get_user_activity` — Pivot investigations by host or user
+- `run_detection_query` / `run_parallel_detections` - Execute MITRE-mapped detection templates
+- `list_detection_templates` - Browse available templates
+- `get_host_activity` / `get_user_activity` - Pivot investigations by host or user
 
 ## Configuration
 
