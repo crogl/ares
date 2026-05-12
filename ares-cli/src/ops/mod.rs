@@ -9,7 +9,7 @@ mod kill;
 mod list;
 mod loot;
 mod queue;
-mod report;
+pub(crate) mod report;
 pub(crate) mod resolve;
 mod runtime;
 mod sessions;

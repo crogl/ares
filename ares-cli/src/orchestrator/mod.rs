@@ -774,6 +774,37 @@ async fn run_inner() -> Result<()> {
                 "Failed to finalize operation in Redis"
             ),
         }
+
+        // Auto-generate the red team report and cache it at ares:op:{id}:report
+        // so `ares ops report` / `task ec2:report` returns instantly from cache,
+        // and write a markdown file to disk for direct pickup.
+        match crate::ops::report::generate_and_cache_report(&mut conn, &config.operation_id).await {
+            Ok(report) => {
+                let output_dir =
+                    std::env::var("ARES_REPORT_DIR").unwrap_or_else(|_| "/tmp/reports".to_string());
+                let dir = format!("{output_dir}/red");
+                let path = format!("{dir}/{}.md", config.operation_id);
+                match std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, &report)) {
+                    Ok(()) => info!(
+                        operation_id = %config.operation_id,
+                        path = %path,
+                        bytes = report.len(),
+                        "Auto-generated red team report"
+                    ),
+                    Err(e) => warn!(
+                        operation_id = %config.operation_id,
+                        path = %path,
+                        err = %e,
+                        "Failed to write auto-generated report to disk (still cached in Redis)"
+                    ),
+                }
+            }
+            Err(e) => warn!(
+                operation_id = %config.operation_id,
+                err = %e,
+                "Failed to auto-generate red team report on completion"
+            ),
+        }
     }
 
     info!("ares-orchestrator stopped");

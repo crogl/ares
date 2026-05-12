@@ -13,6 +13,12 @@ use super::ALL_DEDUP_SETS;
 /// AD lockout observation windows. Longer values block the critical path.
 const QUARANTINE_DURATION_SECS: i64 = 300;
 
+/// TTL for `credential_capture_in_flight` entries. Long enough to cover a
+/// slow DCSync (typical: 30-90s for a populated NTDS) plus result processing,
+/// short enough that a silently-failed secretsdump unblocks the destructive
+/// ACL fallback within a couple of automation ticks.
+const CAPTURE_IN_FLIGHT_TTL_SECS: i64 = 180;
+
 #[derive(Debug)]
 pub struct StateInner {
     pub operation_id: String,
@@ -54,6 +60,20 @@ pub struct StateInner {
 
     // Per-domain DA tracking: domains where krbtgt NTLM has been obtained
     pub dominated_domains: HashSet<String>,
+
+    // Per-domain credential-capture in-flight markers. Inserted when an
+    // automation dispatches secretsdump (or another mass credential-dump
+    // primitive) for that domain. Read by destructive ACL automations to
+    // defer ForceChangePassword on accounts whose original plaintext might
+    // otherwise be overwritten before DCSync surfaces the existing hash.
+    //
+    // TTL-based: an entry is "active" for CAPTURE_IN_FLIGHT_TTL_SECS after
+    // its timestamp. No explicit clear hook — once the dump completes, the
+    // domain enters `dominated_domains` (the stronger signal), and the
+    // ACL gate falls through to the dominance check. The TTL is the safety
+    // valve for dumps that fail silently so the ACL chain still runs as
+    // a fallback rather than being blocked forever.
+    pub credential_capture_in_flight: HashMap<String, DateTime<Utc>>,
 
     // Flags
     pub has_domain_admin: bool,
@@ -161,6 +181,7 @@ impl StateInner {
             admin_names: HashMap::new(),
             trusted_domains: HashMap::new(),
             dominated_domains: HashSet::new(),
+            credential_capture_in_flight: HashMap::new(),
             has_domain_admin: false,
             has_golden_ticket: false,
             domain_admin_path: None,
@@ -220,6 +241,30 @@ impl StateInner {
         let key = format!("{}@{}", username.to_lowercase(), domain.to_lowercase());
         let expiry = Utc::now() + chrono::Duration::seconds(QUARANTINE_DURATION_SECS);
         self.quarantined_principals.insert(key, expiry);
+    }
+
+    /// Mark `domain` as having a credential-capture primitive (secretsdump,
+    /// DCSync, PTH-secretsdump) currently in flight. Read by destructive ACL
+    /// automations to avoid overwriting plaintext that DCSync is about to
+    /// surface. Domain is stored lowercased.
+    pub fn mark_credential_capture_in_flight(&mut self, domain: &str) {
+        if domain.is_empty() {
+            return;
+        }
+        self.credential_capture_in_flight
+            .insert(domain.to_lowercase(), Utc::now());
+    }
+
+    /// True iff a credential-capture primitive was dispatched against
+    /// `domain` within the last `CAPTURE_IN_FLIGHT_TTL_SECS` and the domain
+    /// has not yet entered `dominated_domains`. Once dominance is reached,
+    /// the in-flight marker is irrelevant (the dominance gate fires first).
+    pub fn credential_capture_in_flight_for(&self, domain: &str) -> bool {
+        let d = domain.to_lowercase();
+        let Some(ts) = self.credential_capture_in_flight.get(&d) else {
+            return false;
+        };
+        Utc::now().signed_duration_since(*ts).num_seconds() < CAPTURE_IN_FLIGHT_TTL_SECS
     }
 
     /// Return a deduplicated list of currently-quarantined usernames in
@@ -683,6 +728,41 @@ mod tests {
         let mut state = StateInner::new("op-1".into());
         let removed = state.unmark_processed_by_prefix("does_not_exist", "x:");
         assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn credential_capture_in_flight_initially_empty() {
+        let state = StateInner::new("op-1".into());
+        assert!(!state.credential_capture_in_flight_for("contoso.local"));
+    }
+
+    #[test]
+    fn credential_capture_in_flight_after_mark() {
+        let mut state = StateInner::new("op-1".into());
+        state.mark_credential_capture_in_flight("Contoso.Local");
+        // Stored lowercased; lookup is case-insensitive.
+        assert!(state.credential_capture_in_flight_for("contoso.local"));
+        assert!(state.credential_capture_in_flight_for("CONTOSO.LOCAL"));
+        // Unrelated domain stays clear.
+        assert!(!state.credential_capture_in_flight_for("fabrikam.local"));
+    }
+
+    #[test]
+    fn credential_capture_in_flight_expires_after_ttl() {
+        let mut state = StateInner::new("op-1".into());
+        // Backdate the marker past the TTL by writing directly.
+        state.credential_capture_in_flight.insert(
+            "contoso.local".to_string(),
+            Utc::now() - chrono::Duration::seconds(CAPTURE_IN_FLIGHT_TTL_SECS + 1),
+        );
+        assert!(!state.credential_capture_in_flight_for("contoso.local"));
+    }
+
+    #[test]
+    fn credential_capture_in_flight_empty_domain_noop() {
+        let mut state = StateInner::new("op-1".into());
+        state.mark_credential_capture_in_flight("");
+        assert!(state.credential_capture_in_flight.is_empty());
     }
 
     #[test]

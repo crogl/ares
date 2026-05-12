@@ -104,11 +104,11 @@ pub async fn auto_local_admin_secretsdump(
             {
                 Ok(Some(task_id)) => {
                     info!(task_id = %task_id, dc = %dc_ip, user = %cred.username, "Admin secretsdump dispatched");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                        state.mark_credential_capture_in_flight(&cred.domain);
+                    }
                     let _ = dispatcher
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)
@@ -161,7 +161,7 @@ pub async fn auto_local_admin_secretsdump(
             items
         };
 
-        for (dedup_key, dc_ip, hash_domain, hash_value, _parent_domain) in
+        for (dedup_key, dc_ip, hash_domain, hash_value, parent_domain) in
             hash_work.into_iter().take(2)
         {
             let priority = dispatcher.effective_priority("dc_secretsdump");
@@ -182,11 +182,11 @@ pub async fn auto_local_admin_secretsdump(
                         hash_domain = %hash_domain,
                         "PTH secretsdump dispatched against parent DC"
                     );
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                        state.mark_credential_capture_in_flight(&parent_domain);
+                    }
                     let _ = dispatcher
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)

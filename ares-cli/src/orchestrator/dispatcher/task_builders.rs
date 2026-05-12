@@ -4,9 +4,117 @@ use anyhow::Result;
 use serde_json::json;
 use tracing::{debug, info, instrument};
 
-use crate::orchestrator::state::{DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
+use ares_core::models::{Credential, Hash};
+
+use crate::orchestrator::state::{StateInner, DEDUP_CROSS_REALM_LATERAL, DEDUP_SCANNED_TARGETS};
 
 use super::Dispatcher;
+
+/// Credential + hash pair selected for an exploit task.
+#[derive(Default, Debug)]
+struct ExploitAuth {
+    credential: Option<Credential>,
+    hash: Option<Hash>,
+}
+
+impl ExploitAuth {
+    /// True when the selected auth actually matches the target domain.
+    ///
+    /// An empty `target_domain` means the caller does not constrain by domain
+    /// (e.g. anonymous/local exploits) — any selected auth counts as a match.
+    fn matches_domain(&self, target_domain: &str) -> bool {
+        if target_domain.is_empty() {
+            return self.credential.is_some() || self.hash.is_some();
+        }
+        let cred_match = self
+            .credential
+            .as_ref()
+            .map(|c| c.domain.eq_ignore_ascii_case(target_domain))
+            .unwrap_or(false);
+        let hash_match = self
+            .hash
+            .as_ref()
+            .map(|h| h.domain.eq_ignore_ascii_case(target_domain))
+            .unwrap_or(false);
+        cred_match || hash_match
+    }
+}
+
+/// Select a credential + hash for an exploit task.
+///
+/// Lookup order:
+///   1. Credential by `account_name` (any domain).
+///   2. Credential in the target domain, excluding delegation accounts.
+///   3. Hash by `account_name` (any domain).
+///   4. Hash in the target domain.
+///
+/// When no `domain` is supplied, falls back to "any non-delegation credential"
+/// — preserved for legacy callers that dispatch domain-agnostic exploits.
+/// Callers that specify a `domain` should consult [`ExploitAuth::matches_domain`]
+/// and defer dispatch when it returns false, rather than firing the task with
+/// a wrong-realm credential attached.
+fn select_exploit_auth(
+    state: &StateInner,
+    account_name: Option<&str>,
+    domain: &str,
+) -> ExploitAuth {
+    let credential = if let Some(acct) = account_name {
+        state
+            .credentials
+            .iter()
+            .find(|c| c.username.eq_ignore_ascii_case(acct))
+    } else {
+        None
+    }
+    .or_else(|| {
+        if !domain.is_empty() {
+            state.credentials.iter().find(|c| {
+                c.domain.eq_ignore_ascii_case(domain) && !state.is_delegation_account(&c.username)
+            })
+        } else {
+            state
+                .credentials
+                .iter()
+                .find(|c| !state.is_delegation_account(&c.username))
+        }
+    })
+    .cloned();
+
+    let hash = if let Some(acct) = account_name {
+        state
+            .hashes
+            .iter()
+            .find(|h| h.username.eq_ignore_ascii_case(acct))
+    } else if !domain.is_empty() {
+        state
+            .hashes
+            .iter()
+            .find(|h| h.domain.eq_ignore_ascii_case(domain))
+    } else {
+        None
+    }
+    .cloned();
+
+    ExploitAuth { credential, hash }
+}
+
+/// Vuln types that do not require an authenticated credential to exploit.
+///
+/// These run pre-auth (against the network stack of the DC, or via NTLM relay)
+/// and would be incorrectly deferred by the credential gate. Kept narrow on
+/// purpose — adding to this list bypasses the gate and reintroduces the
+/// wrong-realm dispatch failure mode if the vuln actually does need auth.
+fn vuln_type_is_preauth(vtype: &str) -> bool {
+    matches!(
+        vtype.to_ascii_lowercase().as_str(),
+        "zerologon"
+            | "nopac"
+            | "petitpotam_unauth"
+            | "printnightmare_unauth"
+            | "dfscoerce_unauth"
+            | "esc8_relay"
+    )
+}
 
 impl Dispatcher {
     /// Submit a crack task for a hash.
@@ -361,65 +469,58 @@ impl Dispatcher {
             "details": vuln.details,
         });
 
-        // Look up credentials for this exploit from state
-        {
+        let account_name = vuln
+            .details
+            .get("account_name")
+            .and_then(|v| v.as_str())
+            .or_else(|| vuln.details.get("AccountName").and_then(|v| v.as_str()));
+
+        let domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let (auth, all_creds_for_mssql) = {
             let state = self.state.read().await;
+            let auth = select_exploit_auth(&state, account_name, domain);
 
-            // Try account_name from vuln details first, then fall back to any cred for the target domain
-            let account_name = vuln
-                .details
-                .get("account_name")
-                .and_then(|v| v.as_str())
-                .or_else(|| vuln.details.get("AccountName").and_then(|v| v.as_str()));
-
-            let domain = vuln
-                .details
-                .get("domain")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-
-            // Try to find a matching credential
-            let cred = if let Some(acct) = account_name {
-                state
-                    .credentials
-                    .iter()
-                    .find(|c| c.username.to_lowercase() == acct.to_lowercase())
-            } else {
-                None
-            }
-            .or_else(|| {
-                // Fall back to any non-delegation credential for the vuln's domain
-                if !domain.is_empty() {
-                    state.credentials.iter().find(|c| {
-                        c.domain.to_lowercase() == domain.to_lowercase()
-                            && !state.is_delegation_account(&c.username)
-                    })
-                } else {
-                    // Fall back to first available non-delegation credential
-                    state
-                        .credentials
-                        .iter()
-                        .find(|c| !state.is_delegation_account(&c.username))
-                }
-            });
-
-            if let Some(cred) = cred {
-                payload["credential"] = json!({
-                    "username": cred.username,
-                    "password": cred.password,
-                    "domain": cred.domain,
-                });
+            // Credential gate: refuse to dispatch when the vuln targets a
+            // specific AD domain but no usable credential or hash exists for
+            // that domain. Without this, the orchestrator dispatches the
+            // exploit with a wrong-realm credential (or no auth at all)
+            // attached, the LLM agent fails with KRB 0x52e or "no
+            // credential," the cooldown burns through MAX_EXPLOIT_FAILURES,
+            // and the vuln is marked abandoned — even though the cracker or
+            // a later inject would have unlocked the path. Returning
+            // Ok(None) here lets the exploitation workflow re-enqueue the
+            // vuln and retry once a domain-matched credential lands.
+            //
+            // Pre-auth attacks (zerologon and friends) bypass the gate
+            // because they don't need authentication to fire.
+            if !domain.is_empty()
+                && !vuln_type_is_preauth(&vuln.vuln_type)
+                && !auth.matches_domain(domain)
+            {
+                debug!(
+                    vuln_id = %vuln.vuln_id,
+                    vuln_type = %vuln.vuln_type,
+                    domain = domain,
+                    "Deferring exploit — no credential or hash available for target domain"
+                );
+                return Ok(None);
             }
 
-            // For MSSQL vulns, include ALL available credentials for the domain
-            // so the LLM can try each one (different users have different MSSQL
-            // permissions — e.g. sam.wilson can EXECUTE AS LOGIN = 'sa').
-            if vuln.vuln_type.starts_with("mssql") && !domain.is_empty() {
-                let all_creds: Vec<_> = state
+            // For MSSQL vulns, include ALL available credentials for the
+            // domain so the LLM can try each one (different users have
+            // different MSSQL permissions — e.g. sam.wilson can
+            // EXECUTE AS LOGIN = 'sa').
+            let all_creds = if vuln.vuln_type.starts_with("mssql") && !domain.is_empty() {
+                let v: Vec<_> = state
                     .credentials
                     .iter()
                     .filter(|c| {
-                        c.domain.to_lowercase() == domain.to_lowercase()
+                        c.domain.eq_ignore_ascii_case(domain)
                             && !state.is_delegation_account(&c.username)
                     })
                     .map(|c| {
@@ -430,24 +531,33 @@ impl Dispatcher {
                         })
                     })
                     .collect();
-                if all_creds.len() > 1 {
-                    payload["all_credentials"] = json!(all_creds);
-                }
-            }
+                Some(v)
+            } else {
+                None
+            };
 
-            // Also attach a hash if available for the account
-            if let Some(acct) = account_name {
-                if let Some(hash) = state
-                    .hashes
-                    .iter()
-                    .find(|h| h.username.to_lowercase() == acct.to_lowercase())
-                {
-                    payload["hash"] = json!(hash.hash_value);
-                    payload["hash_username"] = json!(hash.username);
-                    if let Some(ref aes) = hash.aes_key {
-                        payload["aes_key"] = json!(aes);
-                    }
-                }
+            (auth, all_creds)
+        };
+
+        if let Some(ref cred) = auth.credential {
+            payload["credential"] = json!({
+                "username": cred.username,
+                "password": cred.password,
+                "domain": cred.domain,
+            });
+        }
+
+        if let Some(all_creds) = all_creds_for_mssql {
+            if all_creds.len() > 1 {
+                payload["all_credentials"] = json!(all_creds);
+            }
+        }
+
+        if let Some(ref hash) = auth.hash {
+            payload["hash"] = json!(hash.hash_value);
+            payload["hash_username"] = json!(hash.username);
+            if let Some(ref aes) = hash.aes_key {
+                payload["aes_key"] = json!(aes);
             }
         }
 
@@ -567,5 +677,226 @@ impl Dispatcher {
         let op_id = self.state.operation_id().await;
         self.queue.publish_state_update(&op_id).await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_cred(username: &str, domain: &str) -> Credential {
+        Credential {
+            id: format!("cred-{username}-{domain}"),
+            username: username.into(),
+            password: "P@ssw0rd!".into(),
+            domain: domain.into(),
+            source: "test".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    fn make_hash(username: &str, domain: &str) -> Hash {
+        Hash {
+            id: format!("hash-{username}-{domain}"),
+            username: username.into(),
+            hash_value: "aad3b435b51404eeaad3b435b51404ee:31d6cfe0d16ae931b73c59d7e0c089c0".into(),
+            hash_type: "NTLM".into(),
+            domain: domain.into(),
+            cracked_password: None,
+            source: "test".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
+    #[test]
+    fn select_auth_prefers_account_name_over_domain() {
+        let mut state = StateInner::new("op-test".into());
+        state.credentials.push(make_cred("bob", "fabrikam.local"));
+        state.credentials.push(make_cred("alice", "contoso.local"));
+
+        let auth = select_exploit_auth(&state, Some("alice"), "fabrikam.local");
+
+        assert_eq!(auth.credential.as_ref().unwrap().username, "alice");
+        assert_eq!(auth.credential.as_ref().unwrap().domain, "contoso.local");
+    }
+
+    #[test]
+    fn select_auth_finds_domain_cred_when_account_unset() {
+        let mut state = StateInner::new("op-test".into());
+        state.credentials.push(make_cred("alice", "contoso.local"));
+        state.credentials.push(make_cred("carol", "fabrikam.local"));
+
+        let auth = select_exploit_auth(&state, None, "fabrikam.local");
+
+        assert_eq!(auth.credential.as_ref().unwrap().username, "carol");
+    }
+
+    #[test]
+    fn select_auth_returns_no_cred_when_domain_unmatched() {
+        let mut state = StateInner::new("op-test".into());
+        state.credentials.push(make_cred("alice", "contoso.local"));
+
+        let auth = select_exploit_auth(&state, None, "fabrikam.local");
+
+        assert!(
+            auth.credential.is_none(),
+            "must not fall back to wrong-realm cred"
+        );
+    }
+
+    #[test]
+    fn select_auth_falls_back_to_any_cred_when_no_domain() {
+        let mut state = StateInner::new("op-test".into());
+        state.credentials.push(make_cred("alice", "contoso.local"));
+
+        let auth = select_exploit_auth(&state, None, "");
+
+        // Legacy behavior preserved: when caller doesn't specify a domain,
+        // any non-delegation credential is acceptable.
+        assert_eq!(auth.credential.as_ref().unwrap().username, "alice");
+    }
+
+    #[test]
+    fn select_auth_picks_domain_hash_when_account_unset() {
+        let mut state = StateInner::new("op-test".into());
+        state.hashes.push(make_hash("carol", "fabrikam.local"));
+        state.hashes.push(make_hash("alice", "contoso.local"));
+
+        let auth = select_exploit_auth(&state, None, "fabrikam.local");
+
+        assert_eq!(auth.hash.as_ref().unwrap().domain, "fabrikam.local");
+    }
+
+    #[test]
+    fn select_auth_domain_match_is_case_insensitive() {
+        let mut state = StateInner::new("op-test".into());
+        state.credentials.push(make_cred("alice", "FABRIKAM.LOCAL"));
+
+        let auth = select_exploit_auth(&state, None, "fabrikam.local");
+
+        assert!(auth.credential.is_some());
+    }
+
+    #[test]
+    fn matches_domain_true_when_cred_matches() {
+        let auth = ExploitAuth {
+            credential: Some(make_cred("alice", "fabrikam.local")),
+            hash: None,
+        };
+        assert!(auth.matches_domain("fabrikam.local"));
+        assert!(auth.matches_domain("FABRIKAM.LOCAL"));
+    }
+
+    #[test]
+    fn matches_domain_true_when_hash_matches() {
+        let auth = ExploitAuth {
+            credential: None,
+            hash: Some(make_hash("alice", "fabrikam.local")),
+        };
+        assert!(auth.matches_domain("fabrikam.local"));
+    }
+
+    #[test]
+    fn matches_domain_false_when_neither_matches() {
+        // The bug fix: a cred existed but for the wrong realm, so the exploit
+        // should be deferred, not dispatched with a wrong-realm cred attached.
+        let auth = ExploitAuth {
+            credential: Some(make_cred("alice", "contoso.local")),
+            hash: None,
+        };
+        assert!(!auth.matches_domain("fabrikam.local"));
+    }
+
+    #[test]
+    fn matches_domain_empty_target_accepts_any_auth() {
+        let auth = ExploitAuth {
+            credential: Some(make_cred("alice", "contoso.local")),
+            hash: None,
+        };
+        // Empty target = no domain constraint = legacy behavior.
+        assert!(auth.matches_domain(""));
+    }
+
+    #[test]
+    fn matches_domain_empty_target_rejects_no_auth() {
+        let auth = ExploitAuth::default();
+        assert!(!auth.matches_domain(""));
+    }
+
+    #[test]
+    fn preauth_vuln_types_bypass_gate() {
+        for vt in [
+            "zerologon",
+            "ZeroLogon",
+            "nopac",
+            "petitpotam_unauth",
+            "printnightmare_unauth",
+            "dfscoerce_unauth",
+            "esc8_relay",
+        ] {
+            assert!(vuln_type_is_preauth(vt), "{vt} should be pre-auth");
+        }
+    }
+
+    #[test]
+    fn auth_required_vuln_types_do_not_bypass_gate() {
+        for vt in [
+            "mssql_access",
+            "writeproperty",
+            "genericall",
+            "dcsync",
+            "esc1",
+            "kerberoast",
+        ] {
+            assert!(
+                !vuln_type_is_preauth(vt),
+                "{vt} should require credential gate"
+            );
+        }
+    }
+
+    #[test]
+    fn select_auth_skips_delegation_account_in_domain_fallback() {
+        let mut state = StateInner::new("op-test".into());
+        // Mark svc_deleg as a delegation account by adding a vuln that names it.
+        state.discovered_vulnerabilities.insert(
+            "vuln-deleg".into(),
+            ares_core::models::VulnerabilityInfo {
+                vuln_id: "vuln-deleg".into(),
+                vuln_type: "constrained_delegation".into(),
+                target: "192.168.58.10".into(),
+                discovered_by: "test".into(),
+                discovered_at: chrono::Utc::now(),
+                details: {
+                    let mut m = std::collections::HashMap::new();
+                    m.insert(
+                        "account_name".into(),
+                        serde_json::Value::String("svc_deleg".into()),
+                    );
+                    m
+                },
+                recommended_agent: String::new(),
+                priority: 1,
+            },
+        );
+        state
+            .credentials
+            .push(make_cred("svc_deleg", "fabrikam.local"));
+        state.credentials.push(make_cred("alice", "fabrikam.local"));
+
+        // account_name unset → falls back to domain match, must skip svc_deleg.
+        let auth = select_exploit_auth(&state, None, "fabrikam.local");
+
+        assert_eq!(auth.credential.as_ref().unwrap().username, "alice");
     }
 }

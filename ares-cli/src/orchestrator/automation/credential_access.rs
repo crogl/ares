@@ -629,11 +629,11 @@ pub async fn auto_credential_access(
                         username = %cred.username,
                         "Credential secretsdump dispatched"
                     );
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                    {
+                        let mut state = dispatcher.state.write().await;
+                        state.mark_processed(DEDUP_SECRETSDUMP, dedup_key.clone());
+                        state.mark_credential_capture_in_flight(&cred.domain);
+                    }
                     let _ = dispatcher
                         .state
                         .persist_dedup(&dispatcher.queue, DEDUP_SECRETSDUMP, &dedup_key)

@@ -1064,10 +1064,81 @@ tasks:
       {{if eq .LATEST "true"}}--latest{{end}}
 
   # ============================================================================
+  # Watch + auto-report
+  # ============================================================================
+  watch:
+    desc: "Poll EC2 operation until complete, then auto-fetch the report locally (usage: task ec2:watch [EC2_NAME=kali-ares] [LATEST=true] [OPERATION_ID=op-xxx] [POLL_INTERVAL=30] [MAX_WAIT=7200] [OUTPUT_DIR=./reports])"
+    silent: true
+    vars:
+      OPERATION_ID: '{{.OPERATION_ID | default ""}}'
+      LATEST: '{{.LATEST | default "true"}}'
+      POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
+      MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
+    cmds:
+      - |
+        if [ -z "{{.OPERATION_ID}}" ] && [ "{{.LATEST}}" != "true" ]; then
+          echo -e "{{.ERROR}} Either OPERATION_ID or LATEST=true is required"
+          exit 1
+        fi
+
+        OP_ARG=""
+        LATEST_FLAG=""
+        if [ -n "{{.OPERATION_ID}}" ]; then
+          OP_ARG="{{.OPERATION_ID}}"
+        else
+          LATEST_FLAG="--latest"
+        fi
+
+        START=$(date +%s)
+        echo -e "{{.INFO}} Watching EC2 operation (poll={{.POLL_INTERVAL}}s, max_wait={{.MAX_WAIT}}s)"
+        echo -e "{{.INFO}} Will fetch report to {{.OUTPUT_DIR}}/red/ when the op reaches a terminal state"
+
+        RESOLVED_OP=""
+        while true; do
+          ELAPSED=$(( $(date +%s) - START ))
+          if [ $ELAPSED -gt {{.MAX_WAIT}} ]; then
+            echo -e "{{.ERROR}} Max wait ({{.MAX_WAIT}}s) exceeded, giving up"
+            exit 1
+          fi
+
+          STATUS_OUT=$(ares --ec2 {{.EC2_NAME}} --ec2-profile {{.EC2_PROFILE}} --ec2-region {{.EC2_REGION}} \
+            ops status $OP_ARG $LATEST_FLAG 2>&1 || true)
+
+          STATUS=$(echo "$STATUS_OUT" | grep -E '^Status: ' | head -1 | awk '{print $2}')
+          OP_ID=$(echo "$STATUS_OUT" | grep -E '^Operation: ' | head -1 | awk '{print $2}')
+          if [ -n "$OP_ID" ]; then
+            RESOLVED_OP="$OP_ID"
+          fi
+
+          if [ -z "$STATUS" ]; then
+            echo -e "{{.WARN}} [${ELAPSED}s] no status yet (waiting for op to register)"
+          else
+            echo -e "{{.INFO}} [${ELAPSED}s] op=${RESOLVED_OP:-?} status=$STATUS"
+            case "$STATUS" in
+              completed|stopped)
+                echo -e "{{.SUCCESS}} Operation reached terminal state: $STATUS"
+                break
+                ;;
+            esac
+          fi
+
+          sleep {{.POLL_INTERVAL}}
+        done
+
+        if [ -z "$RESOLVED_OP" ]; then
+          echo -e "{{.ERROR}} Could not resolve operation ID — cannot fetch report"
+          exit 1
+        fi
+
+        echo -e "{{.INFO}} Fetching report for $RESOLVED_OP..."
+        task ec2:report EC2_NAME={{.EC2_NAME}} OPERATION_ID=$RESOLVED_OP OUTPUT_DIR={{.OUTPUT_DIR}}
+
+  # ============================================================================
   # Operation Launch
   # ============================================================================
   launch:
-    desc: "Launch orchestrator on EC2 via Secrets Manager (usage: task ec2:launch EC2_NAME=kali-ares [DOMAIN=...] [TARGETS=...] [CRED_USER=...] [CRED_PASS=...])"
+    desc: "Launch orchestrator on EC2 via Secrets Manager (usage: task ec2:launch EC2_NAME=kali-ares [DOMAIN=...] [TARGETS=...] [CRED_USER=...] [CRED_PASS=...] [WAIT=true] [POLL_INTERVAL=30])"
     silent: true
     vars:
       DOMAIN: '{{.DOMAIN | default "sevenkingdoms.local"}}'
@@ -1079,6 +1150,10 @@ tasks:
       LLM_MODEL: '{{.LLM_MODEL | default ""}}'
       FLUSH_REDIS: '{{.FLUSH_REDIS | default "true"}}'
       OPERATION_ID: '{{.OPERATION_ID | default ""}}'
+      WAIT: '{{.WAIT | default "false"}}'
+      POLL_INTERVAL: '{{.POLL_INTERVAL | default "30"}}'
+      MAX_WAIT: '{{.MAX_WAIT | default "7200"}}'
+      OUTPUT_DIR: '{{.OUTPUT_DIR | default "./reports"}}'
     cmds:
       - |
         INSTANCE_ID=$(aws ec2 describe-instances \
@@ -1260,6 +1335,16 @@ tasks:
 
         echo -e "{{.SUCCESS}} Operation $OP_ID launched"
         echo -e "{{.INFO}} Monitor: task ec2:runtime EC2_NAME={{.EC2_NAME}}"
+
+        if [ "{{.WAIT}}" = "true" ]; then
+          echo -e "{{.INFO}} WAIT=true — handing off to ec2:watch (auto-fetch report on completion)"
+          task ec2:watch \
+            EC2_NAME={{.EC2_NAME}} \
+            OPERATION_ID="$OP_ID" \
+            POLL_INTERVAL={{.POLL_INTERVAL}} \
+            MAX_WAIT={{.MAX_WAIT}} \
+            OUTPUT_DIR={{.OUTPUT_DIR}}
+        fi
 
   # ============================================================================
   # Post-AMI Tool Setup

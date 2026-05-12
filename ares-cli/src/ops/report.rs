@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use redis::AsyncCommands;
 
 use ares_core::state::RedisStateReader;
 
@@ -25,15 +26,33 @@ pub(crate) async fn ops_report(
         }
     }
 
-    // Generate report from state using tera templates
+    let report = generate_and_cache_report(&mut conn, &op_id).await?;
+    let report_path = save_report(&output_dir, &op_id, &report)?;
+    println!("Report saved to {report_path}");
+
+    Ok(())
+}
+
+/// Render a red team report from current Redis state for `op_id`, cache it at
+/// `ares:op:{op_id}:report`, and return the rendered markdown.
+///
+/// Used by both `ops_report` (CLI on-demand fetch) and the orchestrator's
+/// completion path so finished operations always have a report available
+/// without operator action.
+pub(crate) async fn generate_and_cache_report(
+    conn: &mut impl AsyncCommands,
+    op_id: &str,
+) -> Result<String> {
+    let reader = RedisStateReader::new(op_id.to_string());
+
     let state = reader
-        .load_state(&mut conn)
+        .load_state(conn)
         .await?
         .with_context(|| format!("No state found for operation: {op_id}"))?;
 
-    let timeline = reader.get_timeline(&mut conn).await.unwrap_or_default();
-    let techniques = reader.get_techniques(&mut conn).await.unwrap_or_default();
-    let is_running = reader.is_running(&mut conn).await.unwrap_or(false);
+    let timeline = reader.get_timeline(conn).await.unwrap_or_default();
+    let techniques = reader.get_techniques(conn).await.unwrap_or_default();
+    let is_running = reader.is_running(conn).await.unwrap_or(false);
 
     let generator = ares_core::reports::RedTeamReportGenerator::new()
         .context("Failed to initialize report template engine")?;
@@ -41,10 +60,14 @@ pub(crate) async fn ops_report(
         .generate_comprehensive(&state, &timeline, &techniques)
         .or_else(|_| generator.generate_summary(&state, &timeline, &techniques, is_running))
         .context("Failed to render report template")?;
-    let report_path = save_report(&output_dir, &op_id, &report)?;
-    println!("Report saved to {report_path}");
 
-    Ok(())
+    let key = format!("ares:op:{op_id}:report");
+    let _: () = conn
+        .set(&key, &report)
+        .await
+        .with_context(|| format!("Failed to cache report at {key}"))?;
+
+    Ok(report)
 }
 
 fn save_report(output_dir: &str, op_id: &str, report: &str) -> Result<String> {
