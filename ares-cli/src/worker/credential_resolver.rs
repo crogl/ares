@@ -40,6 +40,10 @@ use tracing::{debug, info, warn};
 use ares_core::models::{Credential, Hash};
 use ares_core::state::RedisStateReader;
 
+use crate::orchestrator::recovery::{
+    normalize_credential_domains, normalize_hash_domains, resolve_domain,
+};
+
 /// Argument keys that contain secret material and must come from state, never
 /// from the LLM.
 pub const CREDENTIAL_KEYS: &[&str] = &[
@@ -75,23 +79,30 @@ pub const CREDENTIAL_KEYS: &[&str] = &[
 ///
 /// If `operation_id` is `None`, this is a no-op: the tool runs with whatever
 /// arguments were provided. This handles direct CLI invokes and tests.
+/// Resolve the credential, ticket, and tool-redirection inputs for a single
+/// tool dispatch. Returns `Ok(Some(new_tool_name))` when a cross-forest Kerberos
+/// coercion redirected the call to a `*_kerberos` variant — callers MUST
+/// substitute that name before invoking `ares_tools::dispatch`. `Ok(None)`
+/// means the call should proceed under the original `tool_name`.
 pub async fn resolve_credentials(
     conn: &mut ConnectionManager,
     operation_id: Option<&str>,
     tool_name: &str,
     arguments: &mut Value,
-) -> Result<()> {
+) -> Result<Option<String>> {
     let Some(op_id) = operation_id else {
         debug!(
             tool = %tool_name,
             "credential_resolver: no operation_id, skipping resolution"
         );
-        return Ok(());
+        return Ok(None);
     };
 
     let Some(args_obj) = arguments.as_object_mut() else {
-        return Ok(());
+        return Ok(None);
     };
+
+    let mut redirected_tool: Option<String> = None;
 
     // Strip any LLM-supplied credential placeholders before lookup. Even if
     // state has nothing, we never want a `[HASH]` or `<password>` literal to
@@ -102,9 +113,21 @@ pub async fn resolve_credentials(
 
     // Bulk-load state once per call. These are HASHes/LISTs cached in Redis,
     // so the cost is small relative to the subsequent tool execution.
-    let credentials = reader.get_credentials(conn).await.unwrap_or_default();
-    let hashes = reader.get_hashes(conn).await.unwrap_or_default();
+    let mut credentials = reader.get_credentials(conn).await.unwrap_or_default();
+    let mut hashes = reader.get_hashes(conn).await.unwrap_or_default();
     let domain_sids = reader.get_domain_sids(conn).await.unwrap_or_default();
+    let netbios_map = reader.get_netbios_map(conn).await.unwrap_or_default();
+
+    // Collapse NetBIOS short-form domains ("CONTOSO") to FQDN
+    // ("contoso.local") on the in-memory copy so a lookup against either form
+    // finds the cred. The recovery loop also normalizes at rest, but
+    // ingestion between recoveries can leave short-form rows; matching both
+    // shapes from the read side avoids burning a tool call when the cred is
+    // on the board.
+    if !netbios_map.is_empty() {
+        normalize_credential_domains(&mut credentials, &netbios_map);
+        normalize_hash_domains(&mut hashes, &netbios_map);
+    }
 
     let primary_username = string_field(args_obj, "username");
     // `bind_domain` is the auth realm for cross-forest queries (e.g.
@@ -148,6 +171,16 @@ pub async fn resolve_credentials(
                 domain = %d,
                 "credential_resolver: inferred missing domain from target host"
             );
+        }
+    }
+
+    // If the resolved domain is a NetBIOS short-form ("CONTOSO"), collapse to
+    // FQDN before the lookup. Stored creds (above) are already normalized in
+    // memory; this normalizes the *query* side so both shapes converge. Runs
+    // after both args-supplied and inferred paths so neither escapes.
+    if let Some(d) = primary_domain.as_deref() {
+        if let Some(fqdn) = resolve_domain(d, &netbios_map) {
+            primary_domain = Some(fqdn);
         }
     }
 
@@ -208,21 +241,43 @@ pub async fn resolve_credentials(
     // krbtgt hash — for golden ticket forging.
     resolve_krbtgt_hashes(args_obj, &hashes);
 
-    // Cross-forest Kerberos ticket — inject ticket_path for LDAP-bind tools
-    // when the target server is in a foreign forest. `primary_domain` prefers
-    // `bind_domain` (the auth realm) for cred resolution, but the inter-realm
-    // ticket must be looked up by the *target* realm (the server's realm).
-    // For ldap_acl_enumeration / ldap_search against a foreign DC, the LLM
-    // passes `domain=<target_realm>` and `bind_domain=<auth_realm>` — without
-    // this distinction we look up the ticket under the auth realm and miss
-    // the forged ccache, leaving the tool to attempt cross-realm NTLM bind
-    // (which the foreign DC rejects with 0x52e).
-    if requires_exact_realm(tool_name) && !args_obj.contains_key("ticket_path") {
-        let target_realm = string_field(args_obj, "target_domain")
-            .or_else(|| string_field(args_obj, "domain"))
-            .or_else(|| primary_domain.clone());
+    // Cross-forest Kerberos ticket — inject ticket_path when the target server
+    // is in a foreign forest and we have a forged inter-realm ccache for it.
+    //
+    // Two trigger paths:
+    //
+    // 1. LDAP-bind tools (`requires_exact_realm`) — the LLM passes
+    //    `domain=<target_realm>` and `bind_domain=<auth_realm>`. `primary_domain`
+    //    is the auth realm; the *target* realm is `domain`/`target_domain`.
+    //    Without this distinction we look up the ticket under the auth realm
+    //    and miss the forged ccache, leaving the tool to attempt cross-realm
+    //    NTLM bind (which the foreign DC rejects with 0x52e).
+    //
+    // 2. impacket-secretsdump-class tools (`supports_kerberos_auth_mode`) —
+    //    `domain` is the user's realm, not the target. cross-realm NTLM bind
+    //    against a hardened DC is rejected (impacket cross-realm referral is
+    //    broken — see CLAUDE.md). Infer the target realm from the target host
+    //    so the forged ccache for the *server's* realm is found, then flip the
+    //    tool into Kerberos mode (`no_pass=true`, strip password/hash).
+    if !args_obj.contains_key("ticket_path") {
+        let target_realm = if requires_exact_realm(tool_name) {
+            string_field(args_obj, "target_domain")
+                .or_else(|| string_field(args_obj, "domain"))
+                .or_else(|| primary_domain.clone())
+        } else if supports_kerberos_auth_mode(tool_name) {
+            infer_domain_from_target(args_obj, conn, &reader)
+                .await
+                .or_else(|| primary_domain.clone())
+        } else {
+            None
+        };
         if let Some(ref realm) = target_realm {
-            resolve_cross_forest_ticket(args_obj, &reader, conn, tool_name, realm, &hashes).await;
+            if let Some(renamed) =
+                resolve_cross_forest_ticket(args_obj, &reader, conn, tool_name, realm, &hashes)
+                    .await
+            {
+                redirected_tool = Some(renamed);
+            }
         }
     }
 
@@ -232,7 +287,7 @@ pub async fn resolve_credentials(
     // Domain SIDs — direct lookup against the domain_sids HASH.
     resolve_domain_sids(args_obj, &domain_sids);
 
-    Ok(())
+    Ok(redirected_tool)
 }
 
 /// Remove any credential-shaped argument whose value is empty, null, or a
@@ -744,6 +799,61 @@ pub(crate) fn requires_exact_realm(tool_name: &str) -> bool {
     )
 }
 
+/// How a tool transitions into Kerberos auth mode when a cross-forest (forged
+/// inter-realm) ccache is available for the target host's realm. Single source
+/// of truth — `expects_ticket`, `supports_kerberos_auth_mode`, and the dispatcher
+/// rename hook all derive from this. Adding a Kerberos-capable tool means
+/// extending [`kerberos_coercion`] once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum KerberosCoercion {
+    /// Tool accepts `no_pass=true`+`ticket_path` in place. Apply the flip and
+    /// dispatch under the same tool name. Example: impacket-secretsdump.
+    InPlace,
+    /// Tool doesn't accept `ticket_path` directly — a dedicated `*_kerberos`
+    /// variant exists. The resolver injects the ticket and signals the
+    /// dispatcher to rename the tool. The renamed variant is `AlreadyKerberos`.
+    /// Example: psexec → psexec_kerberos.
+    Redirect(&'static str),
+    /// Tool is already a `*_kerberos` variant. Apply the flip but don't rename.
+    /// Example: secretsdump_kerberos.
+    AlreadyKerberos,
+    /// Tool has no Kerberos mode. The resolver leaves it alone and the LDAP-bind
+    /// FQDN rewrite is the only cross-forest transform that may still apply.
+    None,
+}
+
+/// Look up the Kerberos coercion for a tool. See [`KerberosCoercion`].
+pub(crate) fn kerberos_coercion(tool_name: &str) -> KerberosCoercion {
+    match tool_name {
+        "secretsdump" => KerberosCoercion::InPlace,
+        "psexec" => KerberosCoercion::Redirect("psexec_kerberos"),
+        "wmiexec" => KerberosCoercion::Redirect("wmiexec_kerberos"),
+        "smbexec" => KerberosCoercion::Redirect("smbexec_kerberos"),
+        "secretsdump_kerberos" | "psexec_kerberos" | "wmiexec_kerberos" | "smbexec_kerberos" => {
+            KerberosCoercion::AlreadyKerberos
+        }
+        _ => KerberosCoercion::None,
+    }
+}
+
+/// True when the tool has any Kerberos auth path the resolver can take.
+/// Derived from [`kerberos_coercion`] — the call site uses it as a guard to
+/// decide whether to even look up an inter-realm ticket for the target realm.
+pub(crate) fn supports_kerberos_auth_mode(tool_name: &str) -> bool {
+    !matches!(kerberos_coercion(tool_name), KerberosCoercion::None)
+}
+
+/// Flip a tool's args into Kerberos auth mode: set `no_pass=true` and remove
+/// any `password` / `hash` that the principal resolver injected earlier.
+/// Returns `(stripped_password, stripped_hash)` so the caller can log
+/// what was removed.
+pub(crate) fn apply_kerberos_auth_mode_flip(args: &mut Map<String, Value>) -> (bool, bool) {
+    args.insert("no_pass".to_string(), Value::Bool(true));
+    let stripped_password = args.remove("password").is_some();
+    let stripped_hash = args.remove("hash").is_some();
+    (stripped_password, stripped_hash)
+}
+
 fn find_hash<'a>(
     hashes: &'a [Hash],
     username: &str,
@@ -834,15 +944,15 @@ fn nt_hash_only(hash: &str) -> &str {
 }
 
 /// True when the tool expects a Kerberos ticket and the args don't have one.
+/// `*_kerberos` variants have no other auth mode — see [`KerberosCoercion::AlreadyKerberos`].
 fn expects_ticket(tool_name: &str, args: &Map<String, Value>) -> bool {
     if args.contains_key("ticket_path") {
         return false;
     }
-    tool_name.ends_with("_kerberos")
-        || matches!(
-            tool_name,
-            "secretsdump_kerberos" | "psexec_kerberos" | "wmiexec_kerberos" | "smbexec_kerberos"
-        )
+    matches!(
+        kerberos_coercion(tool_name),
+        KerberosCoercion::AlreadyKerberos
+    )
 }
 
 /// Find the most-recent `*.ccache` file in the worker's working directory that
@@ -882,18 +992,28 @@ fn find_ccache(username: &str, _domain: &str) -> Option<String> {
     best.map(|(_, p)| p.to_string_lossy().to_string())
 }
 
-/// Inject `ticket_path` for a cross-forest LDAP-bind tool using a forged
-/// inter-realm ccache stored in Redis.
+/// Inject `ticket_path` for a cross-forest tool using a forged inter-realm
+/// ccache stored in Redis.
 ///
-/// Called only when `requires_exact_realm(tool_name)` is true and the
-/// primary domain has no matching NTLM credential in state (i.e. the target
-/// is a foreign forest where NTLM bind would return 0x52e). Looks up the
-/// `kerberos_tickets` HASH for a `(*, target_domain, Administrator)` entry
-/// and injects the ccache path into `args["ticket_path"]`.
+/// Two call paths:
 ///
-/// If the target domain doesn't have a kerberos ticket in Redis this is a
-/// no-op — the tool will fail with a missing-credential error, which is the
-/// correct signal to the orchestrator.
+/// - LDAP-bind tools (`requires_exact_realm` set) — the target server is in a
+///   foreign forest where NTLM bind returns 0x52e. The tool reads `ticket_path`
+///   and switches to GSSAPI bind; the function rewrites an IP `target` to an
+///   FQDN so ldapsearch can derive the `ldap/<host>@<REALM>` SPN.
+///
+/// - impacket-secretsdump-class tools (`supports_kerberos_auth_mode` set) —
+///   cross-realm NTLM is broken (fortra/impacket#315 plus hardened DCs reject
+///   pass-through). The function additionally sets `no_pass=true` and strips
+///   `password`/`hash` so impacket presents the ccache directly to the target
+///   DC instead of falling through to cleartext bind. The target argument
+///   stays as-is — impacket-secretsdump derives the SPN from the target host
+///   and `-dc-ip`, no FQDN rewrite needed.
+///
+/// Looks up the `kerberos_tickets` HASH for a `(*, target_domain, Administrator)`
+/// entry. If no ticket exists in Redis the function is a no-op — the tool will
+/// fail with a missing-credential error, which is the correct signal to the
+/// orchestrator.
 async fn resolve_cross_forest_ticket(
     args: &mut Map<String, Value>,
     reader: &RedisStateReader,
@@ -901,7 +1021,7 @@ async fn resolve_cross_forest_ticket(
     tool_name: &str,
     target_domain: &str,
     hashes: &[Hash],
-) {
+) -> Option<String> {
     // Only fire when the tool has no usable NTLM credential for the target
     // domain (i.e. the realm_strict check already blocked cross-realm fallback).
     // If there's already an exact-domain hash for a non-common account, NTLM
@@ -918,7 +1038,7 @@ async fn resolve_cross_forest_ticket(
     });
     if has_ntlm {
         // NTLM bind is available — no need to inject Kerberos ticket.
-        return;
+        return None;
     }
 
     // Look up kerberos_tickets HASH in Redis.
@@ -938,7 +1058,7 @@ async fn resolve_cross_forest_ticket(
             target_domain = %target_domain,
             "credential_resolver: no inter-realm Kerberos ticket found for cross-forest tool"
         );
-        return;
+        return None;
     };
 
     // Sanity-check the ccache exists on disk (best-effort — workers may not
@@ -950,20 +1070,50 @@ async fn resolve_cross_forest_ticket(
             ticket_path = %ticket.ticket_path,
             "credential_resolver: inter-realm ccache not found on disk — skipping injection"
         );
-        return;
+        return None;
     }
 
+    let coercion = kerberos_coercion(tool_name);
     info!(
         tool = %tool_name,
         target_domain = %target_domain,
         ticket_path = %ticket.ticket_path,
         source_domain = %ticket.source_domain,
-        "credential_resolver: injecting inter-realm Kerberos ticket for cross-forest LDAP bind"
+        coercion = ?coercion,
+        "credential_resolver: injecting inter-realm Kerberos ticket for cross-forest tool"
     );
     args.insert(
         "ticket_path".to_string(),
         Value::String(ticket.ticket_path.clone()),
     );
+
+    // Apply the per-tool transition described by KerberosCoercion. The flip
+    // (no_pass=true, strip password/hash) is the same for InPlace, Redirect,
+    // and AlreadyKerberos — without it, impacket reads ticket_path but still
+    // falls through to NTLM bind because `password`/`hash` are populated by
+    // the principal resolver, which the foreign DC rejects with rpc_s_access_denied.
+    // The difference is whether we also return a tool-name rename for the
+    // dispatcher to honor (Redirect only).
+    match coercion {
+        KerberosCoercion::InPlace | KerberosCoercion::AlreadyKerberos => {
+            let (stripped_pw, stripped_hash) = apply_kerberos_auth_mode_flip(args);
+            log_kerberos_strip(tool_name, stripped_pw, stripped_hash);
+            return None;
+        }
+        KerberosCoercion::Redirect(variant) => {
+            let (stripped_pw, stripped_hash) = apply_kerberos_auth_mode_flip(args);
+            log_kerberos_strip(tool_name, stripped_pw, stripped_hash);
+            info!(
+                from = %tool_name,
+                to = %variant,
+                "credential_resolver: redirecting tool to *_kerberos variant for cross-forest call"
+            );
+            return Some(variant.to_string());
+        }
+        KerberosCoercion::None => {
+            // LDAP-bind path — fall through to FQDN rewrite for GSSAPI SPN.
+        }
+    }
 
     // GSSAPI bind needs an FQDN to derive the ldap/<host>@<REALM> SPN. If the
     // LLM passed an IP for `target`, look up the host's hostname from state
@@ -999,6 +1149,25 @@ async fn resolve_cross_forest_ticket(
                 );
             }
         }
+    }
+    None
+}
+
+/// Debug-log which credential fields the Kerberos flip removed. Kept separate
+/// from `apply_kerberos_auth_mode_flip` so the flip helper stays a pure data
+/// transform (testable without `tracing`).
+fn log_kerberos_strip(tool_name: &str, stripped_password: bool, stripped_hash: bool) {
+    if stripped_password {
+        debug!(
+            tool = %tool_name,
+            "credential_resolver: stripped wrong-realm password — using forged ccache instead"
+        );
+    }
+    if stripped_hash {
+        debug!(
+            tool = %tool_name,
+            "credential_resolver: stripped wrong-realm hash — using forged ccache instead"
+        );
     }
 }
 
@@ -1234,6 +1403,40 @@ mod tests {
         ];
         let found = find_credential(&creds, "admin", "contoso.local", true).unwrap();
         assert_eq!(found.password, "right");
+    }
+
+    #[test]
+    fn find_credential_netbios_form_matches_after_normalize() {
+        // Cred stored with NetBIOS short-form domain ("CONTOSO"); after
+        // `normalize_credential_domains` runs over the slice, the FQDN-form
+        // query matches. Mirrors what `resolve_credentials` does in prod.
+        use crate::orchestrator::recovery::normalize_credential_domains;
+        use std::collections::HashMap;
+
+        let mut creds = vec![cred("alice", "CONTOSO", "P@ss1")];
+        let mut nb = HashMap::new();
+        nb.insert("CONTOSO".to_string(), "contoso.local".to_string());
+        let fixed = normalize_credential_domains(&mut creds, &nb);
+        assert_eq!(fixed, 1, "normalize must rewrite the NetBIOS-form domain");
+        let found = find_credential(&creds, "alice", "contoso.local", false).unwrap();
+        assert_eq!(found.password, "P@ss1");
+    }
+
+    #[test]
+    fn find_credential_normalize_noop_when_map_empty() {
+        // No netbios map → no normalization → existing behavior preserved.
+        // Regression guard: the normalize call must be safe when the map is
+        // empty (which is the common case in unit tests and the initial
+        // moments of any operation).
+        use crate::orchestrator::recovery::normalize_credential_domains;
+        use std::collections::HashMap;
+
+        let mut creds = vec![cred("alice", "contoso.local", "P@ss1")];
+        let nb: HashMap<String, String> = HashMap::new();
+        let fixed = normalize_credential_domains(&mut creds, &nb);
+        assert_eq!(fixed, 0);
+        let found = find_credential(&creds, "alice", "contoso.local", false).unwrap();
+        assert_eq!(found.password, "P@ss1");
     }
 
     #[test]
@@ -1669,5 +1872,223 @@ mod tests {
         // Confirm the canary tool is covered by realm_strict so that the
         // cross-forest ticket injection fires for it.
         assert!(requires_exact_realm("bloodyad_set_password"));
+    }
+
+    #[test]
+    fn supports_kerberos_auth_mode_covers_secretsdump() {
+        // secretsdump must be eligible for cross-forest ccache injection — it
+        // accepts no_pass=true+ticket_path even though it's not in
+        // requires_exact_realm (it normally traverses trusts via NTLM
+        // pass-through, but cross-forest NTLM is broken per CLAUDE.md).
+        assert!(supports_kerberos_auth_mode("secretsdump"));
+        assert!(supports_kerberos_auth_mode("secretsdump_kerberos"));
+    }
+
+    #[test]
+    fn supports_kerberos_auth_mode_excludes_non_kerberos_tools() {
+        // Tools with no Kerberos transition (neither in-place flip nor a
+        // *_kerberos variant) must return false. After centralizing on
+        // `kerberos_coercion`, this is anything that resolves to
+        // KerberosCoercion::None.
+        assert!(!supports_kerberos_auth_mode("ldap_search"));
+        assert!(!supports_kerberos_auth_mode("nmap_scan"));
+        assert!(!supports_kerberos_auth_mode("crack_with_hashcat"));
+        assert!(!supports_kerberos_auth_mode("kerberoast"));
+    }
+
+    #[test]
+    fn supports_kerberos_auth_mode_covers_redirect_tools() {
+        // psexec/wmiexec/smbexec are Kerberos-capable via redirect to their
+        // *_kerberos variant — the resolver flips args and renames the tool.
+        // Before the KerberosCoercion refactor these were excluded because
+        // the dispatcher couldn't rename; now they're supported.
+        assert!(supports_kerberos_auth_mode("psexec"));
+        assert!(supports_kerberos_auth_mode("wmiexec"));
+        assert!(supports_kerberos_auth_mode("smbexec"));
+    }
+
+    #[test]
+    fn kerberos_coercion_maps_each_tool_to_correct_variant() {
+        // Single source of truth — explicit assertions per tool so a future
+        // change to `kerberos_coercion` shows up as a diff in this test.
+        assert_eq!(kerberos_coercion("secretsdump"), KerberosCoercion::InPlace);
+        assert_eq!(
+            kerberos_coercion("secretsdump_kerberos"),
+            KerberosCoercion::AlreadyKerberos
+        );
+        assert_eq!(
+            kerberos_coercion("psexec"),
+            KerberosCoercion::Redirect("psexec_kerberos")
+        );
+        assert_eq!(
+            kerberos_coercion("wmiexec"),
+            KerberosCoercion::Redirect("wmiexec_kerberos")
+        );
+        assert_eq!(
+            kerberos_coercion("smbexec"),
+            KerberosCoercion::Redirect("smbexec_kerberos")
+        );
+        assert_eq!(
+            kerberos_coercion("psexec_kerberos"),
+            KerberosCoercion::AlreadyKerberos
+        );
+        assert_eq!(kerberos_coercion("ldap_search"), KerberosCoercion::None);
+        assert_eq!(kerberos_coercion("nmap_scan"), KerberosCoercion::None);
+    }
+
+    #[test]
+    fn kerberos_coercion_redirect_targets_are_already_kerberos_tools() {
+        // Self-consistency check: every Redirect(variant) must point at a
+        // tool that resolves to AlreadyKerberos. Otherwise we'd redirect to
+        // a tool that itself wouldn't flip into Kerberos mode.
+        for tool in ["psexec", "wmiexec", "smbexec"] {
+            let KerberosCoercion::Redirect(variant) = kerberos_coercion(tool) else {
+                panic!("{tool} must be a Redirect");
+            };
+            assert_eq!(
+                kerberos_coercion(variant),
+                KerberosCoercion::AlreadyKerberos,
+                "redirect target {variant} must itself be AlreadyKerberos"
+            );
+        }
+    }
+
+    #[test]
+    fn requires_exact_realm_and_kerberos_auth_mode_are_disjoint() {
+        // The call-site picks target_realm differently for these two sets:
+        // realm-strict tools read it from `domain`, kerberos-mode tools infer
+        // it from the target host. A tool in both sets would get conflicting
+        // resolution. Keep them disjoint across every tool the resolver
+        // recognizes.
+        for tool in [
+            "bloodyad_set_password",
+            "ldap_search",
+            "ldap_acl_enumeration",
+            "kerberoast",
+            "nopac",
+            "enumerate_domain_trusts",
+            "secretsdump",
+            "secretsdump_kerberos",
+            "psexec",
+            "psexec_kerberos",
+            "wmiexec",
+            "wmiexec_kerberos",
+            "smbexec",
+            "smbexec_kerberos",
+        ] {
+            assert!(
+                !(requires_exact_realm(tool) && supports_kerberos_auth_mode(tool)),
+                "tool {tool} must not be in both sets"
+            );
+        }
+    }
+
+    #[test]
+    fn expects_ticket_only_for_already_kerberos_variants() {
+        // *_kerberos tools have no other auth mode — they always need a
+        // ticket. Tools with InPlace, Redirect, or None coercion must NOT
+        // be in expects_ticket: InPlace/Redirect get the ticket via the
+        // cross-forest resolver, None doesn't need one at all.
+        let empty = Map::new();
+        for kerberized in [
+            "secretsdump_kerberos",
+            "psexec_kerberos",
+            "wmiexec_kerberos",
+            "smbexec_kerberos",
+        ] {
+            assert!(
+                expects_ticket(kerberized, &empty),
+                "{kerberized} must expect a ticket"
+            );
+        }
+        for not_kerberized in [
+            "secretsdump",
+            "psexec",
+            "wmiexec",
+            "smbexec",
+            "ldap_search",
+            "nmap_scan",
+        ] {
+            assert!(
+                !expects_ticket(not_kerberized, &empty),
+                "{not_kerberized} must NOT expect a ticket from this predicate"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_kerberos_auth_mode_flip_strips_password_and_hash() {
+        // Simulates the post-injection state for cross-forest secretsdump:
+        // principal resolver already injected password+hash, ticket resolver
+        // injected ticket_path. The flip must remove the wrong-realm
+        // credentials and set no_pass=true so impacket actually uses the
+        // ccache.
+        let mut args = Map::new();
+        args.insert(
+            "password".to_string(),
+            Value::String("wrong-realm-pw".into()),
+        );
+        args.insert("hash".to_string(), Value::String("aabbccdd".into()));
+        args.insert(
+            "ticket_path".to_string(),
+            Value::String("/tmp/ares-tickets/some.ccache".into()),
+        );
+
+        let (stripped_pw, stripped_hash) = apply_kerberos_auth_mode_flip(&mut args);
+
+        assert!(stripped_pw, "must report password was stripped");
+        assert!(stripped_hash, "must report hash was stripped");
+        assert!(!args.contains_key("password"));
+        assert!(!args.contains_key("hash"));
+        assert_eq!(args.get("no_pass"), Some(&Value::Bool(true)));
+        assert_eq!(
+            args.get("ticket_path"),
+            Some(&Value::String("/tmp/ares-tickets/some.ccache".into())),
+            "ticket_path must be preserved across the flip"
+        );
+    }
+
+    #[test]
+    fn apply_kerberos_auth_mode_flip_idempotent_with_only_no_pass_already_set() {
+        // Re-running the flip on already-flipped args must be a no-op
+        // (no_pass stays true, password/hash still absent, no panics).
+        let mut args = Map::new();
+        args.insert("no_pass".to_string(), Value::Bool(true));
+        args.insert(
+            "ticket_path".to_string(),
+            Value::String("/tmp/ares-tickets/x.ccache".into()),
+        );
+
+        let (stripped_pw, stripped_hash) = apply_kerberos_auth_mode_flip(&mut args);
+
+        assert!(!stripped_pw, "no password to strip");
+        assert!(!stripped_hash, "no hash to strip");
+        assert_eq!(args.get("no_pass"), Some(&Value::Bool(true)));
+    }
+
+    #[test]
+    fn cross_forest_secretsdump_does_not_inject_when_target_realm_ntlm_exists() {
+        // Same-realm NTLM short-circuit applies to secretsdump too. If an
+        // NTLM hash for the target realm is already in state, we don't need
+        // the forged ccache and must not strip the cleartext/hash creds the
+        // LLM/principal resolver chose.
+        let hashes = [hash(
+            "administrator",
+            "fabrikam.local",
+            "deadbeef00112233",
+            None,
+        )];
+        let domain_l = "fabrikam.local";
+        let user_l = "administrator";
+        let has_ntlm = hashes.iter().any(|h| {
+            h.domain.to_lowercase() == domain_l
+                && (user_l.is_empty() || h.username.to_lowercase() == user_l)
+                && !h.hash_value.is_empty()
+                && is_authenticating_hash_type(&h.hash_type)
+        });
+        assert!(
+            has_ntlm,
+            "same-realm NTLM hash present — secretsdump must NOT be flipped into Kerberos mode"
+        );
     }
 }

@@ -25,7 +25,7 @@ mod exploitation;
 mod llm_runner;
 mod monitoring;
 mod output_extraction;
-mod recovery;
+pub(crate) mod recovery;
 mod result_processing;
 mod results;
 mod routing;
