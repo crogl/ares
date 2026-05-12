@@ -103,6 +103,17 @@ pub struct StateInner {
     // still tolerating transient auth races.
     pub mssql_link_pivot_attempts: HashMap<String, u32>,
 
+    // Per-hash crack attempt counter, keyed by `crack_dedup_key`. Lets a
+    // failed crack (wrong wordlist, password not in list, hashcat transient)
+    // be retried up to `MAX_CRACK_ATTEMPTS` before the dispatcher marks
+    // `DEDUP_CRACK_REQUESTS` and gives up permanently. The previous behavior
+    // wrote dedup on dispatch success, so a single hashcat exit ≠ 0 left
+    // the hash stuck uncracked forever. Restart resilience: the counter is
+    // in-memory only; dedup (the cap marker) is persisted to Redis, so
+    // post-restart capped hashes stay capped while uncapped ones get a
+    // fresh budget (acceptable mild leak).
+    pub crack_attempts: HashMap<String, u32>,
+
     // Forged inter-realm Kerberos tickets (source→target forest, cached path)
     pub kerberos_tickets: Vec<ares_core::models::KerberosTicket>,
 
@@ -162,6 +173,7 @@ impl StateInner {
             quarantined_principals: HashMap::new(),
             forge_aes_defers: HashMap::new(),
             mssql_link_pivot_attempts: HashMap::new(),
+            crack_attempts: HashMap::new(),
             kerberos_tickets: Vec::new(),
             completed: false,
             all_forests_dominated_at: None,

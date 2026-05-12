@@ -28,6 +28,15 @@ fn crack_priority(hash_type: &str) -> u8 {
     }
 }
 
+/// Max times a single hash gets dispatched to hashcat before the dispatcher
+/// permanently marks it `DEDUP_CRACK_REQUESTS` and gives up. Bounded retry
+/// covers the common failure modes (missing wordlist on the worker pod, a
+/// transient hashcat crash, the password not in the current wordlist but
+/// added later) without burning the cracker slot forever on impossible
+/// hashes. Operationally, three attempts costs at most ~3× the hashcat
+/// runtime per hash, which is the same overhead as restarting the op.
+pub(crate) const MAX_CRACK_ATTEMPTS: u32 = 3;
+
 /// Scans for uncracked hashes and submits crack tasks.
 /// Interval: 15s. Matches Python `_auto_crack_dispatch`.
 pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -80,15 +89,36 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
             match dispatcher.request_crack(&hash).await {
                 Ok(Some(task_id)) => {
                     debug!(task_id = %task_id, hash_type = %hash.hash_type, "Crack task dispatched");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_CRACK_REQUESTS, dedup_key.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_CRACK_REQUESTS, &dedup_key)
-                        .await;
+                    // Increment the per-hash attempt counter. Cap reached
+                    // → write the dedup marker (persisted) so future ticks
+                    // and post-restart ticks skip this hash permanently.
+                    // Before the cap, do NOT write the dedup — that lets a
+                    // failed crack (cracked_password still None when the
+                    // task finishes) be retried on the next tick, which is
+                    // the bug this PR fixes.
+                    let attempts = {
+                        let mut state = dispatcher.state.write().await;
+                        let entry = state.crack_attempts.entry(dedup_key.clone()).or_insert(0);
+                        *entry += 1;
+                        *entry
+                    };
+                    if attempts >= MAX_CRACK_ATTEMPTS {
+                        warn!(
+                            dedup_key = %dedup_key,
+                            hash_type = %hash.hash_type,
+                            attempts,
+                            "Crack attempts exhausted; giving up on hash"
+                        );
+                        dispatcher
+                            .state
+                            .write()
+                            .await
+                            .mark_processed(DEDUP_CRACK_REQUESTS, dedup_key.clone());
+                        let _ = dispatcher
+                            .state
+                            .persist_dedup(&dispatcher.queue, DEDUP_CRACK_REQUESTS, &dedup_key)
+                            .await;
+                    }
                 }
                 Ok(None) => {} // deferred or throttled
                 Err(e) => warn!(err = %e, "Failed to dispatch crack task"),
@@ -99,7 +129,8 @@ pub async fn auto_crack_dispatch(dispatcher: Arc<Dispatcher>, mut shutdown: watc
 
 #[cfg(test)]
 mod tests {
-    use super::crack_priority;
+    use super::{crack_priority, MAX_CRACK_ATTEMPTS};
+    use crate::orchestrator::state::{StateInner, DEDUP_CRACK_REQUESTS};
 
     #[test]
     fn roastable_hashes_outrank_ntlm() {
@@ -129,5 +160,75 @@ mod tests {
         assert!(matches!(v[1], "kerberoast" | "asrep"));
         assert_eq!(v[2], "ntlm");
         assert_eq!(v[3], "ntlm");
+    }
+
+    // Crack retry-cap logic. The dispatch path itself takes a Dispatcher
+    // (network + Redis), so these tests pin the state-side invariants:
+    //   - First N-1 attempts increment the counter without writing the
+    //     permanent dedup, so a failed crack can retry on the next tick.
+    //   - The Nth attempt writes the permanent dedup, so the hash is
+    //     never re-dispatched even after the operation restarts.
+
+    fn simulate_attempt(state: &mut StateInner, dedup_key: &str) {
+        let entry = state
+            .crack_attempts
+            .entry(dedup_key.to_string())
+            .or_insert(0);
+        *entry += 1;
+        if *entry >= MAX_CRACK_ATTEMPTS {
+            state.mark_processed(DEDUP_CRACK_REQUESTS, dedup_key.to_string());
+        }
+    }
+
+    #[test]
+    fn crack_retry_below_cap_does_not_write_dedup() {
+        // A hash whose crack failed once (e.g. wordlist miss) must remain
+        // eligible for retry — this was the bug. Confirm that the dedup
+        // marker is NOT written before the cap.
+        let mut state = StateInner::new("op-test".into());
+        let key = "north.contoso.local:svc_sql:abcdef0123456789abcdef0123456789";
+        for _ in 0..(MAX_CRACK_ATTEMPTS - 1) {
+            simulate_attempt(&mut state, key);
+        }
+        assert!(
+            !state.is_processed(DEDUP_CRACK_REQUESTS, key),
+            "dedup must not be written before the attempt cap"
+        );
+        assert_eq!(
+            state.crack_attempts.get(key).copied().unwrap_or(0),
+            MAX_CRACK_ATTEMPTS - 1
+        );
+    }
+
+    #[test]
+    fn crack_retry_at_cap_writes_dedup_permanently() {
+        // Cap reached → dedup written → next ticks (and post-restart
+        // ticks, once persisted) skip this hash forever.
+        let mut state = StateInner::new("op-test".into());
+        let key = "contoso.local:alice:00112233445566778899aabbccddeeff";
+        for _ in 0..MAX_CRACK_ATTEMPTS {
+            simulate_attempt(&mut state, key);
+        }
+        assert!(
+            state.is_processed(DEDUP_CRACK_REQUESTS, key),
+            "dedup must be written once attempts reach MAX_CRACK_ATTEMPTS"
+        );
+    }
+
+    #[test]
+    fn crack_retry_independent_per_hash() {
+        // Each hash gets its own attempt budget — exhausting one must not
+        // dedup another. Without this, a single perma-failing hash would
+        // appear to "use up" everyone else's slot from the dispatcher's
+        // perspective if the state key collision is wrong.
+        let mut state = StateInner::new("op-test".into());
+        let stuck = "contoso.local:stuck:00000000000000000000000000000000";
+        let fresh = "contoso.local:fresh:11111111111111111111111111111111";
+        for _ in 0..MAX_CRACK_ATTEMPTS {
+            simulate_attempt(&mut state, stuck);
+        }
+        assert!(state.is_processed(DEDUP_CRACK_REQUESTS, stuck));
+        assert!(!state.is_processed(DEDUP_CRACK_REQUESTS, fresh));
+        assert_eq!(state.crack_attempts.get(fresh).copied(), None);
     }
 }
