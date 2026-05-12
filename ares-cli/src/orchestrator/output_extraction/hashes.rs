@@ -158,6 +158,10 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     parent_id: None,
                     attack_step: 0,
                     aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -186,6 +190,10 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     parent_id: None,
                     attack_step: 0,
                     aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -212,6 +220,10 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     parent_id: None,
                     attack_step: 0,
                     aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
             continue;
@@ -262,6 +274,10 @@ pub fn extract_hashes(output: &str, default_domain: &str) -> Vec<Hash> {
                     parent_id: None,
                     attack_step: 0,
                     aes_key: aes_by_user.get(&username.to_lowercase()).cloned(),
+                    is_previous: false,
+                    source_host: None,
+                    is_trust_key: false,
+                    trust_pair_label: None,
                 });
             }
         }

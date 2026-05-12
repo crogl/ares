@@ -69,6 +69,7 @@ pub fn extract_shares(output: &str) -> Vec<Share> {
                             name: share_name,
                             permissions: perm.to_uppercase(),
                             comment,
+                            authenticated_as: None,
                         });
                     }
                 }

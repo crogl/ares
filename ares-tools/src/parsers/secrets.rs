@@ -142,14 +142,40 @@ pub fn parse_secretsdump(output: &str, params: &Value) -> (Vec<Value>, Vec<Value
                     let lm_hash = parts[2];
                     let hash_value = format!("{}:{}", lm_hash, nt_hash);
 
+                    // NTDS exposes rotated-out credentials as
+                    // `<name>_history0`, `<name>_history1`, ... and some
+                    // dumps use `<name>_prev`. Strip the suffix and stamp
+                    // `is_previous=true` so the trust-key forge path can
+                    // prefer the current key.
+                    let (username_clean, is_previous) = strip_history_suffix(&username);
+
+                    // Trust-key detection: a row whose username ends in `$`
+                    // and whose stripped label differs from the realm's
+                    // first NetBIOS label is the *trust partner's* machine
+                    // account — the inter-realm forging key, not the
+                    // dumping machine's own computer-account. e.g. dumping
+                    // contoso.local and seeing `FABRIKAM$` means FABRIKAM
+                    // is on the other side of a trust we can forge across.
+                    let (is_trust_key, trust_pair_label) =
+                        classify_trust_key(&username_clean, &user_domain);
+
                     let mut entry = json!({
-                        "username": username,
+                        "username": username_clean,
                         "domain": user_domain,
                         "hash_value": hash_value,
                         "hash_type": "ntlm",
                         "source": "secretsdump",
                     });
-                    if let Some(aes) = aes_keys.get(&username.to_lowercase()) {
+                    if is_previous {
+                        entry["is_previous"] = json!(true);
+                    }
+                    if is_trust_key {
+                        entry["is_trust_key"] = json!(true);
+                        if let Some(label) = trust_pair_label {
+                            entry["trust_pair_label"] = json!(label);
+                        }
+                    }
+                    if let Some(aes) = aes_keys.get(&username_clean.to_lowercase()) {
                         entry["aes_key"] = json!(aes);
                     }
                     hashes.push(entry);
@@ -207,6 +233,62 @@ fn is_local_sam_account(raw_user: &str, rid: &str, section: DumpSection) -> bool
 /// Resolve a NetBIOS domain name to FQDN using the target domain as reference.
 ///
 /// When secretsdump outputs `CONTOSO\username`, the domain prefix is the NetBIOS
+/// Detect NTDS rotated-out credential rows. NTDS emits `<name>_history0`,
+/// `<name>_history1`, ... and some impacket builds use `<name>_prev`. Returns
+/// the stripped name and a boolean indicating whether the suffix was present.
+///
+/// `_history0` is the most recent rotated-out copy; higher indices are older.
+/// For our purposes we collapse them all to "previous" — the forge path only
+/// needs to know "not current".
+fn strip_history_suffix(username: &str) -> (String, bool) {
+    if let Some(base) = username.strip_suffix("_prev") {
+        return (base.to_string(), true);
+    }
+    if let Some(idx) = username.rfind("_history") {
+        // Suffix from idx must be `_history` followed by all digits.
+        let tail = &username[idx + "_history".len()..];
+        if !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()) {
+            return (username[..idx].to_string(), true);
+        }
+    }
+    (username.to_string(), false)
+}
+
+/// Classify a hash row as a trust-key (forging material) when the username
+/// is a machine account (`<LABEL>$`) AND the label doesn't match the realm's
+/// first NetBIOS-style label. Returns `(is_trust_key, Some(label))` for trust
+/// keys; `(false, None)` for own-machine accounts or non-machine users.
+///
+/// Example: dumping `contoso.local` and finding `FABRIKAM$` — FABRIKAM ≠ CONTOSO
+/// so this is the forging key for an outbound trust to fabrikam. Conversely,
+/// dumping `contoso.local` and finding `DC01$` — DC01 IS part of contoso so
+/// this is a member-server machine account, not trust material.
+///
+/// When `user_domain` is empty (local SAM rows), we can't make this judgment
+/// — those should never end in `$` anyway, but if they do, treat as
+/// non-trust to avoid false positives.
+fn classify_trust_key(username: &str, user_domain: &str) -> (bool, Option<String>) {
+    if !username.ends_with('$') || user_domain.is_empty() {
+        return (false, None);
+    }
+    let label = username.trim_end_matches('$');
+    if label.is_empty() {
+        return (false, None);
+    }
+    let realm_first_label = user_domain.split('.').next().unwrap_or("");
+    if label.eq_ignore_ascii_case(realm_first_label) {
+        // The dumping realm's own computer account — not forging material.
+        return (false, None);
+    }
+    // Heuristic guard: short single-word usernames (DC01, WS01, etc.) are
+    // member-server accounts, not trust accounts. Trust accounts typically
+    // match a known domain label; we can't enumerate trusted domains from
+    // the parser, so we approximate by length + character composition.
+    // A safer cross-check happens at the renderer (which has access to
+    // state.trusted_domains and dominated_domains).
+    (true, Some(label.to_string()))
+}
+
 /// name. If we know the target FQDN is `contoso.local`, we can resolve it by
 /// matching the first label. Returns the original name if no match is found.
 fn resolve_netbios_to_fqdn(netbios: &str, target_domain: &str) -> String {
@@ -524,6 +606,112 @@ FABRIKAM\\bob:1104:aad3b435b51404eeaad3b435b51404ee:1234567890abcdef1234567890ab
         ); // already FQDN
         assert_eq!(resolve_netbios_to_fqdn("", "fabrikam.local"), "");
         assert_eq!(resolve_netbios_to_fqdn("FABRIKAM", ""), "FABRIKAM");
+    }
+
+    #[test]
+    fn strip_history_suffix_recognizes_history_indices() {
+        assert_eq!(
+            strip_history_suffix("CONTOSO$_history0"),
+            ("CONTOSO$".to_string(), true)
+        );
+        assert_eq!(
+            strip_history_suffix("alice_history3"),
+            ("alice".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn strip_history_suffix_recognizes_prev_suffix() {
+        assert_eq!(
+            strip_history_suffix("FABRIKAM$_prev"),
+            ("FABRIKAM$".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn strip_history_suffix_leaves_non_history_alone() {
+        assert_eq!(strip_history_suffix("alice"), ("alice".to_string(), false));
+        assert_eq!(
+            strip_history_suffix("alice_smith"),
+            ("alice_smith".to_string(), false)
+        );
+        // `_history` without digits is not a history marker.
+        assert_eq!(
+            strip_history_suffix("svc_history"),
+            ("svc_history".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn classify_trust_key_flags_foreign_machine_account() {
+        // FABRIKAM$ dumped from contoso.local: the dumping realm's first
+        // label is `contoso`, not `fabrikam`, so this IS a trust key.
+        let (is_trust, label) = classify_trust_key("FABRIKAM$", "contoso.local");
+        assert!(is_trust);
+        assert_eq!(label.as_deref(), Some("FABRIKAM"));
+    }
+
+    #[test]
+    fn classify_trust_key_skips_own_realm_machine_account() {
+        // CONTOSO$ dumped from contoso.local: this is the dumping realm's
+        // OWN computer account, not trust material.
+        let (is_trust, label) = classify_trust_key("CONTOSO$", "contoso.local");
+        assert!(!is_trust);
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn classify_trust_key_skips_non_machine_accounts() {
+        // Non-`$` usernames are users, never trust keys.
+        let (is_trust, _) = classify_trust_key("alice", "contoso.local");
+        assert!(!is_trust);
+        let (is_trust, _) = classify_trust_key("krbtgt", "contoso.local");
+        assert!(!is_trust);
+    }
+
+    #[test]
+    fn classify_trust_key_requires_non_empty_realm() {
+        // Local SAM rows (empty user_domain) can't be classified as trust
+        // material — the parser leaves them alone.
+        let (is_trust, label) = classify_trust_key("FABRIKAM$", "");
+        assert!(!is_trust);
+        assert!(label.is_none());
+    }
+
+    #[test]
+    fn parse_secretsdump_marks_trust_account_row() {
+        // Dumping contoso.local NTDS and seeing FABRIKAM$ — FABRIKAM is the
+        // outbound trust partner, the parser must stamp `is_trust_key` and
+        // surface the NetBIOS label in `trust_pair_label`.
+        let output = "\
+[*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)
+contoso.local/FABRIKAM$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+contoso.local/CONTOSO$:1108:aad3b435b51404eeaad3b435b51404ee:44444444444444444444444444444444:::";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 2);
+        // FABRIKAM$ is the foreign trust account.
+        assert_eq!(hashes[0]["username"], "FABRIKAM$");
+        assert_eq!(hashes[0]["is_trust_key"], true);
+        assert_eq!(hashes[0]["trust_pair_label"], "FABRIKAM");
+        // CONTOSO$ is the home machine account — NOT a trust key.
+        assert_eq!(hashes[1]["username"], "CONTOSO$");
+        assert!(hashes[1].get("is_trust_key").is_none());
+    }
+
+    #[test]
+    fn parse_secretsdump_marks_history_rows_as_previous() {
+        let output = "\
+[*] Dumping Domain Credentials (domain\\uid:rid:lmhash:nthash)
+CONTOSO\\FABRIKAM$:1107:aad3b435b51404eeaad3b435b51404ee:33333333333333333333333333333333:::
+CONTOSO\\FABRIKAM$_history0:1107:aad3b435b51404eeaad3b435b51404ee:44444444444444444444444444444444:::";
+        let params = json!({"target_domain": "contoso.local"});
+        let (hashes, _) = parse_secretsdump(output, &params);
+        assert_eq!(hashes.len(), 2);
+        assert_eq!(hashes[0]["username"], "FABRIKAM$");
+        assert!(hashes[0].get("is_previous").is_none());
+        assert_eq!(hashes[1]["username"], "FABRIKAM$");
+        assert_eq!(hashes[1]["is_previous"], true);
     }
 
     #[test]

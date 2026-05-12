@@ -46,6 +46,10 @@ fn make_hash(
         parent_id: None,
         attack_step: 0,
         aes_key: aes_key.map(|s| s.to_string()),
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     }
 }
 

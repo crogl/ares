@@ -188,6 +188,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         }
     }
 
@@ -508,6 +512,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         state
             .hosts
@@ -778,6 +786,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         state
             .hosts

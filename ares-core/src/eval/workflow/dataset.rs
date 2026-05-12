@@ -327,6 +327,10 @@ pub fn load_red_state_from_file(
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
     }
 
@@ -336,6 +340,7 @@ pub fn load_red_state_from_file(
             name: s.name,
             permissions: s.permissions,
             comment: String::new(),
+            authenticated_as: None,
         });
     }
 

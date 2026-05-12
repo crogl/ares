@@ -45,6 +45,10 @@ fn make_hash(domain: &str, username: &str, hash_type: &str, hash_value: &str) ->
         parent_id: None,
         attack_step: 0,
         aes_key: None,
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     }
 }
 

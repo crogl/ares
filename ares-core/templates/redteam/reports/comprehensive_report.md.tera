@@ -85,10 +85,10 @@ Persistent domain access has been established via Golden Ticket.
 ## Network Shares
 
 {% if shares | length > 0 %}
-| Share | Host | Permissions |
-|-------|------|-------------|
+| Share | Host | Permissions | Auth |
+|-------|------|-------------|------|
 {% for share in shares %}
-| {{ share.name }} | {{ share.host }} | {{ share.permissions | default(value="-") }} |
+| {{ share.name }} | {{ share.host }} | {{ share.permissions | default(value="-") }} | {{ share.authenticated_as | default(value="-") }} |
 {% endfor %}
 {% else %}
 No network shares discovered.
@@ -96,9 +96,11 @@ No network shares discovered.
 
 ---
 
-## Credentials & Hashes
+## Authentication Material
 
-### Plaintext Credentials ({{ credentials | length }})
+NTLM hashes are equally usable for authentication (pass-the-hash, overpass-the-hash, S4U2Self with `-hashes`). Plaintext is shown first for readability, but operators should treat the two tables as one inventory.
+
+### Cracked Plaintext ({{ credentials | length }})
 
 {% if credentials | length > 0 %}
 | Domain | Username | Password | Source | Admin |
@@ -110,13 +112,28 @@ No network shares discovered.
 No plaintext credentials captured.
 {% endif %}
 
-### Hashes ({{ hashes | length }})
+{% if trust_hashes | length > 0 %}
+### Trust Keys / Forging Material ({{ trust_hashes | length }})
+
+These are inter-realm trust account hashes — usable with `ticketer.py` (or
+`impacket-ticketer`) to forge inter-realm TGTs that authenticate against the
+target forest's KDC. Symmetric pairs share the same key on both sides of the
+trust and only need to be forged from one direction.
+
+| Domain | Account | Trust Partner | Type | Hash | Status |
+|--------|---------|---------------|------|------|--------|
+{% for hash in trust_hashes %}
+| {{ hash.domain }} | {{ hash.username }} | {{ hash.trust_pair_label | default(value="-") }} | {{ hash.hash_type }} | `{{ hash.hash_display }}` | {% if hash.is_previous %}previous{% else %}current{% endif %}{% if hash.symmetric_pair_badge %} ({{ hash.symmetric_pair_badge }}){% endif %} |
+{% endfor %}
+{% endif %}
+
+### Hash Material (Pass-the-Hash usable) ({{ hashes | length }})
 
 {% if hashes | length > 0 %}
-| Domain | Username | Type | Hash | Source |
-|--------|----------|------|------|--------|
+| Domain | Username | Type | Hash | Source | Source Host | Status |
+|--------|----------|------|------|--------|-------------|--------|
 {% for hash in hashes %}
-| {{ hash.domain }} | {{ hash.username }} | {{ hash.hash_type }} | `{{ hash.hash_display }}` | {{ hash.source }} |
+| {{ hash.domain }} | {{ hash.username }} | {{ hash.hash_type }} | `{{ hash.hash_display }}` | {{ hash.source }} | {{ hash.source_host | default(value="-") }} | {% if hash.is_previous %}previous{% else %}current{% endif %} |
 {% endfor %}
 {% else %}
 No hashes captured.

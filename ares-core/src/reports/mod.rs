@@ -102,6 +102,10 @@ mod tests {
                 parent_id: None,
                 attack_step: 0,
                 aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
             },
             Hash {
                 id: "2".to_string(),
@@ -115,6 +119,10 @@ mod tests {
                 parent_id: None,
                 attack_step: 0,
                 aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
             },
         ];
         let deduped = dedup_hashes(&hashes);
@@ -201,6 +209,10 @@ mod tests {
                 parent_id: None,
                 attack_step: 0,
                 aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: false,
+                trust_pair_label: None,
             }],
             all_hosts: vec![Host {
                 ip: "192.168.58.10".to_string(),

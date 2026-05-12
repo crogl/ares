@@ -53,7 +53,7 @@ pub async fn process_completed_task(
     let result = &completed.result;
 
     // Extract task-level metadata from pending_tasks before complete_task removes it.
-    let (cred_key, task_domain, task_target_ip) = {
+    let (cred_key, task_domain, task_target_ip, task_username) = {
         let state = dispatcher.state.read().await;
         let task = state.pending_tasks.get(task_id.as_str());
         let ck = task
@@ -68,7 +68,20 @@ pub async fn process_completed_task(
             .and_then(|t| t.params.get("target_ip"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
-        (ck, td, tip)
+        let tu = task
+            .and_then(|t| t.params.get("username"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        (ck, td, tip, tu)
+    };
+
+    // Pre-compute the "DOMAIN\\username" label for share authentication
+    // tagging — captured from this task's auth params so the renderer can
+    // show which credential opened READ/WRITE on each share.
+    let share_auth_label: Option<String> = match (&task_domain, &task_username) {
+        (Some(d), Some(u)) if !d.is_empty() && !u.is_empty() => Some(format!("{d}\\{u}")),
+        (None, Some(u)) if !u.is_empty() => Some(u.clone()),
+        _ => None,
     };
 
     {
@@ -109,7 +122,14 @@ pub async fn process_completed_task(
     // and must never be fed into parse_discoveries() (hallucination risk).
     if let Some(ref payload) = result.result {
         if let Some(disc) = payload.get("discoveries") {
-            if let Err(e) = extract_discoveries(disc, dispatcher).await {
+            if let Err(e) = extract_discoveries(
+                disc,
+                dispatcher,
+                task_target_ip.as_deref(),
+                share_auth_label.as_deref(),
+            )
+            .await
+            {
                 warn!(task_id = %task_id, err = %e, "Failed to extract parser discoveries");
             }
             check_domain_admin_indicators(disc, dispatcher).await;
@@ -126,7 +146,14 @@ pub async fn process_completed_task(
             // specific DC). Falls back to state.domains.first() only as last resort.
             resolve_domain_from_ip(dispatcher, task_target_ip.as_deref()).await
         };
-        extract_from_raw_text(payload, dispatcher, &default_domain).await;
+        extract_from_raw_text(
+            payload,
+            dispatcher,
+            &default_domain,
+            task_target_ip.as_deref(),
+            share_auth_label.as_deref(),
+        )
+        .await;
     }
 
     // Mark host as owned when a credential_access task succeeds AND parser
@@ -637,6 +664,8 @@ async fn extract_from_raw_text(
     payload: &Value,
     dispatcher: &Arc<Dispatcher>,
     default_domain: &str,
+    task_target_ip: Option<&str>,
+    share_auth_label: Option<&str>,
 ) {
     // Only parse tool_outputs — actual tool stdout collected by the agent loop.
     // The result payload's "summary", "result", and "output" fields are all
@@ -731,7 +760,13 @@ async fn extract_from_raw_text(
         }
     }
 
-    for hash in extracted.hashes {
+    for mut hash in extracted.hashes {
+        // Local-SAM rows (no realm) come back without source_host context.
+        // The dispatcher knows the target IP — stamp it so multiple hosts'
+        // Administrator/Guest/ssm-user rows stay distinct on dedup.
+        if hash.domain.is_empty() && hash.source_host.is_none() {
+            hash.source_host = task_target_ip.map(|s| s.to_string());
+        }
         let username = hash.username.clone();
         let domain = hash.domain.clone();
         let hash_type = hash.hash_type.clone();
@@ -780,7 +815,10 @@ async fn extract_from_raw_text(
         }
     }
 
-    for share in extracted.shares {
+    for mut share in extracted.shares {
+        if share.authenticated_as.is_none() {
+            share.authenticated_as = share_auth_label.map(|s| s.to_string());
+        }
         match dispatcher
             .state
             .publish_share(&dispatcher.queue, share)
@@ -813,7 +851,12 @@ async fn extract_from_raw_text(
 }
 
 /// Extract credentials, hashes, hosts, vulns, and shares from a result payload.
-async fn extract_discoveries(payload: &Value, dispatcher: &Arc<Dispatcher>) -> Result<()> {
+async fn extract_discoveries(
+    payload: &Value,
+    dispatcher: &Arc<Dispatcher>,
+    task_target_ip: Option<&str>,
+    share_auth_label: Option<&str>,
+) -> Result<()> {
     let mut parsed = parse_discoveries(payload);
 
     // Resolve credential lineage (parent_id / attack_step) before publishing.
@@ -888,7 +931,15 @@ async fn extract_discoveries(payload: &Value, dispatcher: &Arc<Dispatcher>) -> R
         }
     }
 
-    for hash in parsed.hashes {
+    for mut hash in parsed.hashes {
+        // Local-SAM rows (no realm) come back without source_host context.
+        // The parser strips the host prefix; the dispatcher knows the target
+        // IP — stamp it so per-host Administrator/Guest/ssm-user rows stay
+        // distinct on dedup. Domain-qualified (NTDS) rows have a realm to
+        // disambiguate; we leave their source_host empty.
+        if hash.domain.is_empty() && hash.source_host.is_none() {
+            hash.source_host = task_target_ip.map(|s| s.to_string());
+        }
         // Capture fields before move for timeline event
         let username = hash.username.clone();
         let domain = hash.domain.clone();
@@ -932,7 +983,10 @@ async fn extract_discoveries(payload: &Value, dispatcher: &Arc<Dispatcher>) -> R
             .await;
     }
 
-    for share in parsed.shares {
+    for mut share in parsed.shares {
+        if share.authenticated_as.is_none() {
+            share.authenticated_as = share_auth_label.map(|s| s.to_string());
+        }
         match dispatcher
             .state
             .publish_share(&dispatcher.queue, share)

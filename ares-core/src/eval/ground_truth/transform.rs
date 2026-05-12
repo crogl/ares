@@ -347,6 +347,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         let gt = create_ground_truth_from_red_state(&state, &[]);
         let hash_iocs: Vec<_> = gt
@@ -419,6 +423,7 @@ mod tests {
             name: "ADMIN$".to_string(),
             permissions: "READ/WRITE".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         });
         let gt = create_ground_truth_from_red_state(&state, &[]);
         assert_eq!(gt.expected_shares.len(), 1);
@@ -433,6 +438,7 @@ mod tests {
             name: "SYSVOL".to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         });
         let gt = create_ground_truth_from_red_state(&state, &[]);
         assert!(!gt.expected_shares[0].required);
@@ -458,6 +464,7 @@ mod tests {
             name: "C$".to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         });
         let gt = create_ground_truth_from_red_state(&state, &[]);
         let ip_iocs: Vec<_> = gt

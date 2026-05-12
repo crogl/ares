@@ -239,6 +239,10 @@ pub(crate) async fn ops_inject_hash(
         parent_id: None,
         attack_step: 0,
         aes_key,
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     };
 
     let added = reader.add_hash(&mut conn, &hash).await?;

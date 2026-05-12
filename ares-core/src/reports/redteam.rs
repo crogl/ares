@@ -244,7 +244,50 @@ impl RedTeamReportGenerator {
             .collect();
         let users: Vec<UserCtx> = state.all_users.iter().map(UserCtx::from).collect();
         let credentials: Vec<CredCtx> = unique_creds.iter().map(CredCtx::from).collect();
-        let hashes: Vec<HashCtx> = unique_hashes.iter().map(HashCtx::from).collect();
+        let mut hashes: Vec<HashCtx> = unique_hashes.iter().map(HashCtx::from).collect();
+
+        // Symmetric trust-key pair detection: when two `is_trust_key` rows
+        // share the same hash_value but have flipped (username, domain) —
+        // e.g. `CONTOSO$ @ fabrikam.local` and `FABRIKAM$ @ contoso.local`
+        // both = the same inter-realm trust key — badge them so the renderer
+        // shows the pair as one entity, not two unrelated rows. Uses
+        // lowercased fields for canonical comparison.
+        let mut symmetric_groups: std::collections::HashMap<String, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, h) in hashes.iter().enumerate() {
+            if !h.is_trust_key {
+                continue;
+            }
+            let key = h.hash_value.trim().to_lowercase();
+            symmetric_groups.entry(key).or_default().push(i);
+        }
+        for (_hv, idxs) in symmetric_groups.iter() {
+            if idxs.len() < 2 {
+                continue;
+            }
+            // Verify the pair has flipped identity (not just two rows with
+            // identical fields, which would already have been deduped).
+            let first_user = hashes[idxs[0]].username.to_lowercase();
+            let first_dom = hashes[idxs[0]].domain.to_lowercase();
+            let flipped = idxs.iter().skip(1).any(|&j| {
+                let u = hashes[j].username.to_lowercase();
+                let d = hashes[j].domain.to_lowercase();
+                u != first_user && d != first_dom
+            });
+            if flipped {
+                for &i in idxs {
+                    hashes[i].symmetric_pair_badge = "symmetric pair".to_string();
+                }
+            }
+        }
+
+        // Partition into trust-key rows (rendered above) and the rest. The
+        // generic dump excludes trust keys to keep the table focused on
+        // direct-auth material; the dedicated section calls out forging
+        // material with current/previous and symmetric-pair badges.
+        let trust_hashes: Vec<HashCtx> =
+            hashes.iter().filter(|h| h.is_trust_key).cloned().collect();
+        let hashes: Vec<HashCtx> = hashes.into_iter().filter(|h| !h.is_trust_key).collect();
 
         // Build IP → hostname map so shares can display hostnames instead of IPs.
         let ip_to_hostname: HashMap<&str, &str> = state
@@ -336,6 +379,7 @@ impl RedTeamReportGenerator {
         ctx.insert("users", &users);
         ctx.insert("credentials", &credentials);
         ctx.insert("hashes", &hashes);
+        ctx.insert("trust_hashes", &trust_hashes);
         ctx.insert("shares", &shares);
         ctx.insert("timeline", &timeline);
         ctx.insert("techniques", &techniques_enriched);
@@ -621,6 +665,7 @@ mod tests {
             name: "SYSVOL".to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         }];
         let users = vec![make_user("u1", "d")];
         let summary = generate_executive_summary(&state, &users, &[]);
@@ -638,5 +683,100 @@ mod tests {
     #[test]
     fn report_generator_default_succeeds() {
         let _gen = RedTeamReportGenerator::default();
+    }
+
+    #[test]
+    fn comprehensive_report_badges_symmetric_trust_pairs() {
+        // Two trust-key rows with the same hash_value but flipped
+        // (username, domain) — `CONTOSO$ @ fabrikam.local` and
+        // `FABRIKAM$ @ contoso.local` — should both be tagged as "symmetric
+        // pair" so the operator knows forging from either direction
+        // unlocks the trust.
+        let mut state = empty_state();
+        state.all_hashes = vec![
+            crate::models::Hash {
+                id: "h1".into(),
+                username: "CONTOSO$".into(),
+                hash_value: "feedbeef".into(),
+                hash_type: "ntlm".into(),
+                domain: "fabrikam.local".into(),
+                source: "secretsdump".into(),
+                cracked_password: None,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+                aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: true,
+                trust_pair_label: Some("CONTOSO".into()),
+            },
+            crate::models::Hash {
+                id: "h2".into(),
+                username: "FABRIKAM$".into(),
+                hash_value: "feedbeef".into(),
+                hash_type: "ntlm".into(),
+                domain: "contoso.local".into(),
+                source: "secretsdump".into(),
+                cracked_password: None,
+                discovered_at: None,
+                parent_id: None,
+                attack_step: 0,
+                aes_key: None,
+                is_previous: false,
+                source_host: None,
+                is_trust_key: true,
+                trust_pair_label: Some("FABRIKAM".into()),
+            },
+        ];
+        let gen = RedTeamReportGenerator::new().expect("template init");
+        let report = gen
+            .generate_comprehensive(&state, &[], &[])
+            .expect("render");
+        assert!(
+            report.contains("Trust Keys / Forging Material"),
+            "trust-key subsection missing from report"
+        );
+        assert!(
+            report.contains("symmetric pair"),
+            "symmetric-pair badge missing from rendered trust-key rows"
+        );
+        // The dedicated trust-key table should hoist BOTH rows above the
+        // generic hash dump.
+        assert!(report.contains("CONTOSO$"));
+        assert!(report.contains("FABRIKAM$"));
+    }
+
+    #[test]
+    fn comprehensive_report_omits_symmetric_badge_for_lone_trust_key() {
+        // A single trust-key hash with no pair should NOT get the
+        // "symmetric pair" badge — that's only for verified pairs.
+        let mut state = empty_state();
+        state.all_hashes = vec![crate::models::Hash {
+            id: "h1".into(),
+            username: "FABRIKAM$".into(),
+            hash_value: "feedbeef".into(),
+            hash_type: "ntlm".into(),
+            domain: "contoso.local".into(),
+            source: "secretsdump".into(),
+            cracked_password: None,
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: true,
+            trust_pair_label: Some("FABRIKAM".into()),
+        }];
+        let gen = RedTeamReportGenerator::new().expect("template init");
+        let report = gen
+            .generate_comprehensive(&state, &[], &[])
+            .expect("render");
+        assert!(report.contains("Trust Keys / Forging Material"));
+        assert!(
+            !report.contains("symmetric pair"),
+            "lone trust key must not be flagged as symmetric"
+        );
     }
 }

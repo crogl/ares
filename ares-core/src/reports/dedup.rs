@@ -29,10 +29,31 @@ pub fn dedup_credentials(creds: &[Credential]) -> Vec<Credential> {
     result
 }
 
-/// Deduplicate hashes by (domain, username, hash_value) case-insensitively.
+/// Canonicalize a domain string for dedup keys.
 ///
-/// Empty-domain entries (from secretsdump local account dumps) are dropped when
-/// a domain-qualified entry with the same username and hash value already exists.
+/// Strips whitespace and lowercases. AD realms are case-insensitive, so
+/// `CONTOSO.LOCAL` and `contoso.local` must collapse into one bucket. A
+/// future pass could prefer FQDN over NetBIOS form using a `netbios_to_fqdn`
+/// map, but write-time sanitization (`publish_hash`, `sanitize_credential`)
+/// already canonicalizes on the way in, so this dedup-time pass only needs
+/// to be case-insensitive.
+fn canonicalize_domain(domain: &str) -> String {
+    domain.trim().to_lowercase()
+}
+
+/// Deduplicate hashes by (canonical_domain, username, hash_value,
+/// source_host) case-insensitively.
+///
+/// `source_host` is part of the key so multiple hosts' local-SAM
+/// `Administrator` / `Guest` / `ssm-user` rows don't collapse into a single
+/// entry — without it, four different DCs each contributing an
+/// `Administrator:500:...` row would render as one, hiding the lateral
+/// movement opportunity. Domain-qualified rows leave `source_host` empty and
+/// rely on the realm to disambiguate.
+///
+/// Empty-domain entries (from secretsdump local account dumps) are dropped
+/// when a domain-qualified entry with the same username and hash value
+/// already exists.
 ///
 /// Sorts with Administrator and krbtgt first.
 pub fn dedup_hashes(hashes: &[Hash]) -> Vec<Hash> {
@@ -40,9 +61,13 @@ pub fn dedup_hashes(hashes: &[Hash]) -> Vec<Hash> {
     let mut result = Vec::new();
     for h in hashes {
         let key = (
-            h.domain.trim().to_lowercase(),
+            canonicalize_domain(&h.domain),
             h.username.trim().to_lowercase(),
             h.hash_value.trim().to_lowercase(),
+            h.source_host
+                .as_deref()
+                .map(|s| s.trim().to_lowercase())
+                .unwrap_or_default(),
         );
         if seen.insert(key) {
             result.push(h.clone());
@@ -95,7 +120,15 @@ pub fn dedup_hashes(hashes: &[Hash]) -> Vec<Hash> {
 /// Sources that produce verified users (KDC-confirmed or enumerated).
 /// `output_extraction` is excluded — its DOMAIN\user regex matches every
 /// wordlist entry in kerbrute/ASREProast output, not just confirmed users.
-const TRUSTED_USER_SOURCES: &[&str] = &["kerberos_enum", "netexec_user_enum"];
+///
+/// `secretsdump_implicit` is a synthesized source: when `publish_hash` lands
+/// a new hash with a non-empty domain and non-machine username, we
+/// backfill a corresponding `User` row so the user table reflects the
+/// identity even when LDAP enum was blocked / cross-forest. The user must
+/// already have been authenticated by the KDC during the NTDS dump, so
+/// treating it as verified is safe.
+const TRUSTED_USER_SOURCES: &[&str] =
+    &["kerberos_enum", "netexec_user_enum", "secretsdump_implicit"];
 
 /// Deduplicate users by (domain, username) case-insensitively.
 /// Filters to trusted parser sources only and normalizes is_admin for known
@@ -155,7 +188,22 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         }
+    }
+
+    fn make_hash_with_source_host(
+        username: &str,
+        domain: &str,
+        hash_value: &str,
+        source_host: &str,
+    ) -> Hash {
+        let mut h = make_hash(username, domain, hash_value);
+        h.source_host = Some(source_host.to_string());
+        h
     }
 
     fn make_user(username: &str, domain: &str) -> User {
@@ -279,6 +327,48 @@ mod tests {
     #[test]
     fn dedup_hashes_keeps_empty_domain_when_no_qualified() {
         let hashes = vec![make_hash("localuser", "", "aabb1122")];
+        let result = dedup_hashes(&hashes);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn dedup_hashes_keeps_per_host_local_sam_rows() {
+        // Four hosts each contributing an `Administrator:500:...` local-SAM
+        // row with the same hash value would collapse to one entry under
+        // the old (domain, username, hash_value) key. Now source_host is
+        // part of the key — they all survive so the operator can see all
+        // four reachable hosts.
+        let hashes = vec![
+            make_hash_with_source_host("Administrator", "", "aabb1122", "dc01"),
+            make_hash_with_source_host("Administrator", "", "aabb1122", "sql01"),
+            make_hash_with_source_host("Administrator", "", "aabb1122", "ws01"),
+            make_hash_with_source_host("Administrator", "", "aabb1122", "ca01"),
+        ];
+        let result = dedup_hashes(&hashes);
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn dedup_hashes_collapses_same_source_host_duplicate() {
+        // Within a single source_host, the same Administrator hash arriving
+        // twice (e.g. a re-run of secretsdump on the same target) must still
+        // dedup to one entry.
+        let hashes = vec![
+            make_hash_with_source_host("Administrator", "", "aabb1122", "dc01"),
+            make_hash_with_source_host("Administrator", "", "aabb1122", "dc01"),
+        ];
+        let result = dedup_hashes(&hashes);
+        assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn dedup_hashes_canonicalizes_realm_casing() {
+        // Same (user, domain, hash) arriving with mixed-case realms must
+        // collapse — AD realms are case-insensitive.
+        let hashes = vec![
+            make_hash("alice", "CONTOSO.LOCAL", "aabb1122"),
+            make_hash("alice", "contoso.local", "aabb1122"),
+        ];
         let result = dedup_hashes(&hashes);
         assert_eq!(result.len(), 1);
     }

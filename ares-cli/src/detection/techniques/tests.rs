@@ -289,12 +289,14 @@ fn build_t1021_002_populated_hosts_and_shares() {
         name: "C$".to_string(),
         permissions: "READ".to_string(),
         comment: String::new(),
+        authenticated_as: None,
     });
     state.all_shares.push(Share {
         host: "192.168.58.10".to_string(),
         name: "ADMIN$".to_string(),
         permissions: "READ".to_string(),
         comment: String::new(),
+        authenticated_as: None,
     });
     let start = Utc::now() - chrono::Duration::hours(1);
     let end = Utc::now();
@@ -317,6 +319,7 @@ fn build_t1021_002_share_evidence_capped_at_five() {
             name: format!("SHARE{i}"),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         });
     }
     let start = Utc::now() - chrono::Duration::hours(1);

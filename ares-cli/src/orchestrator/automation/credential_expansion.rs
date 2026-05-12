@@ -700,6 +700,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let pth_cred = ares_core::models::Credential {
             id: format!("pth_{}", hash.username),

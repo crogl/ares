@@ -131,7 +131,7 @@ impl From<&Credential> for CredCtx {
     }
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 pub(crate) struct HashCtx {
     pub domain: String,
     pub username: String,
@@ -140,6 +140,24 @@ pub(crate) struct HashCtx {
     /// Truncated hash for display (Kerberoast/AS-REP hashes are 1000+ chars).
     pub hash_display: String,
     pub source: String,
+    /// True for `_history*` / `_prev` rotated-out NTDS rows.
+    pub is_previous: bool,
+    /// True for inter-realm trust-account hashes (e.g. `FABRIKAM$` dumped
+    /// from contoso.local) — forging material rendered in a dedicated
+    /// "Trust Keys" section ahead of the generic hash dump.
+    pub is_trust_key: bool,
+    /// NetBIOS label of the trust partner (e.g. `FABRIKAM`). Empty when
+    /// `is_trust_key` is false.
+    pub trust_pair_label: String,
+    /// Source host the hash was dumped from (IP or hostname). Lets the
+    /// renderer disambiguate per-host local-SAM rows like
+    /// `Administrator (from dc01)`. Empty for domain-qualified rows.
+    pub source_host: String,
+    /// Optional badge shown next to symmetric trust pairs in the renderer
+    /// — when two `is_trust_key` rows share the same `hash_value` but have
+    /// flipped (username, domain). Computed by the report generator, not
+    /// the parser. Empty for non-paired rows.
+    pub symmetric_pair_badge: String,
 }
 
 /// Max length before a hash value gets truncated in reports.
@@ -171,6 +189,11 @@ impl From<&Hash> for HashCtx {
             hash_display: truncate_hash(&h.hash_value),
             hash_value: h.hash_value.clone(),
             source: h.source.clone(),
+            is_previous: h.is_previous,
+            is_trust_key: h.is_trust_key,
+            trust_pair_label: h.trust_pair_label.clone().unwrap_or_default(),
+            source_host: h.source_host.clone().unwrap_or_default(),
+            symmetric_pair_badge: String::new(),
         }
     }
 }
@@ -181,6 +204,10 @@ pub(crate) struct ShareCtx {
     pub host: String,
     pub permissions: String,
     pub comment: String,
+    /// Cred used to authenticate during enumeration, e.g. `"CONTOSO\\alice"`.
+    /// Empty when the underlying `Share.authenticated_as` is `None` (legacy
+    /// rows or raw-text fallback that lost dispatch context).
+    pub authenticated_as: String,
 }
 
 impl From<&Share> for ShareCtx {
@@ -198,6 +225,7 @@ impl From<&Share> for ShareCtx {
             } else {
                 s.comment.clone()
             },
+            authenticated_as: s.authenticated_as.clone().unwrap_or_default(),
         }
     }
 }
@@ -379,6 +407,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let ctx = HashCtx::from(&hash);
         assert_eq!(ctx.username, "krbtgt");
@@ -403,6 +435,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let ctx = HashCtx::from(&hash);
         // Full value preserved
@@ -419,6 +455,7 @@ mod tests {
             name: "SYSVOL".to_string(),
             permissions: "READ".to_string(),
             comment: "Logon server share".to_string(),
+            authenticated_as: None,
         };
         let ctx = ShareCtx::from(&share);
         assert_eq!(ctx.name, "SYSVOL");
@@ -433,6 +470,7 @@ mod tests {
             name: "C$".to_string(),
             permissions: String::new(),
             comment: String::new(),
+            authenticated_as: None,
         };
         let ctx = ShareCtx::from(&share);
         assert_eq!(ctx.permissions, "");
@@ -571,6 +609,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let ctx = HashCtx::from(&hash);
         assert_eq!(ctx.domain, "child.contoso.local");

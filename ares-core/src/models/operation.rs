@@ -637,6 +637,10 @@ mod tests {
             parent_id: Some("cred-1".to_string()),
             attack_step: 2,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         let chain = state.build_attack_chain("hash-1");
         assert_eq!(chain.len(), 2);
@@ -711,6 +715,10 @@ mod tests {
             parent_id: Some("cred-init".to_string()),
             attack_step: 2,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         let chain = state.build_domain_admin_chain();
         assert_eq!(chain.len(), 2);
@@ -733,6 +741,10 @@ mod tests {
             parent_id: None,
             attack_step: 1,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         let chain = state.build_domain_admin_chain();
         assert_eq!(chain.len(), 1);
@@ -754,6 +766,10 @@ mod tests {
             parent_id: None,
             attack_step: 1,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         });
         let chain = state.build_domain_admin_chain();
         assert!(chain.is_empty());

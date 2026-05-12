@@ -157,6 +157,10 @@ fn creates_ground_truth_from_red_state() {
         parent_id: None,
         attack_step: 0,
         aes_key: None,
+        is_previous: false,
+        source_host: None,
+        is_trust_key: false,
+        trust_pair_label: None,
     }];
     state.has_domain_admin = true;
 
@@ -277,24 +281,28 @@ fn writable_share_is_marked_required() {
             name: "NETLOGON".to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         },
         Share {
             host: "192.168.58.21".to_string(),
             name: "DATA".to_string(),
             permissions: "READ/WRITE".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         },
         Share {
             host: "192.168.58.22".to_string(),
             name: "BACKUP".to_string(),
             permissions: "WRITE".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         },
         Share {
             host: "192.168.58.23".to_string(),
             name: "PUBLIC".to_string(),
             permissions: "READ ONLY".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         },
     ];
 

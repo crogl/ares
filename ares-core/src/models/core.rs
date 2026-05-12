@@ -145,6 +145,32 @@ pub struct Hash {
     /// AES256 key for Kerberos golden tickets (Windows 2016+ rejects RC4).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub aes_key: Option<String>,
+    /// True when this is a previous (rotated-out) credential history entry —
+    /// NTDS exposes `_history0`, `_history1`, etc. for trust accounts and user
+    /// principals. Operationally, prefer current keys for ticket forging and
+    /// fall back to history only when current fails (e.g. mid-rotation
+    /// window). Defaults to `false` for forward compatibility with existing
+    /// Redis records.
+    #[serde(default)]
+    pub is_previous: bool,
+    /// Source host the hash was dumped from (IP or hostname). Threaded from
+    /// the dispatcher seam so multiple local-SAM `Administrator` / `Guest` /
+    /// `ssm-user` rows from different hosts don't collapse on dedup. Empty for
+    /// domain-qualified (NTDS) rows where the realm already disambiguates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_host: Option<String>,
+    /// True when the row's username ends in `$` AND the row's domain differs
+    /// from the dumping machine's home domain — i.e. this is an inter-realm
+    /// trust account hash (forging material), not the local machine account.
+    /// Set by the secretsdump parser; renderers hoist these into a dedicated
+    /// "Trust Keys / Forging Material" section.
+    #[serde(default)]
+    pub is_trust_key: bool,
+    /// When `is_trust_key` is true, the NetBIOS label of the trust target
+    /// (e.g. `FABRIKAM` for a `FABRIKAM$` row dumped from `contoso.local`).
+    /// Used for symmetric-pair detection in the report renderer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trust_pair_label: Option<String>,
 }
 
 #[cfg(test)]
@@ -346,6 +372,10 @@ mod tests {
             parent_id: None,
             attack_step: 1,
             aes_key: Some("aes256key".to_string()),
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         };
         let json = serde_json::to_string(&hash).unwrap();
         assert!(json.contains("aes256key"));
@@ -360,6 +390,7 @@ mod tests {
             name: "ADMIN$".to_string(),
             permissions: "READ".to_string(),
             comment: "Remote Admin".to_string(),
+            authenticated_as: None,
         };
         let json = serde_json::to_string(&share).unwrap();
         let deser: Share = serde_json::from_str(&json).unwrap();
@@ -612,6 +643,13 @@ pub struct Share {
     pub permissions: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub comment: String,
+    /// Credential the enumerating tool authenticated as, formatted
+    /// `"DOMAIN\\username"`. Lets the report show which key established
+    /// READ/WRITE on the share so an operator can re-issue the same auth for
+    /// follow-on file ops. `None` for share rows recovered from output that
+    /// lost credential context (legacy serialized records, raw-text fallback).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authenticated_as: Option<String>,
 }
 
 /// A forged Kerberos inter-realm ticket produced by `create_inter_realm_ticket`.

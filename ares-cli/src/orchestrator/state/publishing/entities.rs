@@ -490,6 +490,7 @@ mod tests {
             name: name.to_string(),
             permissions: "READ".to_string(),
             comment: String::new(),
+            authenticated_as: None,
         }
     }
 

@@ -166,6 +166,10 @@ impl SharedState {
             }
             return Ok(false);
         }
+        // Capture identity fields before `hash` is moved into state.hashes —
+        // they drive the implicit-user backfill below.
+        let backfill_username = hash.username.clone();
+        let backfill_domain = hash.domain.clone();
         {
             let is_krbtgt = hash.username.to_lowercase() == "krbtgt"
                 && hash.hash_type.to_lowercase().contains("ntlm");
@@ -327,6 +331,29 @@ impl SharedState {
                 }
             }
         }
+
+        // Backfill the users table with an implicit User row derived from the
+        // hash. This closes the gap where cross-forest LDAP enum is blocked
+        // (or the operator never ran user-enum) but secretsdump still lands
+        // identities — without this, the report's user count understates
+        // what we actually know. Machine accounts (`$` suffix) are excluded:
+        // those are trust-key / computer-account material, surfaced via the
+        // hash's `is_trust_key` flag, not as user rows.
+        if !backfill_username.is_empty()
+            && !backfill_username.ends_with('$')
+            && !backfill_domain.is_empty()
+        {
+            let user = ares_core::models::User {
+                username: backfill_username,
+                domain: backfill_domain,
+                description: String::new(),
+                is_admin: false,
+                source: "secretsdump_implicit".to_string(),
+            };
+            // Errors here are non-fatal — the hash already landed.
+            let _ = self.publish_user(queue, user).await;
+        }
+
         Ok(added)
     }
 
@@ -432,6 +459,10 @@ mod tests {
             parent_id: None,
             attack_step: 0,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
         }
     }
 

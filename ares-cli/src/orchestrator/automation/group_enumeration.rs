@@ -427,6 +427,10 @@ mod tests {
             discovered_at: None,
             parent_id: None,
             aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
             attack_step: 0,
         });
         let work = collect_group_enum_work(&state);

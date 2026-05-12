@@ -186,6 +186,7 @@ mod tests {
             name: name.into(),
             permissions: permissions.into(),
             comment: String::new(),
+            authenticated_as: None,
         }
     }
 
