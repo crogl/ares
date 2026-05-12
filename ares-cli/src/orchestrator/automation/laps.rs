@@ -16,6 +16,7 @@ use tokio::sync::watch;
 use tracing::{info, warn};
 
 use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::state::StateInner;
 
 /// Dedup key prefix for LAPS extraction.
 const DEDUP_LAPS: &str = "laps_extract";
@@ -24,6 +25,102 @@ const DEDUP_LAPS: &str = "laps_extract";
 fn is_laps_candidate(vuln_type: &str) -> bool {
     let vtype = vuln_type.to_lowercase();
     vtype == "laps_abuse" || vtype == "laps_reader" || vtype == "laps"
+}
+
+/// Domain-wide LAPS sweep via NTLM hash (pass-the-hash) — a LAPS-reader
+/// principal may only exist in `state.hashes` (e.g. surfaced by
+/// secretsdump on the DC) without a plaintext password. Treat each NTLM
+/// hash as a sweep credential; downstream `laps_dump` routes to
+/// `netexec -H` instead of `-p`.
+///
+/// Filters mirror Path 2 (plaintext sweep) so a principal already
+/// dispatched via password isn't re-dispatched via hash and vice versa:
+///   * empty domain — can't pick a DC
+///   * non-NTLM hash — `netexec -H` expects NTLM
+///   * empty hash value
+///   * delegation accounts — reserved for S4U, spraying causes lockout
+///   * quarantined principals — currently locked out
+///   * already-processed dedup key — sweep was dispatched on a prior tick
+///   * no DC IP known for the domain — defer until probe finds one
+fn collect_laps_hash_sweep_work(state: &StateInner) -> Vec<LapsWork> {
+    let mut items = Vec::new();
+    for h in state.hashes.iter().filter(|h| {
+        !h.domain.is_empty()
+            && h.hash_type.to_lowercase() == "ntlm"
+            && !h.hash_value.is_empty()
+            && !state.is_delegation_account(&h.username)
+            && !state.is_principal_quarantined(&h.username, &h.domain)
+    }) {
+        // Same dedup key namespace as plaintext sweep so we don't
+        // re-dispatch for a principal we already covered via password.
+        let dedup_key = format!(
+            "{DEDUP_LAPS}:sweep:{}:{}",
+            h.domain.to_lowercase(),
+            h.username.to_lowercase()
+        );
+        if state.is_processed(DEDUP_LAPS, &dedup_key) {
+            continue;
+        }
+
+        let dc_ip = state
+            .domain_controllers
+            .get(&h.domain.to_lowercase())
+            .cloned();
+        if dc_ip.is_none() {
+            continue;
+        }
+
+        items.push(LapsWork {
+            dedup_key,
+            domain: h.domain.clone(),
+            dc_ip,
+            target_computer: None,
+            credential: ares_core::models::Credential {
+                id: String::new(),
+                username: h.username.clone(),
+                password: String::new(),
+                domain: h.domain.clone(),
+                source: "hash_fallback".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            },
+            nt_hash: Some(h.hash_value.clone()),
+            vuln_id: None,
+        });
+    }
+    items
+}
+
+/// Build the dispatch payload for a `laps_dump` work item. Splits out so
+/// the optional-field assembly (nt_hash for PTH, dc_ip, target_computer,
+/// vuln_id) can be unit-tested without spinning a Dispatcher.
+fn build_laps_payload(item: &LapsWork) -> serde_json::Value {
+    let mut payload = json!({
+        "technique": "laps_dump",
+        "domain": item.domain,
+        "credential": {
+            "username": item.credential.username,
+            "password": item.credential.password,
+            "domain": item.credential.domain,
+        },
+    });
+
+    if let Some(ref hash) = item.nt_hash {
+        payload["nt_hash"] = json!(hash);
+    }
+    if let Some(ref dc) = item.dc_ip {
+        payload["target_ip"] = json!(dc);
+        payload["dc_ip"] = json!(dc);
+    }
+    if let Some(ref comp) = item.target_computer {
+        payload["target_computer"] = json!(comp);
+    }
+    if let Some(ref vid) = item.vuln_id {
+        payload["vuln_id"] = json!(vid);
+    }
+    payload
 }
 
 /// Monitors for LAPS-readable hosts and dispatches password extraction.
@@ -164,56 +261,7 @@ pub async fn auto_laps_extraction(
                 }
             }
 
-            // Path 2b: Domain-wide LAPS sweep via NTLM hash (pass-the-hash).
-            // A LAPS-reader principal may only exist in state.hashes (e.g.
-            // surfaced by secretsdump on the DC) without a plaintext password.
-            // Treat each NTLM hash as a sweep credential and -H instead of -p.
-            for h in state.hashes.iter().filter(|h| {
-                !h.domain.is_empty()
-                    && h.hash_type.to_lowercase() == "ntlm"
-                    && !h.hash_value.is_empty()
-                    && !state.is_delegation_account(&h.username)
-                    && !state.is_principal_quarantined(&h.username, &h.domain)
-            }) {
-                // Same dedup key namespace as plaintext sweep so we don't
-                // re-dispatch for a principal we already covered via password.
-                let dedup_key = format!(
-                    "{DEDUP_LAPS}:sweep:{}:{}",
-                    h.domain.to_lowercase(),
-                    h.username.to_lowercase()
-                );
-                if state.is_processed(DEDUP_LAPS, &dedup_key) {
-                    continue;
-                }
-
-                let dc_ip = state
-                    .domain_controllers
-                    .get(&h.domain.to_lowercase())
-                    .cloned();
-                if dc_ip.is_none() {
-                    continue;
-                }
-
-                items.push(LapsWork {
-                    dedup_key,
-                    domain: h.domain.clone(),
-                    dc_ip,
-                    target_computer: None,
-                    credential: ares_core::models::Credential {
-                        id: String::new(),
-                        username: h.username.clone(),
-                        password: String::new(),
-                        domain: h.domain.clone(),
-                        source: "hash_fallback".into(),
-                        discovered_at: None,
-                        is_admin: false,
-                        parent_id: None,
-                        attack_step: 0,
-                    },
-                    nt_hash: Some(h.hash_value.clone()),
-                    vuln_id: None,
-                });
-            }
+            items.extend(collect_laps_hash_sweep_work(&state));
 
             // Limit to avoid spamming
             let limit = if dispatcher.config.strategy.is_comprehensive() {
@@ -225,29 +273,7 @@ pub async fn auto_laps_extraction(
         };
 
         for item in work {
-            let mut payload = json!({
-                "technique": "laps_dump",
-                "domain": item.domain,
-                "credential": {
-                    "username": item.credential.username,
-                    "password": item.credential.password,
-                    "domain": item.credential.domain,
-                },
-            });
-
-            if let Some(ref hash) = item.nt_hash {
-                payload["nt_hash"] = json!(hash);
-            }
-            if let Some(ref dc) = item.dc_ip {
-                payload["target_ip"] = json!(dc);
-                payload["dc_ip"] = json!(dc);
-            }
-            if let Some(ref comp) = item.target_computer {
-                payload["target_computer"] = json!(comp);
-            }
-            if let Some(ref vid) = item.vuln_id {
-                payload["vuln_id"] = json!(vid);
-            }
+            let payload = build_laps_payload(&item);
 
             let priority = dispatcher.effective_priority("laps");
             match dispatcher
@@ -360,5 +386,219 @@ mod tests {
             "SVC_Admin".to_lowercase()
         );
         assert_eq!(dedup_key, "laps_extract:sweep:contoso.local:svc_admin");
+    }
+
+    // collect_laps_hash_sweep_work
+
+    fn ntlm_hash(username: &str, domain: &str, value: &str) -> ares_core::models::Hash {
+        ares_core::models::Hash {
+            id: String::new(),
+            username: username.into(),
+            hash_value: value.into(),
+            hash_type: "NTLM".into(),
+            domain: domain.into(),
+            cracked_password: None,
+            source: "test".into(),
+            discovered_at: None,
+            parent_id: None,
+            attack_step: 0,
+            aes_key: None,
+            is_previous: false,
+            source_host: None,
+            is_trust_key: false,
+            trust_pair_label: None,
+        }
+    }
+
+    fn state_with_dc(domain: &str, dc_ip: &str) -> StateInner {
+        let mut s = StateInner::new("op-test".into());
+        s.domain_controllers
+            .insert(domain.to_lowercase(), dc_ip.into());
+        s
+    }
+
+    #[test]
+    fn laps_hash_sweep_emits_work_item_for_valid_ntlm_hash() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes
+            .push(ntlm_hash("alice", "contoso.local", "abcd1234"));
+
+        let work = collect_laps_hash_sweep_work(&s);
+        assert_eq!(work.len(), 1);
+        let item = &work[0];
+        assert_eq!(item.domain, "contoso.local");
+        assert_eq!(item.dc_ip.as_deref(), Some("192.168.58.10"));
+        assert_eq!(item.nt_hash.as_deref(), Some("abcd1234"));
+        assert_eq!(item.credential.username, "alice");
+        assert_eq!(item.credential.password, "");
+        assert_eq!(item.credential.source, "hash_fallback");
+        assert!(item.vuln_id.is_none());
+        assert!(item.target_computer.is_none());
+        assert_eq!(item.dedup_key, "laps_extract:sweep:contoso.local:alice");
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_empty_domain() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes.push(ntlm_hash("alice", "", "abcd1234"));
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_non_ntlm_hash_type() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        let mut h = ntlm_hash("alice", "contoso.local", "abcd1234");
+        h.hash_type = "aes256".into();
+        s.hashes.push(h);
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_empty_hash_value() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes.push(ntlm_hash("alice", "contoso.local", ""));
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_when_no_dc_for_domain() {
+        // No DC registered for the domain — defer until host scan finds it.
+        let mut s = StateInner::new("op-test".into());
+        s.hashes
+            .push(ntlm_hash("alice", "contoso.local", "abcd1234"));
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_quarantined_principal() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes
+            .push(ntlm_hash("alice", "contoso.local", "abcd1234"));
+        s.quarantine_principal("alice", "contoso.local");
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_delegation_account() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        // Register the principal as a constrained-delegation account so
+        // `is_delegation_account` returns true for it.
+        let mut details = std::collections::HashMap::new();
+        details.insert(
+            "account_name".into(),
+            serde_json::Value::String("svc_web".into()),
+        );
+        s.discovered_vulnerabilities.insert(
+            "vuln-deleg".into(),
+            ares_core::models::VulnerabilityInfo {
+                vuln_id: "vuln-deleg".into(),
+                vuln_type: "constrained_delegation".into(),
+                target: "192.168.58.10".into(),
+                discovered_by: "test".into(),
+                discovered_at: chrono::Utc::now(),
+                details,
+                recommended_agent: String::new(),
+                priority: 1,
+            },
+        );
+        s.hashes
+            .push(ntlm_hash("svc_web", "contoso.local", "abcd1234"));
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_skips_already_processed_dedup_key() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes
+            .push(ntlm_hash("alice", "contoso.local", "abcd1234"));
+        s.mark_processed(DEDUP_LAPS, "laps_extract:sweep:contoso.local:alice".into());
+        assert!(collect_laps_hash_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_hash_sweep_normalizes_case_in_dedup_lookup() {
+        // Hash carries mixed-case domain/username but the DC lookup and
+        // dedup key go through `.to_lowercase()` — the work item is still
+        // emitted.
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes
+            .push(ntlm_hash("Alice", "CONTOSO.LOCAL", "abcd1234"));
+        let work = collect_laps_hash_sweep_work(&s);
+        assert_eq!(work.len(), 1);
+        assert_eq!(work[0].dedup_key, "laps_extract:sweep:contoso.local:alice");
+    }
+
+    #[test]
+    fn laps_hash_sweep_emits_one_item_per_eligible_hash() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.hashes
+            .push(ntlm_hash("alice", "contoso.local", "abcd1234"));
+        s.hashes.push(ntlm_hash("bob", "contoso.local", "deadbeef"));
+        let work = collect_laps_hash_sweep_work(&s);
+        assert_eq!(work.len(), 2);
+    }
+
+    // build_laps_payload
+
+    fn work_item(nt_hash: Option<&str>) -> LapsWork {
+        LapsWork {
+            dedup_key: "laps_extract:sweep:contoso.local:alice".into(),
+            domain: "contoso.local".into(),
+            dc_ip: Some("192.168.58.10".into()),
+            target_computer: None,
+            credential: ares_core::models::Credential {
+                id: String::new(),
+                username: "alice".into(),
+                password: "P@ssw0rd!".into(),
+                domain: "contoso.local".into(),
+                source: "test".into(),
+                discovered_at: None,
+                is_admin: false,
+                parent_id: None,
+                attack_step: 0,
+            },
+            nt_hash: nt_hash.map(str::to_string),
+            vuln_id: None,
+        }
+    }
+
+    #[test]
+    fn build_laps_payload_omits_nt_hash_when_password_only() {
+        let payload = build_laps_payload(&work_item(None));
+        assert_eq!(payload["technique"], "laps_dump");
+        assert_eq!(payload["domain"], "contoso.local");
+        assert_eq!(payload["credential"]["username"], "alice");
+        assert_eq!(payload["credential"]["password"], "P@ssw0rd!");
+        assert!(payload.get("nt_hash").is_none());
+        assert_eq!(payload["target_ip"], "192.168.58.10");
+        assert_eq!(payload["dc_ip"], "192.168.58.10");
+    }
+
+    #[test]
+    fn build_laps_payload_includes_nt_hash_for_pth() {
+        let payload = build_laps_payload(&work_item(Some("abcd1234")));
+        assert_eq!(payload["nt_hash"], "abcd1234");
+        // Other fields stay intact.
+        assert_eq!(payload["technique"], "laps_dump");
+        assert_eq!(payload["dc_ip"], "192.168.58.10");
+    }
+
+    #[test]
+    fn build_laps_payload_includes_optional_target_computer_and_vuln_id() {
+        let mut item = work_item(None);
+        item.target_computer = Some("ws01.contoso.local".into());
+        item.vuln_id = Some("vuln-laps-1".into());
+        let payload = build_laps_payload(&item);
+        assert_eq!(payload["target_computer"], "ws01.contoso.local");
+        assert_eq!(payload["vuln_id"], "vuln-laps-1");
+    }
+
+    #[test]
+    fn build_laps_payload_omits_dc_ip_when_unknown() {
+        let mut item = work_item(None);
+        item.dc_ip = None;
+        let payload = build_laps_payload(&item);
+        assert!(payload.get("target_ip").is_none());
+        assert!(payload.get("dc_ip").is_none());
     }
 }

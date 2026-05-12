@@ -957,6 +957,26 @@ mod tests {
         assert!(required_str(&args, "domain").is_ok());
     }
 
+    // --- laps_dump auth-arg validation gate ---
+
+    #[tokio::test]
+    async fn laps_dump_rejects_missing_password_and_nt_hash() {
+        // Validation runs before netexec spawn — neither password nor
+        // nt_hash supplied means we bail with a clear error message rather
+        // than letting netexec fail anonymously.
+        let args = json!({
+            "target": "192.168.58.10",
+            "username": "alice",
+            "domain": "contoso.local",
+        });
+        let err = super::laps_dump(&args).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("requires either 'password' or 'nt_hash'"),
+            "unexpected error: {err}"
+        );
+    }
+
     // --- DEFAULT_SPRAY_USERNAMES ---
 
     #[test]

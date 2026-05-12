@@ -400,6 +400,13 @@ fn is_gmsa_principal(username: &str) -> bool {
     !trimmed.is_empty() && trimmed.len() < username.len() && trimmed.to_lowercase().contains("gmsa")
 }
 
+/// `gmsa_{name}` scoreboard token for a gMSA principal — the trailing `$`
+/// is stripped and the name lowercased so secretsdump-surfaced and
+/// enumeration-surfaced paths converge on a single exploited-set entry.
+fn gmsa_exploit_token(username: &str) -> String {
+    format!("gmsa_{}", username.trim_end_matches('$').to_lowercase())
+}
+
 fn parse_lockout_principal(line: &str) -> Option<(String, Option<String>)> {
     let marker_pos = LOCKOUT_PATTERNS.iter().filter_map(|p| line.find(p)).min()?;
     let prefix = &line[..marker_pos];
@@ -976,7 +983,7 @@ async fn extract_discoveries(
                 // Without this, gMSA hashes captured incidentally via DCSync
                 // never emit a `gmsa_*` token to the exploited set.
                 if is_gmsa_principal(&username) {
-                    let vuln_id = format!("gmsa_{}", username.trim_end_matches('$').to_lowercase());
+                    let vuln_id = gmsa_exploit_token(&username);
                     if let Err(e) = dispatcher
                         .state
                         .mark_exploited(&dispatcher.queue, &vuln_id)

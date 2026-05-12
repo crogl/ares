@@ -1255,3 +1255,20 @@ fn is_gmsa_principal_rejects_user_without_trailing_dollar() {
     assert!(!is_gmsa_principal(""));
     assert!(!is_gmsa_principal("$"));
 }
+
+#[test]
+fn gmsa_exploit_token_strips_dollar_and_lowercases() {
+    use super::gmsa_exploit_token;
+    assert_eq!(gmsa_exploit_token("gmsaDragon$"), "gmsa_gmsadragon");
+    assert_eq!(gmsa_exploit_token("GMSA_WEB$"), "gmsa_gmsa_web");
+    assert_eq!(gmsa_exploit_token("svc_gmsa$"), "gmsa_svc_gmsa");
+}
+
+#[test]
+fn gmsa_exploit_token_converges_with_enumeration_format() {
+    // Enumeration path emits `gmsa_{name}` lowercased; secretsdump-surfaced
+    // path must produce the same key so the exploited-set entry deduplicates
+    // across paths and the scoreboard counts the primitive once.
+    use super::gmsa_exploit_token;
+    assert_eq!(gmsa_exploit_token("gmsaDragon$"), "gmsa_gmsadragon");
+}

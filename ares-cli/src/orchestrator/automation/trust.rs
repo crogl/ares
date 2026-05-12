@@ -40,6 +40,33 @@ fn forest_trust_vuln_id(source_domain: &str, target_domain: &str) -> String {
     )
 }
 
+/// Maps a `source → target` trust escalation to its scoreboard tokens:
+/// the `vuln_id`, the `vuln_type` enum used by the exploit gate, and the
+/// human-readable note prefix written into the vulnerability details.
+///
+/// Intra-forest (child↔parent) and inter-forest are distinct MITRE
+/// primitives — both ride the inter-realm-TGT + secretsdump mechanic
+/// internally, but downstream scoreboard tokenization, suppression rules
+/// (SID filtering), and exploitation gates branch on this distinction.
+fn classify_trust_escalation(
+    source_domain: &str,
+    target_domain: &str,
+) -> (String, &'static str, &'static str) {
+    if is_inter_forest(source_domain, target_domain) {
+        (
+            forest_trust_vuln_id(source_domain, target_domain),
+            "forest_trust_escalation",
+            "Forest trust escalation",
+        )
+    } else {
+        (
+            child_to_parent_vuln_id(source_domain, target_domain),
+            "child_to_parent",
+            "Child-to-parent escalation",
+        )
+    }
+}
+
 /// Build a trust account name from a flat name (e.g. "FABRIKAM" -> "FABRIKAM$").
 fn trust_account_name(flat_name: &str) -> String {
     format!("{}$", flat_name.to_uppercase())
@@ -1423,26 +1450,8 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         };
 
         for item in work {
-            // Trust topology determines the scoreboard tokenization: intra-forest
-            // (child↔parent) escalations are a different MITRE primitive than
-            // inter-forest trust exploitation, even though both ride the same
-            // inter-realm-TGT + secretsdump mechanic here.
-            let is_intra_forest = !is_inter_forest(&item.source_domain, &item.target_domain);
-            let vuln_id = if is_intra_forest {
-                child_to_parent_vuln_id(&item.source_domain, &item.target_domain)
-            } else {
-                forest_trust_vuln_id(&item.source_domain, &item.target_domain)
-            };
-            let vuln_type = if is_intra_forest {
-                "child_to_parent"
-            } else {
-                "forest_trust_escalation"
-            };
-            let note_kind = if is_intra_forest {
-                "Child-to-parent escalation"
-            } else {
-                "Forest trust escalation"
-            };
+            let (vuln_id, vuln_type, note_kind) =
+                classify_trust_escalation(&item.source_domain, &item.target_domain);
 
             // Defer dispatch when the target DC IP is unknown: impacket needs
             // a routable -target-ip for both create_inter_realm_ticket and the
@@ -2838,5 +2847,50 @@ mod tests {
         });
         let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
         assert!(got.is_none());
+    }
+
+    // classify_trust_escalation
+
+    #[test]
+    fn classify_trust_escalation_intra_forest_child_to_parent() {
+        let (vuln_id, vuln_type, note_kind) =
+            classify_trust_escalation("child.contoso.local", "contoso.local");
+        assert_eq!(vuln_id, "child_to_parent_child_contoso_local_contoso_local");
+        assert_eq!(vuln_type, "child_to_parent");
+        assert_eq!(note_kind, "Child-to-parent escalation");
+    }
+
+    #[test]
+    fn classify_trust_escalation_intra_forest_parent_to_child() {
+        let (vuln_id, vuln_type, note_kind) =
+            classify_trust_escalation("contoso.local", "child.contoso.local");
+        assert_eq!(vuln_id, "child_to_parent_contoso_local_child_contoso_local");
+        assert_eq!(vuln_type, "child_to_parent");
+        assert_eq!(note_kind, "Child-to-parent escalation");
+    }
+
+    #[test]
+    fn classify_trust_escalation_inter_forest() {
+        let (vuln_id, vuln_type, note_kind) =
+            classify_trust_escalation("contoso.local", "fabrikam.local");
+        assert_eq!(vuln_id, "forest_trust_contoso.local_fabrikam.local");
+        assert_eq!(vuln_type, "forest_trust_escalation");
+        assert_eq!(note_kind, "Forest trust escalation");
+    }
+
+    #[test]
+    fn classify_trust_escalation_same_domain_treated_as_intra() {
+        // is_inter_forest returns false for s == t, so the helper falls through
+        // to the intra-forest branch. The auto loop suppresses self-trust later;
+        // here we just pin the classification.
+        let (_, vuln_type, _) = classify_trust_escalation("contoso.local", "contoso.local");
+        assert_eq!(vuln_type, "child_to_parent");
+    }
+
+    #[test]
+    fn classify_trust_escalation_case_insensitive() {
+        let (vuln_id_a, _, _) = classify_trust_escalation("CHILD.Contoso.Local", "Contoso.Local");
+        let (vuln_id_b, _, _) = classify_trust_escalation("child.contoso.local", "contoso.local");
+        assert_eq!(vuln_id_a, vuln_id_b);
     }
 }
