@@ -49,6 +49,21 @@ impl SharedState {
             host.hostname = String::new();
         }
 
+        // Reject malformed multi-IP `host.ip` fields. Some parsers receive a
+        // target list (comma- or space-separated) as the `target` param and
+        // store the whole string verbatim in `host.ip`. `dedup_hosts` then
+        // rescues the malformed value into the hostname field for display,
+        // producing phantom rows like `- 1.2.3.4,5.6.7.8 / (empty)`. Reject
+        // anything that doesn't parse as a single IpAddr at the boundary.
+        // Empty IP is allowed (hostname-only hosts are a legitimate shape).
+        if !host.ip.is_empty() && host.ip.parse::<std::net::IpAddr>().is_err() {
+            tracing::debug!(
+                ip = %host.ip,
+                "Skipping host publish: ip field is not a single valid address"
+            );
+            return Ok(false);
+        }
+
         // Self-IP guard: an SMB sweep from the attacker pivot will hit its own
         // NIC and produce a "host" record for the pivot box itself. Skip it
         // silently — we don't want to count, scan, or attack ourselves. The
@@ -1021,5 +1036,32 @@ mod tests {
         let host = make_host("192.168.58.99", "srv01.contoso.local", false);
         let added = state.publish_host(&q, host).await.unwrap();
         assert!(added);
+    }
+
+    #[tokio::test]
+    async fn publish_host_rejects_multi_ip_in_ip_field() {
+        // Some parsers store the entire sweep target list verbatim in the
+        // `ip` field (e.g. "1.2.3.4,5.6.7.8"). Without this guard,
+        // `dedup_hosts` rescues the malformed string into the hostname
+        // field on display, producing phantom rows with an IP-list as a
+        // "hostname". Reject at the publish boundary.
+        let state = SharedState::new("op-1".to_string());
+        let q = mock_queue();
+
+        for malformed in &[
+            "192.168.58.10,192.168.58.20",
+            "192.168.58.10 192.168.58.20",
+            "not-an-ip",
+        ] {
+            let host = make_host(malformed, "", false);
+            let added = state.publish_host(&q, host).await.unwrap();
+            assert!(!added, "must drop malformed host.ip {:?}", malformed);
+        }
+        let s = state.inner.read().await;
+        assert!(
+            s.hosts.is_empty(),
+            "no malformed entry should reach state.hosts, got: {:?}",
+            s.hosts
+        );
     }
 }
