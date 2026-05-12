@@ -156,19 +156,28 @@ pub fn parse_nmap_output(output: &str, params: &Value) -> Vec<Value> {
         flush_nmap_host(&current_ip, &hostname, &os_info, &services, &mut hosts);
     }
 
-    // If no hosts were found but we have a target_ip, create a minimal host entry
-    // Skip CIDR notation (e.g. "192.168.58.0/24") — individual hosts will be discovered
+    // If no hosts were found but we have a target_ip, create a minimal host entry.
+    // Skip CIDR notation (e.g. a `/24` mask) — individual hosts will be discovered
     // by their own scan results; a subnet target should never become a host entry.
+    // Also split multi-target lists (comma/space/semicolon separated) so callers
+    // that pass `"<ip1>,<ip2>"` as the target param don't get one host record
+    // containing the literal joined string in the `ip` field.
     if hosts.is_empty() && !target_ip.is_empty() && !target_ip.contains('/') {
-        hosts.push(json!({
-            "ip": target_ip,
-            "hostname": "",
-            "os": "",
-            "roles": [],
-            "services": [],
-            "is_dc": false,
-            "owned": false,
-        }));
+        for ip in target_ip
+            .split([',', ' ', ';', '\t', '\n'])
+            .map(str::trim)
+            .filter(|s| super::looks_like_ip(s))
+        {
+            hosts.push(json!({
+                "ip": ip,
+                "hostname": "",
+                "os": "",
+                "roles": [],
+                "services": [],
+                "is_dc": false,
+                "owned": false,
+            }));
+        }
     }
 
     hosts
