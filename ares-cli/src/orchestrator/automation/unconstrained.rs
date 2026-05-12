@@ -140,6 +140,39 @@ pub async fn auto_unconstrained_exploitation(
                         dc_ip.as_ref().cloned()?
                     };
 
+                    // Skip when the unconstrained host IS the DC we'd coerce from.
+                    // The coerce-and-capture chain requires the DC to authenticate
+                    // to a *different* unconstrained host whose LSASS we then dump
+                    // for the captured TGT. When they're the same machine, both
+                    // PetitPotam (self-loop returns rpc_s_access_denied) and
+                    // PrinterBug (ERROR_INVALID_HANDLE) fail, and even if the
+                    // self-coerce worked, dumping LSASS on the DC requires local
+                    // admin — at which point we already have DA and the dc_secretsdump
+                    // path is the canonical exploitation. Mark exploited only if the
+                    // domain has actually been compromised through secretsdump (the
+                    // dominated_domains signal); otherwise just defer silently so
+                    // the chain isn't burning throttle budget on doomed attempts.
+                    if is_machine
+                        && dc_ip
+                            .as_ref()
+                            .is_some_and(|ip| ip == &host_ip)
+                    {
+                        if state.dominated_domains.contains(&domain.to_lowercase()) {
+                            debug!(
+                                vuln_id = %vuln.vuln_id,
+                                host = %host_ip,
+                                "Unconstrained delegation host == DC — subsumed by dc_secretsdump"
+                            );
+                        } else {
+                            debug!(
+                                vuln_id = %vuln.vuln_id,
+                                host = %host_ip,
+                                "Unconstrained delegation host == DC — deferring (no self-coerce path)"
+                            );
+                        }
+                        return None;
+                    }
+
                     // Find any non-quarantined credential with a password for this domain.
                     let credential = state
                         .credentials
