@@ -1,7 +1,9 @@
 //! In-process tool dispatcher (no Redis).
 
+use std::borrow::Cow;
+
 use anyhow::Result;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use ares_llm::{ToolCall, ToolExecResult};
 
@@ -73,7 +75,12 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         // domain arg (used for the lookup) is the LLM-supplied target.
         inject_excluded_users(&self.state, &call.name, &mut resolved_arguments).await;
         let mut conn = self.queue.connection();
-        if let Err(e) = resolve_credentials(
+        // A cross-forest Kerberos coercion may redirect to a `*_kerberos`
+        // variant (e.g. psexec → psexec_kerberos). Track the effective tool
+        // name so the dispatch call below picks up the rename — without this
+        // the rename in `resolve_credentials` would silently no-op.
+        let mut effective_tool_name: Cow<'_, str> = Cow::Borrowed(call.name.as_str());
+        match resolve_credentials(
             &mut conn,
             Some(self.operation_id.as_str()),
             &call.name,
@@ -81,16 +88,27 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
         )
         .await
         {
-            warn!(
-                tool = %call.name,
-                err = %e,
-                "credential_resolver failed; continuing with original arguments"
-            );
-            resolved_arguments = call.arguments.clone();
-            inject_excluded_users(&self.state, &call.name, &mut resolved_arguments).await;
+            Ok(Some(renamed)) => {
+                info!(
+                    from = %call.name,
+                    to = %renamed,
+                    "tool_dispatcher: applying Kerberos variant redirect from credential_resolver"
+                );
+                effective_tool_name = Cow::Owned(renamed);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(
+                    tool = %call.name,
+                    err = %e,
+                    "credential_resolver failed; continuing with original arguments"
+                );
+                resolved_arguments = call.arguments.clone();
+                inject_excluded_users(&self.state, &call.name, &mut resolved_arguments).await;
+            }
         }
 
-        match ares_tools::dispatch(&call.name, &resolved_arguments).await {
+        match ares_tools::dispatch(&effective_tool_name, &resolved_arguments).await {
             Ok(output) => {
                 let raw = output.combined_raw();
                 let combined = output.combined();
@@ -100,9 +118,15 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                     Some(format!("tool exited with code {:?}", output.exit_code))
                 };
 
-                // Parse structured discoveries from raw (unfiltered) output
-                let discoveries =
-                    ares_tools::parsers::parse_tool_output(&call.name, &raw, &resolved_arguments);
+                // Parse structured discoveries from raw (unfiltered) output.
+                // Use the effective (post-redirect) tool name so the parser
+                // matches the actual binary that ran — secretsdump and
+                // secretsdump_kerberos emit slightly different output shapes.
+                let discoveries = ares_tools::parsers::parse_tool_output(
+                    &effective_tool_name,
+                    &raw,
+                    &resolved_arguments,
+                );
                 let discoveries = if discoveries.as_object().is_none_or(|o| o.is_empty()) {
                     None
                 } else {
@@ -115,7 +139,7 @@ impl ares_llm::ToolDispatcher for LocalToolDispatcher {
                         &self.queue,
                         &self.operation_id,
                         disc,
-                        &call.name,
+                        &effective_tool_name,
                         &resolved_arguments,
                     )
                     .await;
