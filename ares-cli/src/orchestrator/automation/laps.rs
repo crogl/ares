@@ -27,6 +27,123 @@ fn is_laps_candidate(vuln_type: &str) -> bool {
     vtype == "laps_abuse" || vtype == "laps_reader" || vtype == "laps"
 }
 
+/// Path 1: Vulnerability-driven LAPS — BloodHound or an ACL probe surfaced an
+/// explicit LAPS-reader principal. Match the principal to a known credential
+/// and emit one work item per (unexploited, unprocessed) LAPS vulnerability.
+///
+/// Filters mirror the inline path: `is_laps_candidate` vuln types,
+/// not-yet-exploited, not-yet-dispatched, and the principal must be present in
+/// `state.credentials` (we lack auth material to act on a name we can't
+/// authenticate as). Splits out so the per-vuln field extraction can be unit
+/// tested without spinning a Dispatcher.
+fn collect_laps_vuln_work(state: &StateInner) -> Vec<LapsWork> {
+    let mut items = Vec::new();
+    for vuln in state.discovered_vulnerabilities.values() {
+        if !is_laps_candidate(&vuln.vuln_type) {
+            continue;
+        }
+        if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
+            continue;
+        }
+        let dedup_key = format!("{DEDUP_LAPS}:vuln:{}", vuln.vuln_id);
+        if state.is_processed(DEDUP_LAPS, &dedup_key) {
+            continue;
+        }
+
+        let reader = vuln
+            .details
+            .get("source")
+            .or_else(|| vuln.details.get("account_name"))
+            .or_else(|| vuln.details.get("reader"))
+            .and_then(|v| v.as_str());
+
+        let domain = vuln
+            .details
+            .get("domain")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let target_computer = vuln
+            .details
+            .get("target")
+            .or_else(|| vuln.details.get("target_computer"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let credential = reader.and_then(|r| {
+            state
+                .credentials
+                .iter()
+                .find(|c| {
+                    c.username.to_lowercase() == r.to_lowercase()
+                        && (domain.is_empty() || c.domain.to_lowercase() == domain.to_lowercase())
+                })
+                .cloned()
+        });
+
+        if let Some(cred) = credential {
+            let dc_ip = state
+                .domain_controllers
+                .get(&domain.to_lowercase())
+                .cloned();
+            items.push(LapsWork {
+                dedup_key,
+                domain: domain.to_string(),
+                dc_ip,
+                target_computer: if target_computer.is_empty() {
+                    None
+                } else {
+                    Some(target_computer.to_string())
+                },
+                credential: cred,
+                nt_hash: None,
+                vuln_id: Some(vuln.vuln_id.clone()),
+            });
+        }
+    }
+    items
+}
+
+/// Path 2: Domain-wide LAPS sweep — try each plaintext credential against its
+/// domain's DC to read LAPS for every computer. Mirrors the hash-fallback
+/// sweep filters (`collect_laps_hash_sweep_work`) so the same principal is
+/// never dispatched twice across both paths.
+fn collect_laps_sweep_work(state: &StateInner) -> Vec<LapsWork> {
+    let mut items = Vec::new();
+    for cred in state.credentials.iter().filter(|c| {
+        !c.domain.is_empty()
+            && !c.password.is_empty()
+            && !state.is_delegation_account(&c.username)
+            && !state.is_principal_quarantined(&c.username, &c.domain)
+    }) {
+        let dedup_key = format!(
+            "{DEDUP_LAPS}:sweep:{}:{}",
+            cred.domain.to_lowercase(),
+            cred.username.to_lowercase()
+        );
+        if state.is_processed(DEDUP_LAPS, &dedup_key) {
+            continue;
+        }
+        let dc_ip = state
+            .domain_controllers
+            .get(&cred.domain.to_lowercase())
+            .cloned();
+        if dc_ip.is_none() {
+            continue;
+        }
+        items.push(LapsWork {
+            dedup_key,
+            domain: cred.domain.clone(),
+            dc_ip,
+            target_computer: None,
+            credential: cred.clone(),
+            nt_hash: None,
+            vuln_id: None,
+        });
+    }
+    items
+}
+
 /// Domain-wide LAPS sweep via NTLM hash (pass-the-hash) — a LAPS-reader
 /// principal may only exist in `state.hashes` (e.g. surfaced by
 /// secretsdump on the DC) without a plaintext password. Treat each NTLM
@@ -153,114 +270,14 @@ pub async fn auto_laps_extraction(
                 continue;
             }
 
-            // Two paths to LAPS:
+            // Three paths to LAPS:
             // 1. Vuln-driven: BloodHound/ACL analysis found explicit LAPS read access
-            // 2. Domain-wide: try each credential against the DC to read LAPS for all
-            //    computers (netexec ldap -M laps)
-
-            let mut items = Vec::new();
-
-            // Path 1: Vulnerability-driven LAPS (specific reader identified)
-            for vuln in state.discovered_vulnerabilities.values() {
-                if !is_laps_candidate(&vuln.vuln_type) {
-                    continue;
-                }
-                if state.exploited_vulnerabilities.contains(&vuln.vuln_id) {
-                    continue;
-                }
-
-                let dedup_key = format!("{DEDUP_LAPS}:vuln:{}", vuln.vuln_id);
-                if state.is_processed(DEDUP_LAPS, &dedup_key) {
-                    continue;
-                }
-
-                let reader = vuln
-                    .details
-                    .get("source")
-                    .or_else(|| vuln.details.get("account_name"))
-                    .or_else(|| vuln.details.get("reader"))
-                    .and_then(|v| v.as_str());
-
-                let domain = vuln
-                    .details
-                    .get("domain")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                let target_computer = vuln
-                    .details
-                    .get("target")
-                    .or_else(|| vuln.details.get("target_computer"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-
-                // Find credential for the reader
-                let credential = reader
-                    .and_then(|r| {
-                        state.credentials.iter().find(|c| {
-                            c.username.to_lowercase() == r.to_lowercase()
-                                && (domain.is_empty()
-                                    || c.domain.to_lowercase() == domain.to_lowercase())
-                        })
-                    })
-                    .cloned();
-
-                if let Some(cred) = credential {
-                    let dc_ip = state
-                        .domain_controllers
-                        .get(&domain.to_lowercase())
-                        .cloned();
-
-                    items.push(LapsWork {
-                        dedup_key,
-                        domain: domain.to_string(),
-                        dc_ip,
-                        target_computer: if target_computer.is_empty() {
-                            None
-                        } else {
-                            Some(target_computer.to_string())
-                        },
-                        credential: cred,
-                        nt_hash: None,
-                        vuln_id: Some(vuln.vuln_id.clone()),
-                    });
-                }
-            }
-
-            // Path 2: Domain-wide LAPS sweep (one per domain+credential)
-            for cred in state.credentials.iter().filter(|c| {
-                !c.domain.is_empty()
-                    && !c.password.is_empty()
-                    && !state.is_delegation_account(&c.username)
-                    && !state.is_principal_quarantined(&c.username, &c.domain)
-            }) {
-                let dedup_key = format!(
-                    "{DEDUP_LAPS}:sweep:{}:{}",
-                    cred.domain.to_lowercase(),
-                    cred.username.to_lowercase()
-                );
-                if state.is_processed(DEDUP_LAPS, &dedup_key) {
-                    continue;
-                }
-
-                let dc_ip = state
-                    .domain_controllers
-                    .get(&cred.domain.to_lowercase())
-                    .cloned();
-
-                if dc_ip.is_some() {
-                    items.push(LapsWork {
-                        dedup_key,
-                        domain: cred.domain.clone(),
-                        dc_ip,
-                        target_computer: None,
-                        credential: cred.clone(),
-                        nt_hash: None,
-                        vuln_id: None,
-                    });
-                }
-            }
-
+            // 2. Domain-wide sweep: try each plaintext credential against the DC
+            //    to read LAPS for all computers (netexec ldap -M laps)
+            // 3. Hash-fallback sweep: same as #2 but pass-the-hash when only an
+            //    NTLM hash is available for a candidate principal.
+            let mut items = collect_laps_vuln_work(&state);
+            items.extend(collect_laps_sweep_work(&state));
             items.extend(collect_laps_hash_sweep_work(&state));
 
             // Limit to avoid spamming
@@ -600,5 +617,303 @@ mod tests {
         let payload = build_laps_payload(&item);
         assert!(payload.get("target_ip").is_none());
         assert!(payload.get("dc_ip").is_none());
+    }
+
+    // collect_laps_vuln_work
+
+    fn vuln_with_details(
+        vuln_id: &str,
+        vuln_type: &str,
+        details: Vec<(&str, &str)>,
+    ) -> ares_core::models::VulnerabilityInfo {
+        let mut map = std::collections::HashMap::new();
+        for (k, v) in details {
+            map.insert(k.into(), serde_json::Value::String(v.into()));
+        }
+        ares_core::models::VulnerabilityInfo {
+            vuln_id: vuln_id.into(),
+            vuln_type: vuln_type.into(),
+            target: String::new(),
+            discovered_by: "test".into(),
+            discovered_at: chrono::Utc::now(),
+            details: map,
+            recommended_agent: String::new(),
+            priority: 5,
+        }
+    }
+
+    fn plaintext_cred(
+        username: &str,
+        domain: &str,
+        password: &str,
+    ) -> ares_core::models::Credential {
+        ares_core::models::Credential {
+            id: String::new(),
+            username: username.into(),
+            password: password.into(),
+            domain: domain.into(),
+            source: "test".into(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        }
+    }
+
+    #[test]
+    fn laps_vuln_work_emits_item_when_reader_credential_known() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-laps-1".into(),
+            vuln_with_details(
+                "vuln-laps-1",
+                "laps_reader",
+                vec![
+                    ("source", "alice"),
+                    ("domain", "contoso.local"),
+                    ("target", "ws01.contoso.local"),
+                ],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+
+        let work = collect_laps_vuln_work(&s);
+        assert_eq!(work.len(), 1);
+        let item = &work[0];
+        assert_eq!(item.vuln_id.as_deref(), Some("vuln-laps-1"));
+        assert_eq!(item.domain, "contoso.local");
+        assert_eq!(item.dc_ip.as_deref(), Some("192.168.58.10"));
+        assert_eq!(item.target_computer.as_deref(), Some("ws01.contoso.local"));
+        assert_eq!(item.credential.username, "alice");
+        assert!(item.nt_hash.is_none());
+        assert_eq!(item.dedup_key, "laps_extract:vuln:vuln-laps-1");
+    }
+
+    #[test]
+    fn laps_vuln_work_falls_back_to_account_name_then_reader() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-1".into(),
+            vuln_with_details(
+                "vuln-1",
+                "laps",
+                vec![("account_name", "bob"), ("domain", "contoso.local")],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("bob", "contoso.local", "P@ss!"));
+        assert_eq!(collect_laps_vuln_work(&s).len(), 1);
+
+        // `reader` key works too
+        s.discovered_vulnerabilities.clear();
+        s.discovered_vulnerabilities.insert(
+            "vuln-2".into(),
+            vuln_with_details(
+                "vuln-2",
+                "laps_abuse",
+                vec![("reader", "bob"), ("domain", "contoso.local")],
+            ),
+        );
+        assert_eq!(collect_laps_vuln_work(&s).len(), 1);
+    }
+
+    #[test]
+    fn laps_vuln_work_skips_non_laps_vulnerability() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-x".into(),
+            vuln_with_details(
+                "vuln-x",
+                "rbcd",
+                vec![("source", "alice"), ("domain", "contoso.local")],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        assert!(collect_laps_vuln_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_vuln_work_skips_already_exploited() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-done".into(),
+            vuln_with_details(
+                "vuln-done",
+                "laps_reader",
+                vec![("source", "alice"), ("domain", "contoso.local")],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        s.exploited_vulnerabilities.insert("vuln-done".into());
+        assert!(collect_laps_vuln_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_vuln_work_skips_already_processed_dedup_key() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-p".into(),
+            vuln_with_details(
+                "vuln-p",
+                "laps_reader",
+                vec![("source", "alice"), ("domain", "contoso.local")],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        s.mark_processed(DEDUP_LAPS, "laps_extract:vuln:vuln-p".into());
+        assert!(collect_laps_vuln_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_vuln_work_skips_when_reader_principal_has_no_credential() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-orphan".into(),
+            vuln_with_details(
+                "vuln-orphan",
+                "laps_reader",
+                vec![("source", "ghost"), ("domain", "contoso.local")],
+            ),
+        );
+        // No credential for "ghost" — item must not be emitted.
+        assert!(collect_laps_vuln_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_vuln_work_target_computer_falls_back_to_target_field() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-tgt".into(),
+            vuln_with_details(
+                "vuln-tgt",
+                "laps_reader",
+                vec![
+                    ("source", "alice"),
+                    ("domain", "contoso.local"),
+                    ("target", "ws07.contoso.local"),
+                ],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        let work = collect_laps_vuln_work(&s);
+        assert_eq!(
+            work[0].target_computer.as_deref(),
+            Some("ws07.contoso.local")
+        );
+    }
+
+    #[test]
+    fn laps_vuln_work_target_computer_none_when_unspecified() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.discovered_vulnerabilities.insert(
+            "vuln-no-tgt".into(),
+            vuln_with_details(
+                "vuln-no-tgt",
+                "laps_reader",
+                vec![("source", "alice"), ("domain", "contoso.local")],
+            ),
+        );
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        assert!(collect_laps_vuln_work(&s)[0].target_computer.is_none());
+    }
+
+    // collect_laps_sweep_work
+
+    #[test]
+    fn laps_sweep_emits_item_for_plaintext_credential_with_dc() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        let work = collect_laps_sweep_work(&s);
+        assert_eq!(work.len(), 1);
+        let item = &work[0];
+        assert_eq!(item.credential.username, "alice");
+        assert_eq!(item.dedup_key, "laps_extract:sweep:contoso.local:alice");
+        assert!(item.nt_hash.is_none());
+        assert!(item.vuln_id.is_none());
+        assert!(item.target_computer.is_none());
+    }
+
+    #[test]
+    fn laps_sweep_skips_empty_password() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", ""));
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_skips_empty_domain() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials.push(plaintext_cred("alice", "", "P@ss!"));
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_skips_when_no_dc_for_domain() {
+        let mut s = StateInner::new("op-test".into());
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_skips_quarantined_principal() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        s.quarantine_principal("alice", "contoso.local");
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_skips_delegation_account() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        let mut details = std::collections::HashMap::new();
+        details.insert(
+            "account_name".into(),
+            serde_json::Value::String("svc_web".into()),
+        );
+        s.discovered_vulnerabilities.insert(
+            "vuln-deleg".into(),
+            ares_core::models::VulnerabilityInfo {
+                vuln_id: "vuln-deleg".into(),
+                vuln_type: "constrained_delegation".into(),
+                target: "192.168.58.10".into(),
+                discovered_by: "test".into(),
+                discovered_at: chrono::Utc::now(),
+                details,
+                recommended_agent: String::new(),
+                priority: 1,
+            },
+        );
+        s.credentials
+            .push(plaintext_cred("svc_web", "contoso.local", "P@ss!"));
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_skips_already_processed_dedup_key() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        s.mark_processed(DEDUP_LAPS, "laps_extract:sweep:contoso.local:alice".into());
+        assert!(collect_laps_sweep_work(&s).is_empty());
+    }
+
+    #[test]
+    fn laps_sweep_emits_one_item_per_eligible_credential() {
+        let mut s = state_with_dc("contoso.local", "192.168.58.10");
+        s.credentials
+            .push(plaintext_cred("alice", "contoso.local", "P@ss!"));
+        s.credentials
+            .push(plaintext_cred("bob", "contoso.local", "p2"));
+        assert_eq!(collect_laps_sweep_work(&s).len(), 2);
     }
 }
