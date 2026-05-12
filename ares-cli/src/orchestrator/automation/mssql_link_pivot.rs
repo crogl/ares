@@ -103,6 +103,23 @@ struct PivotWork {
     cred_domain: String,
 }
 
+/// Has any `mssql_impersonation` vuln on the same `target` been marked
+/// exploited? Used by the linked-server pivot to fire as soon as
+/// `auto_mssql_impersonation` confirms `EXECUTE AS LOGIN` worked, even
+/// though the `mssql_linked_server` vuln itself hasn't been independently
+/// exploited yet (the impersonation chain is what gives us the rights for
+/// the cross-link openquery hop in the first place).
+fn same_target_impersonation_exploited(state: &StateInner, target: &str) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    state.discovered_vulnerabilities.values().any(|v| {
+        v.vuln_type.eq_ignore_ascii_case("mssql_impersonation")
+            && v.target == target
+            && state.exploited_vulnerabilities.contains(&v.vuln_id)
+    })
+}
+
 async fn collect_pivot_work(dispatcher: &Dispatcher) -> Vec<PivotWork> {
     let state = dispatcher.state.read().await;
     state
@@ -111,8 +128,16 @@ async fn collect_pivot_work(dispatcher: &Dispatcher) -> Vec<PivotWork> {
         .filter(|v| v.vuln_type.eq_ignore_ascii_case("mssql_linked_server"))
         // Source-side access has to be confirmed before a cross-link
         // probe can succeed — no point firing if we never authenticated
-        // to the source MSSQL.
-        .filter(|v| state.exploited_vulnerabilities.contains(&v.vuln_id))
+        // to the source MSSQL. Accept EITHER the linked_server vuln itself
+        // being exploited (LLM round confirmed access) OR a same-target
+        // `mssql_impersonation` being exploited (PR 3:
+        // `auto_mssql_impersonation` just landed EXECUTE AS LOGIN, which
+        // proves source-side access AND grants the rights typically needed
+        // for openquery hops — see plan-loot-gaps.md §1E).
+        .filter(|v| {
+            state.exploited_vulnerabilities.contains(&v.vuln_id)
+                || same_target_impersonation_exploited(&state, &v.target)
+        })
         .filter_map(|vuln| {
             let linked_server = vuln
                 .details
@@ -239,21 +264,121 @@ fn probe_output_is_remote_select(output: &str) -> bool {
     lower.contains("who") && lower.contains("is_sa") && lower.contains("srv")
 }
 
+/// Did the probe data row indicate `IS_SRVROLEMEMBER('sysadmin') = 1` on the
+/// linked-server side? When sysadmin is true, the cross-link auth landed us
+/// in a context that can xp_cmdshell and dump SAM/LSA — equivalent to local
+/// admin on the linked-server host. The caller then marks that host owned so
+/// `auto_lsassy_dump` / `auto_local_admin_secretsdump` can fire against it.
+///
+/// Heuristic: find a data row that contains both the linked-server name and
+/// a standalone `1` token (the value column for `is_sa`). impacket's
+/// mssqlclient.py emits fixed-column-aligned rows; whitespace split is
+/// unambiguous because `who` is the only field that can contain spaces and
+/// it's always before `is_sa` and `srv` columns.
+fn probe_output_indicates_sysadmin(output: &str, linked_server: &str) -> bool {
+    if !probe_output_is_remote_select(output) {
+        return false;
+    }
+    let ls_lower = linked_server.to_lowercase();
+    for line in output.lines() {
+        let line_lower = line.to_lowercase();
+        if !line_lower.contains(&ls_lower) {
+            continue;
+        }
+        // The data row contains the linked-server name. Look for a standalone
+        // `1` token in the same line — that's the is_sa value.
+        if line.split_whitespace().any(|tok| tok == "1") {
+            return true;
+        }
+    }
+    false
+}
+
+/// Best-effort: map the linked-server SQL name to a host IP in state by
+/// matching the leading label of any host's hostname (case-insensitive).
+/// Returns the IP if a unique-enough match exists; `None` otherwise so the
+/// caller skips the ownership upgrade.
+fn resolve_linked_server_host_ip(state: &StateInner, linked_server: &str) -> Option<String> {
+    let target = linked_server.to_lowercase();
+    state
+        .hosts
+        .iter()
+        .find(|h| {
+            !h.ip.is_empty()
+                && !h.hostname.is_empty()
+                && (h.hostname.to_lowercase() == target
+                    || h.hostname
+                        .to_lowercase()
+                        .split('.')
+                        .next()
+                        .map(|s| s == target)
+                        .unwrap_or(false))
+        })
+        .map(|h| h.ip.clone())
+}
+
 async fn handle_probe_outcome(dispatcher: &Dispatcher, item: &PivotWork, outcome: ProbeOutcome) {
     match outcome {
         ProbeOutcome::Confirmed(output) => {
             let tail = tail_lines(&output, 8);
+            let is_sa = probe_output_indicates_sysadmin(&output, &item.linked_server);
             info!(
                 vuln_id = %item.vuln_id,
                 linked_server = %item.linked_server,
+                is_sa,
                 output_tail = %tail,
                 "MSSQL link pivot confirmed — remote SELECT returned rows; \
                  cross-link primitive is workable (dedup locked permanently)"
             );
-            // Clear the attempt counter — confirmed pivots don't need it
-            // sticking around on the StateInner map.
-            let mut state = dispatcher.state.write().await;
-            state.mssql_link_pivot_attempts.remove(&item.dedup_key);
+            {
+                // Clear the attempt counter — confirmed pivots don't need it
+                // sticking around on the StateInner map.
+                let mut state = dispatcher.state.write().await;
+                state.mssql_link_pivot_attempts.remove(&item.dedup_key);
+            }
+
+            // When the link hop runs as sysadmin on the remote SQL Server, the
+            // resulting principal can xp_cmdshell, which is local-admin-
+            // equivalent on the host running the SQL Server. Mark that host
+            // owned so `auto_lsassy_dump` and `auto_local_admin_secretsdump`
+            // start firing against it — that's how cross-forest member
+            // servers get their SAM/LSA harvested without an explicit
+            // secretsdump path. Confirmed manually end-to-end: the link hop
+            // can reach sysadmin via a stored `sa` login mapping, and the
+            // subsequent SAM/LSA dump surfaces cached domain credentials that
+            // `auto_credential_reuse` then uses to DCSync the foreign DC.
+            if is_sa {
+                let host_ip = {
+                    let state = dispatcher.state.read().await;
+                    resolve_linked_server_host_ip(&state, &item.linked_server)
+                };
+                if let Some(ip) = host_ip {
+                    match dispatcher
+                        .state
+                        .mark_host_owned(&dispatcher.queue, &ip)
+                        .await
+                    {
+                        Ok(()) => info!(
+                            linked_server = %item.linked_server,
+                            host_ip = %ip,
+                            "Marked linked-server host owned (sysadmin via MSSQL link); \
+                             lsassy_dump and local_admin_secretsdump will now target it"
+                        ),
+                        Err(e) => warn!(
+                            err = %e,
+                            linked_server = %item.linked_server,
+                            host_ip = %ip,
+                            "Failed to mark linked-server host owned after sysadmin pivot"
+                        ),
+                    }
+                } else {
+                    warn!(
+                        linked_server = %item.linked_server,
+                        "Cross-link sysadmin confirmed but no matching host in state.hosts; \
+                         ownership upgrade skipped (lsassy/local-admin chains won't auto-fire)"
+                    );
+                }
+            }
         }
         other => {
             let attempts = {
@@ -451,5 +576,163 @@ mod tests {
         // Sanity check — if someone bumps this they should also reconsider
         // the per-source rate limit and the dedup-clear cost.
         assert!((2..=6).contains(&MAX_PIVOT_ATTEMPTS));
+    }
+
+    #[test]
+    fn probe_sysadmin_recognised_when_data_row_has_is_sa_one() {
+        // Real impacket mssqlclient output: fixed-column data row with the
+        // linked-server name and `1` in the is_sa column.
+        let out = "SQL> SELECT SYSTEM_USER AS who, IS_SRVROLEMEMBER('sysadmin') AS is_sa, @@SERVERNAME AS srv;\n\
+                   who                          is_sa   srv\n\
+                   --------------------------   -----   --------\n\
+                   nt service\\mssql$sqlexpress 1       SQL01";
+        assert!(probe_output_indicates_sysadmin(out, "SQL01"));
+    }
+
+    #[test]
+    fn probe_sysadmin_rejected_when_is_sa_zero() {
+        // Non-sysadmin context — link auth landed but the remote principal
+        // is a regular user. We must NOT mark the host owned in this case.
+        let out = "SQL> SELECT ...;\n\
+                   who              is_sa  srv\n\
+                   --------------   -----  --------\n\
+                   guest            0      SQL01";
+        assert!(!probe_output_indicates_sysadmin(out, "SQL01"));
+    }
+
+    #[test]
+    fn probe_sysadmin_rejected_when_columns_missing() {
+        // No probe columns in output — must reject regardless of stray `1`s.
+        let out = "[!] Login failed for user '1' on SQL01";
+        assert!(!probe_output_indicates_sysadmin(out, "SQL01"));
+    }
+
+    #[test]
+    fn resolve_linked_server_host_by_short_name() {
+        use ares_core::models::Host;
+        let mut state = StateInner::new("op-test".into());
+        state.hosts.push(Host {
+            ip: "192.168.58.51".into(),
+            hostname: "sql01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        });
+        // Linked-server SQL name "SQL01" should match host "sql01.contoso.local"
+        // by leading-label comparison (case-insensitive).
+        assert_eq!(
+            resolve_linked_server_host_ip(&state, "SQL01"),
+            Some("192.168.58.51".into())
+        );
+    }
+
+    #[test]
+    fn resolve_linked_server_host_returns_none_when_no_match() {
+        use ares_core::models::Host;
+        let mut state = StateInner::new("op-test".into());
+        state.hosts.push(Host {
+            ip: "192.168.58.51".into(),
+            hostname: "dc01.contoso.local".into(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: true,
+            owned: false,
+        });
+        assert_eq!(resolve_linked_server_host_ip(&state, "SQL01"), None);
+    }
+
+    #[test]
+    fn same_target_impersonation_exploited_unlocks_pivot_gate() {
+        // PR 3 plan §1E: once `auto_mssql_impersonation` confirms
+        // EXECUTE AS LOGIN landed and marks the impersonation vuln
+        // exploited, the linked-server pivot's gate must accept the
+        // SAME-target linked_server vuln even if that vuln hasn't been
+        // independently exploited yet. This is what closes the
+        // source-MSSQL→remote-MSSQL hop without waiting for the LLM to
+        // re-discover the linked-server primitive.
+        use ares_core::models::VulnerabilityInfo;
+        use std::collections::HashMap;
+
+        let mut state = StateInner::new("op-test".into());
+
+        let mut imp_details = HashMap::new();
+        imp_details.insert("account_name".into(), serde_json::json!("svc_sql"));
+        imp_details.insert("domain".into(), serde_json::json!("contoso.local"));
+        let imp = VulnerabilityInfo {
+            vuln_id: "mssql_impersonation_192.168.58.51".into(),
+            vuln_type: "mssql_impersonation".into(),
+            target: "192.168.58.51".into(),
+            discovered_by: "mssql_enum_impersonation".into(),
+            discovered_at: chrono::Utc::now(),
+            details: imp_details,
+            recommended_agent: "privesc".into(),
+            priority: 3,
+        };
+        state
+            .discovered_vulnerabilities
+            .insert(imp.vuln_id.clone(), imp.clone());
+        state.exploited_vulnerabilities.insert(imp.vuln_id.clone());
+
+        assert!(same_target_impersonation_exploited(&state, "192.168.58.51"));
+        // Different target — pivot gate must NOT open.
+        assert!(!same_target_impersonation_exploited(
+            &state,
+            "192.168.58.99"
+        ));
+        // Empty target — defensive: must NOT open.
+        assert!(!same_target_impersonation_exploited(&state, ""));
+    }
+
+    #[test]
+    fn same_target_impersonation_not_exploited_keeps_gate_closed() {
+        // Negative case: an impersonation vuln exists on the same target
+        // but has NOT been exploited — the linked-server pivot must stay
+        // gated. This guards against firing the pivot from a stale
+        // mssql_impersonation row that never landed EXECUTE AS LOGIN.
+        use ares_core::models::VulnerabilityInfo;
+        use std::collections::HashMap;
+
+        let mut state = StateInner::new("op-test".into());
+        let imp = VulnerabilityInfo {
+            vuln_id: "mssql_impersonation_192.168.58.51".into(),
+            vuln_type: "mssql_impersonation".into(),
+            target: "192.168.58.51".into(),
+            discovered_by: "mssql_enum_impersonation".into(),
+            discovered_at: chrono::Utc::now(),
+            details: HashMap::new(),
+            recommended_agent: "privesc".into(),
+            priority: 3,
+        };
+        state
+            .discovered_vulnerabilities
+            .insert(imp.vuln_id.clone(), imp);
+        // NOT inserted into exploited_vulnerabilities.
+
+        assert!(!same_target_impersonation_exploited(
+            &state,
+            "192.168.58.51"
+        ));
+    }
+
+    #[test]
+    fn resolve_linked_server_host_ignores_empty_hostname() {
+        // A host record with empty hostname must not match the empty leading
+        // label — that would mass-pwn every IP-only host on a single link.
+        use ares_core::models::Host;
+        let mut state = StateInner::new("op-test".into());
+        state.hosts.push(Host {
+            ip: "192.168.58.51".into(),
+            hostname: String::new(),
+            os: String::new(),
+            roles: Vec::new(),
+            services: Vec::new(),
+            is_dc: false,
+            owned: false,
+        });
+        assert_eq!(resolve_linked_server_host_ip(&state, ""), None);
+        assert_eq!(resolve_linked_server_host_ip(&state, "SQL01"), None);
     }
 }

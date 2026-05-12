@@ -90,6 +90,13 @@ pub const DEDUP_MSSQL_RETRY: &str = "mssql_retry";
 /// failure does not permanently bury the cross-forest hop primitive.
 pub const DEDUP_MSSQL_LINK_PIVOT: &str = "mssql_link_pivot";
 
+/// Dedup for `auto_mssql_impersonation` — fires `mssql_impersonate` directly
+/// when an `mssql_impersonation` vuln has been confirmed AND a credential
+/// for the named impersonable account is in state. Key is per-(vuln_id,
+/// account); a transient auth race that fails the probe clears the dedup
+/// so the next tick re-attempts up to MAX_IMPERSONATION_ATTEMPTS.
+pub const DEDUP_MSSQL_IMPERSONATION: &str = "mssql_impersonation_auto";
+
 /// Task patterns that ended with `RequestAssistance` are recorded here and
 /// refused on re-dispatch. Each entry is a canonical key of
 /// `(task_type, target_ip, username, domain)` — enough to identify a
@@ -167,6 +174,7 @@ const ALL_DEDUP_SETS: &[&str] = &[
     DEDUP_GOLDEN_CERT,
     DEDUP_MSSQL_RETRY,
     DEDUP_MSSQL_LINK_PIVOT,
+    DEDUP_MSSQL_IMPERSONATION,
     DEDUP_ASSIST_ABANDONED,
 ];
 

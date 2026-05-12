@@ -806,6 +806,7 @@ mod tests {
             DEDUP_GOLDEN_CERT,
             DEDUP_MSSQL_RETRY,
             DEDUP_MSSQL_LINK_PIVOT,
+            DEDUP_MSSQL_IMPERSONATION,
             DEDUP_ASSIST_ABANDONED,
         ];
         assert_eq!(expected.len(), ALL_DEDUP_SETS.len());
