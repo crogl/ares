@@ -1230,3 +1230,28 @@ fn extract_locked_users_rejects_llm_narrative_tokens() {
     let locked = extract_locked_usernames_from_result(&Some(payload));
     assert!(locked.is_empty(), "got false positives: {locked:?}");
 }
+
+#[test]
+fn is_gmsa_principal_matches_trailing_dollar_with_gmsa_name() {
+    use super::is_gmsa_principal;
+    assert!(is_gmsa_principal("gmsaDragon$"));
+    assert!(is_gmsa_principal("GMSA_WEB$"));
+    assert!(is_gmsa_principal("svc_gmsa$"));
+}
+
+#[test]
+fn is_gmsa_principal_rejects_machine_account_without_gmsa_substring() {
+    use super::is_gmsa_principal;
+    // Plain machine accounts end with $ but are not gMSA.
+    assert!(!is_gmsa_principal("DC01$"));
+    assert!(!is_gmsa_principal("WEB01$"));
+}
+
+#[test]
+fn is_gmsa_principal_rejects_user_without_trailing_dollar() {
+    use super::is_gmsa_principal;
+    // A user named "gmsa_admin" (no trailing $) is a regular user, not gMSA.
+    assert!(!is_gmsa_principal("gmsa_admin"));
+    assert!(!is_gmsa_principal(""));
+    assert!(!is_gmsa_principal("$"));
+}

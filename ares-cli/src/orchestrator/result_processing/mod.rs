@@ -390,6 +390,16 @@ pub(crate) fn extract_locked_usernames_from_result(
 /// Bare `user:pass` (or `Welcome1:` style narrative tokens) are rejected
 /// because LLM summary text frequently contains `word:` tokens that are
 /// not principals (e.g. `Notable:`, `username_as_password:`).
+/// True when `username` looks like a Group Managed Service Account principal:
+/// trailing `$` (machine/service account convention) and the SAM name (with
+/// the trailing `$` stripped) contains the substring `gmsa`. Case-insensitive.
+/// Matches the same heuristic `auto_gmsa_extraction` uses to recognise gMSA
+/// accounts surfaced by enumeration.
+fn is_gmsa_principal(username: &str) -> bool {
+    let trimmed = username.trim_end_matches('$');
+    !trimmed.is_empty() && trimmed.len() < username.len() && trimmed.to_lowercase().contains("gmsa")
+}
+
 fn parse_lockout_principal(line: &str) -> Option<(String, Option<String>)> {
     let marker_pos = LOCKOUT_PATTERNS.iter().filter_map(|p| line.find(p)).min()?;
     let prefix = &line[..marker_pos];
@@ -958,6 +968,33 @@ async fn extract_discoveries(
                     &source,
                 )
                 .await;
+
+                // gMSA managed-password recovery side-effect: when secretsdump
+                // returns a Group Managed Service Account hash (account ends
+                // with `$` and name contains "gmsa"), credit the gMSA primitive
+                // even though we never went through `auto_gmsa_extraction`.
+                // Without this, gMSA hashes captured incidentally via DCSync
+                // never emit a `gmsa_*` token to the exploited set.
+                if is_gmsa_principal(&username) {
+                    let vuln_id = format!("gmsa_{}", username.trim_end_matches('$').to_lowercase());
+                    if let Err(e) = dispatcher
+                        .state
+                        .mark_exploited(&dispatcher.queue, &vuln_id)
+                        .await
+                    {
+                        warn!(
+                            err = %e,
+                            vuln_id = %vuln_id,
+                            "Failed to mark gMSA hash as exploited"
+                        );
+                    } else {
+                        info!(
+                            vuln_id = %vuln_id,
+                            account = %username,
+                            "gMSA hash captured via secretsdump — emitted exploit token"
+                        );
+                    }
+                }
             }
             Ok(false) => {}
             Err(e) => warn!(err = %e, "Failed to publish hash"),
