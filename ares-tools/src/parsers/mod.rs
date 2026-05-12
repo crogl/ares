@@ -20,7 +20,7 @@ mod users_shares;
 use serde_json::{json, Value};
 
 // Re-export all public parser functions at module level.
-pub use certipy::parse_certipy_find;
+pub use certipy::{parse_certipy_esc1_chain, parse_certipy_find};
 pub use cracker::parse_cracker_output;
 pub use credential_tools::{
     parse_adidnsdump, parse_ldap_descriptions, parse_lsassy, parse_ntds_dit, parse_spray_success,
@@ -189,6 +189,17 @@ pub fn parse_tool_output(tool_name: &str, output: &str, params: &Value) -> Value
             let vulns = parse_certipy_find(output, params);
             if !vulns.is_empty() {
                 discoveries["vulnerabilities"] = Value::Array(vulns);
+            }
+        }
+        "certipy_esc1_full_chain" => {
+            // Composite ESC1 tool: certipy req (with -upn/-sid) followed by
+            // certipy auth. On success the auth step emits a "Got hash for
+            // 'user@realm': <lm>:<nt>" line. Extract into a `Hash` discovery
+            // so `auto_credential_reuse` picks it up and DCSyncs the foreign
+            // DC — closes the chain end-to-end without an LLM round.
+            let hashes = parse_certipy_esc1_chain(output, params);
+            if !hashes.is_empty() {
+                discoveries["hashes"] = Value::Array(hashes);
             }
         }
         "lsassy" => {

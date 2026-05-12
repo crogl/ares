@@ -3,8 +3,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serde_json::json;
 use tokio::sync::watch;
 use tracing::{info, warn};
+
+use ares_llm::ToolCall;
 
 use crate::orchestrator::dispatcher::Dispatcher;
 use crate::orchestrator::state::*;
@@ -18,6 +21,12 @@ fn extract_domain_from_fqdn(fqdn: &str) -> Option<String> {
 }
 
 /// Work item for ADCS enumeration.
+///
+/// When no cleartext credential is available but an NTLM hash is, the work
+/// item carries a synthetic `Credential` with the hash-owner's username and
+/// an empty password. The worker's credential resolver looks up the matching
+/// `Hash` record by `(username, domain)` and injects it as the `hash` arg, so
+/// the dispatcher doesn't need to thread the hash through separately.
 struct AdcsWork {
     host_ip: String,
     /// Auth-and-identity dedup key
@@ -28,9 +37,6 @@ struct AdcsWork {
     dc_ip: Option<String>,
     domain: String,
     credential: ares_core::models::Credential,
-    /// NTLM hash for pass-the-hash authentication (when no cleartext cred available).
-    ntlm_hash: Option<String>,
-    ntlm_hash_username: Option<String>,
 }
 
 /// Dedup key for a cred-based certipy_find attempt.
@@ -202,13 +208,8 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
             } else {
                 None
             };
-            let (ntlm_hash, ntlm_hash_username) = match &hash_pick {
-                Some(h) => (Some(h.hash_value.clone()), Some(h.username.clone())),
-                None => (None, None),
-            };
-
             // Need at least a credential or an NTLM hash
-            if cred.is_none() && ntlm_hash.is_none() {
+            if cred.is_none() && hash_pick.is_none() {
                 return None;
             }
 
@@ -218,24 +219,31 @@ fn collect_adcs_work(state: &StateInner) -> Vec<AdcsWork> {
                 (None, None) => return None,
             };
 
-            Some(AdcsWork {
-                host_ip: s.host.clone(),
-                dedup_key,
-                dc_ip,
-                domain: domain.clone(),
-                credential: cred.unwrap_or_else(|| ares_core::models::Credential {
+            // Synthetic credential from the hash owner's identity when no
+            // cleartext cred is available; credential_resolver looks up the
+            // matching Hash record by (username, domain) and injects the
+            // `hash` arg, which `certipy_find` accepts via `-hashes`.
+            let credential = cred.unwrap_or_else(|| {
+                let h = hash_pick.as_ref().expect("guard above ensures one is Some");
+                ares_core::models::Credential {
                     id: String::new(),
-                    username: ntlm_hash_username.clone().unwrap_or_default(),
+                    username: h.username.clone(),
                     password: String::new(),
-                    domain,
+                    domain: domain.clone(),
                     source: "hash_fallback".into(),
                     is_admin: false,
                     discovered_at: None,
                     parent_id: None,
                     attack_step: 0,
-                }),
-                ntlm_hash,
-                ntlm_hash_username,
+                }
+            });
+
+            Some(AdcsWork {
+                host_ip: s.host.clone(),
+                dedup_key,
+                dc_ip,
+                domain,
+                credential,
             })
         })
         .collect()
@@ -302,32 +310,140 @@ pub async fn auto_adcs_enumeration(
             } else {
                 None
             };
-            match dispatcher
-                .request_certipy_find(
-                    target_ip,
-                    &item.domain,
-                    &item.credential,
-                    item.ntlm_hash.as_deref(),
-                    item.ntlm_hash_username.as_deref(),
-                    ca_host_ip,
-                )
+
+            // Mark dedup BEFORE dispatch so concurrent ticks don't double-fire
+            // against the same (CA, credential) pair. The spawned task clears
+            // dedup on transport failure so the next tick can retry.
+            dispatcher
+                .state
+                .write()
                 .await
-            {
-                Ok(Some(task_id)) => {
-                    info!(task_id = %task_id, host = %item.host_ip, dc_ip = ?item.dc_ip, "ADCS enumeration dispatched");
-                    dispatcher
-                        .state
-                        .write()
-                        .await
-                        .mark_processed(DEDUP_ADCS_SERVERS, item.dedup_key.clone());
-                    let _ = dispatcher
-                        .state
-                        .persist_dedup(&dispatcher.queue, DEDUP_ADCS_SERVERS, &item.dedup_key)
-                        .await;
-                }
-                Ok(None) => {}
-                Err(e) => warn!(err = %e, "Failed to dispatch ADCS enumeration"),
+                .mark_processed(DEDUP_ADCS_SERVERS, item.dedup_key.clone());
+            let _ = dispatcher
+                .state
+                .persist_dedup(&dispatcher.queue, DEDUP_ADCS_SERVERS, &item.dedup_key)
+                .await;
+
+            // Deterministic tool dispatch — bypass the LLM "recon" agent.
+            // The LLM-routed path (`request_certipy_find`) puts a task in the
+            // recon queue with instructions to call `certipy_find` and
+            // register vulns. In practice the recon agent has been observed
+            // burning its budget on adjacent techniques (unconstrained
+            // delegation TGT dumps that need local admin, WinRM exec without
+            // a WinRM tool installed, etc.) and never reaching certipy_find
+            // against discovered ADCS servers — even when a usable cred for
+            // the CA's domain is sitting in state. Bypassing the agent
+            // guarantees every (CA host, cred) pair gets one certipy_find
+            // shot; the worker's parser (`parse_certipy_find`) extracts ESC
+            // vulns from raw output and the result_processing pipeline
+            // publishes them, letting `auto_adcs_exploitation` pick up
+            // immediately. Same approach as `auto_mssql_link_pivot`.
+            let task_id = format!(
+                "adcs_find_{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..12]
+            );
+            let mut args = json!({
+                "username": item.credential.username,
+                "domain": item.domain,
+                "dc_ip": target_ip,
+                "vulnerable": true,
+            });
+            if let Some(ref ca_ip) = ca_host_ip {
+                // Surfaces ca_host_ip in the params object the parser reads to
+                // set the resulting vuln's `target` to the CA, not the DC.
+                args["ca_host_ip"] = json!(ca_ip);
             }
+            // Credential resolver injects password/hash from state given
+            // (username, domain) — we never carry secrets in the args here.
+            let call = ToolCall {
+                id: format!("certipy_find_{}", uuid::Uuid::new_v4().simple()),
+                name: "certipy_find".to_string(),
+                arguments: args,
+            };
+            info!(
+                task_id = %task_id,
+                ca_host = %item.host_ip,
+                dc_ip = ?item.dc_ip,
+                domain = %item.domain,
+                user = %item.credential.username,
+                "ADCS find dispatched (direct tool, no LLM)"
+            );
+
+            let dispatcher_bg = dispatcher.clone();
+            let dedup_key_bg = item.dedup_key.clone();
+            let host_ip_bg = item.host_ip.clone();
+            let task_id_bg = task_id.clone();
+            tokio::spawn(async move {
+                let result = dispatcher_bg
+                    .llm_runner
+                    .tool_dispatcher()
+                    .dispatch_tool("recon", &task_id_bg, &call)
+                    .await;
+                match result {
+                    Ok(exec) => {
+                        let vulns_found = exec
+                            .discoveries
+                            .as_ref()
+                            .and_then(|d| d.get("vulnerabilities"))
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        info!(
+                            task_id = %task_id_bg,
+                            ca_host = %host_ip_bg,
+                            vulns_found,
+                            "Deterministic certipy_find completed"
+                        );
+                        // No vulns + no transport error → genuine "nothing
+                        // vulnerable here". Keep dedup locked. The exec
+                        // path may also emit an error if creds were
+                        // missing — in which case clear dedup to allow a
+                        // later credential to retry.
+                        if let Some(err) = exec.error {
+                            warn!(
+                                task_id = %task_id_bg,
+                                ca_host = %host_ip_bg,
+                                err = %err,
+                                "Deterministic certipy_find failed — clearing dedup for retry"
+                            );
+                            dispatcher_bg
+                                .state
+                                .write()
+                                .await
+                                .unmark_processed(DEDUP_ADCS_SERVERS, &dedup_key_bg);
+                            let _ = dispatcher_bg
+                                .state
+                                .unpersist_dedup(
+                                    &dispatcher_bg.queue,
+                                    DEDUP_ADCS_SERVERS,
+                                    &dedup_key_bg,
+                                )
+                                .await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            task_id = %task_id_bg,
+                            ca_host = %host_ip_bg,
+                            err = %e,
+                            "Deterministic certipy_find dispatch errored — clearing dedup for retry"
+                        );
+                        dispatcher_bg
+                            .state
+                            .write()
+                            .await
+                            .unmark_processed(DEDUP_ADCS_SERVERS, &dedup_key_bg);
+                        let _ = dispatcher_bg
+                            .state
+                            .unpersist_dedup(
+                                &dispatcher_bg.queue,
+                                DEDUP_ADCS_SERVERS,
+                                &dedup_key_bg,
+                            )
+                            .await;
+                    }
+                }
+            });
         }
     }
 }

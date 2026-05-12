@@ -167,6 +167,7 @@ pub async fn dispatch(tool_name: &str, arguments: &Value) -> Result<ToolOutput> 
         "certipy_template_esc4" => privesc::certipy_template_esc4(arguments).await,
         "certipy_esc4_full_chain" => privesc::certipy_esc4_full_chain(arguments).await,
         "certipy_esc3_full_chain" => privesc::certipy_esc3_full_chain(arguments).await,
+        "certipy_esc1_full_chain" => privesc::certipy_esc1_full_chain(arguments).await,
         "certipy_ca" => privesc::certipy_ca(arguments).await,
         "certipy_forge" => privesc::certipy_forge(arguments).await,
         "certipy_retrieve" => privesc::certipy_retrieve(arguments).await,

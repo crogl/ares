@@ -151,6 +151,69 @@ fn extract_template_for_esc(output: &str, esc_type: &str) -> Option<String> {
     None
 }
 
+/// Parse the combined output of `certipy_esc1_full_chain` and emit a `Hash`
+/// discovery for the NTLM hash returned by the `certipy auth` step. Returns
+/// an empty vec when the chain didn't actually yield a hash (request denied,
+/// auth path bailed, etc.) — the caller treats that as "nothing to publish".
+///
+/// Lines we recognise from `certipy auth` output:
+///   `[*] Got hash for 'administrator@<realm>': <lmhash>:<nthash>`
+///
+/// Realm in the principal comes from the cert's `-upn` flag — that's the
+/// impersonated identity, NOT the requester's username. Both pieces matter:
+/// `Hash.username = "administrator"`, `Hash.domain = "<realm>"`.
+pub fn parse_certipy_esc1_chain(output: &str, params: &Value) -> Vec<Value> {
+    let mut hashes = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        // Format examples (with quoted or unquoted principal):
+        //   [*] Got hash for 'user@REALM.LOCAL': aad3...:31d6...
+        //   [*] Got hash for user@REALM.LOCAL: aad3...:31d6...
+        let Some(rest) = line
+            .strip_prefix("[*] Got hash for ")
+            .or_else(|| line.strip_prefix("Got hash for "))
+        else {
+            continue;
+        };
+        // Strip optional surrounding quotes from the principal.
+        let rest = rest.trim_start_matches('\'').trim_start_matches('"');
+        let Some((principal, hash_part)) = rest.split_once(':') else {
+            continue;
+        };
+        let principal = principal
+            .trim_end_matches('\'')
+            .trim_end_matches('"')
+            .trim();
+        let hash_part = hash_part.trim();
+        let Some((user, realm)) = principal.split_once('@') else {
+            continue;
+        };
+        // hash_part should be lm:nt — accept either combined or split forms.
+        let (lm, nt) = match hash_part.split_once(':') {
+            Some((lm, nt)) => (lm.trim().to_string(), nt.trim().to_string()),
+            // Some certipy builds emit just the NT half; fill in the empty LM.
+            None => (
+                "aad3b435b51404eeaad3b435b51404ee".to_string(),
+                hash_part.trim().to_string(),
+            ),
+        };
+        if nt.len() != 32 || !nt.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let domain = realm.trim().to_lowercase();
+        let user = user.trim().to_lowercase();
+        let _ = params; // params reserved for future correlation
+        hashes.push(json!({
+            "username": user,
+            "domain": domain,
+            "hash_type": "NTLM",
+            "hash_value": format!("{lm}:{nt}"),
+            "source": "certipy_esc1_full_chain",
+        }));
+    }
+    hashes
+}
+
 /// Priority for ESC types (lower = more urgent).
 fn esc_priority(esc_type: &str) -> i32 {
     match esc_type {

