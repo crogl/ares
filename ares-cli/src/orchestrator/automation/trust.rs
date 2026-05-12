@@ -1423,7 +1423,26 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
         };
 
         for item in work {
-            let vuln_id = forest_trust_vuln_id(&item.source_domain, &item.target_domain);
+            // Trust topology determines the scoreboard tokenization: intra-forest
+            // (child↔parent) escalations are a different MITRE primitive than
+            // inter-forest trust exploitation, even though both ride the same
+            // inter-realm-TGT + secretsdump mechanic here.
+            let is_intra_forest = !is_inter_forest(&item.source_domain, &item.target_domain);
+            let vuln_id = if is_intra_forest {
+                child_to_parent_vuln_id(&item.source_domain, &item.target_domain)
+            } else {
+                forest_trust_vuln_id(&item.source_domain, &item.target_domain)
+            };
+            let vuln_type = if is_intra_forest {
+                "child_to_parent"
+            } else {
+                "forest_trust_escalation"
+            };
+            let note_kind = if is_intra_forest {
+                "Child-to-parent escalation"
+            } else {
+                "Forest trust escalation"
+            };
 
             // Defer dispatch when the target DC IP is unknown: impacket needs
             // a routable -target-ip for both create_inter_realm_ticket and the
@@ -1460,13 +1479,13 @@ pub async fn auto_trust_follow(dispatcher: Arc<Dispatcher>, mut shutdown: watch:
                 details.insert(
                     "note".into(),
                     serde_json::Value::String(format!(
-                        "Forest trust escalation via {} trust key — inter-realm ticket + secretsdump",
+                        "{note_kind} via {} trust key — inter-realm ticket + secretsdump",
                         item.hash.username
                     )),
                 );
                 let vuln = ares_core::models::VulnerabilityInfo {
                     vuln_id: vuln_id.clone(),
-                    vuln_type: "forest_trust_escalation".to_string(),
+                    vuln_type: vuln_type.to_string(),
                     target: trust_target,
                     discovered_by: "trust_automation".to_string(),
                     discovered_at: chrono::Utc::now(),
