@@ -66,11 +66,23 @@ fn extract_fqdn_from_line(line: &str, positional_name: &str) -> String {
 }
 
 pub fn parse_smb_signing(output: &str, params: &Value) -> Vec<Value> {
-    let target_ip = params
+    let target_param = params
         .get("target")
         .or_else(|| params.get("target_ip"))
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    // Callers sometimes pass a multi-target list (comma- or space-separated)
+    // as `target`. Splitting per call site is brittle — do it here once and
+    // emit one host per valid IPv4. Anything that doesn't parse as a single
+    // IPv4 (CIDR ranges, hostnames, blanks) is skipped; the downstream
+    // publish-host boundary will reject malformed values anyway, but
+    // splitting up-front keeps each tool record clean.
+    let target_ips: Vec<&str> = target_param
+        .split([',', ' ', ';', '\t', '\n'])
+        .map(str::trim)
+        .filter(|s| super::looks_like_ip(s))
+        .collect();
 
     let mut hosts = Vec::new();
 
@@ -86,14 +98,14 @@ pub fn parse_smb_signing(output: &str, params: &Value) -> Vec<Value> {
         .map(|l| extract_fqdn_from_line(l, ""))
         .unwrap_or_default();
 
-    if !target_ip.is_empty() {
+    for ip in target_ips {
         let mut services = vec!["445/tcp (microsoft-ds)".to_string()];
         if signing_disabled {
             services.push("smb_signing_disabled".to_string());
         }
 
         hosts.push(json!({
-            "ip": target_ip,
+            "ip": ip,
             "hostname": hostname,
             "os": "",
             "roles": [],
@@ -193,6 +205,36 @@ mod tests {
     fn parse_smb_signing_no_target() {
         let hosts = parse_smb_signing("signing: disabled", &json!({}));
         assert!(hosts.is_empty());
+    }
+
+    #[test]
+    fn parse_smb_signing_splits_comma_separated_targets() {
+        // Caller passes the entire sweep target list as one `target` param.
+        // Must split and emit one host record per IPv4.
+        let params = json!({"target": "192.168.58.10,192.168.58.20,192.168.58.30"});
+        let hosts = parse_smb_signing("signing: enabled", &params);
+        assert_eq!(hosts.len(), 3);
+        let ips: Vec<&str> = hosts.iter().map(|h| h["ip"].as_str().unwrap()).collect();
+        assert_eq!(ips, vec!["192.168.58.10", "192.168.58.20", "192.168.58.30"]);
+    }
+
+    #[test]
+    fn parse_smb_signing_splits_space_separated_targets() {
+        let params = json!({"target": "192.168.58.10 192.168.58.20"});
+        let hosts = parse_smb_signing("signing: enabled", &params);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0]["ip"], "192.168.58.10");
+        assert_eq!(hosts[1]["ip"], "192.168.58.20");
+    }
+
+    #[test]
+    fn parse_smb_signing_skips_non_ip_tokens_in_target_list() {
+        // Mixed list — keep IPs, drop hostnames and junk.
+        let params = json!({"target": "192.168.58.10, dc01.contoso.local, , 192.168.58.20"});
+        let hosts = parse_smb_signing("signing: enabled", &params);
+        assert_eq!(hosts.len(), 2);
+        assert_eq!(hosts[0]["ip"], "192.168.58.10");
+        assert_eq!(hosts[1]["ip"], "192.168.58.20");
     }
 
     #[test]
