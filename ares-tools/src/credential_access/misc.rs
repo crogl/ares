@@ -210,10 +210,15 @@ pub async fn sysvol_script_search(args: &Value) -> Result<ToolOutput> {
 pub async fn laps_dump(args: &Value) -> Result<ToolOutput> {
     let target = required_str(args, "target")?;
     let username = required_str(args, "username")?;
-    let password = required_str(args, "password")?;
     let domain = required_str(args, "domain")?;
+    let password = optional_str(args, "password");
+    let nt_hash = optional_str(args, "nt_hash");
 
-    let cred_args = credentials::netexec_creds(Some(username), Some(password), None, Some(domain));
+    if password.is_none() && nt_hash.is_none() {
+        anyhow::bail!("laps_dump requires either 'password' or 'nt_hash'");
+    }
+
+    let cred_args = credentials::netexec_creds(Some(username), password, nt_hash, Some(domain));
 
     CommandBuilder::new("netexec")
         .arg("ldap")
