@@ -46,6 +46,10 @@ jobs:
       - name: Checkout git repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
+          # For cross-fork PRs the head branch lives on the contributor's fork,
+          # not on this repo. Without an explicit repository the checkout tries
+          # to fetch head.ref from the base repo and fails before any hook runs.
+          repository: ${{ github.event.pull_request.head.repo.full_name || github.repository }}
           ref: ${{ github.event.pull_request.head.ref || github.ref }}
           persist-credentials: false
 

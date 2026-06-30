@@ -62,6 +62,16 @@ pub struct Strategy {
     pub continue_after_da: bool,
     /// LLM temperature override. None = provider default.
     pub llm_temperature: Option<f32>,
+    /// Queue selection temperature. 0.0 = deterministic argmin (current behaviour).
+    pub selection_temperature: f32,
+    /// Cross-run novelty memory: bias away from previously walked path prefixes.
+    pub novelty_enabled: bool,
+    /// Scope key for novelty memory (which runs share/reset diversity bias).
+    pub novelty_scope: String,
+    /// Randomize the entry foothold per run.
+    pub randomize_entry_foothold: bool,
+    /// Emit structured per-run path records for coverage measurement (Phase 0).
+    pub emit_path_records: bool,
 }
 
 impl Default for Strategy {
@@ -78,6 +88,11 @@ impl Strategy {
             exclude_techniques: HashSet::new(),
             include_techniques: HashSet::new(),
             llm_temperature: None,
+            selection_temperature: 0.0,
+            novelty_enabled: false,
+            novelty_scope: "per-campaign".to_string(),
+            randomize_entry_foothold: false,
+            emit_path_records: false,
             preset,
         }
     }
@@ -203,10 +218,44 @@ impl Strategy {
             })
             .or_else(|| yaml.and_then(|c| c.operation.llm_temperature));
 
+        // 7. Attack-path diversity knobs: env > json > yaml. All default to
+        //    today's deterministic behaviour (see docs/attack-path-diversity.md).
+        if let Some(t) = std::env::var("ARES_SELECTION_TEMPERATURE")
+            .ok()
+            .and_then(|v| v.parse::<f32>().ok())
+            .or_else(|| {
+                json.and_then(|v| v.get("selection_temperature"))
+                    .and_then(|v| v.as_f64())
+                    .map(|v| v as f32)
+            })
+            .or_else(|| yaml.map(|c| c.operation.selection_temperature))
+        {
+            strategy.selection_temperature = t.max(0.0);
+        }
+
+        if let Some(cfg) = yaml {
+            strategy.novelty_enabled = cfg.operation.novelty.enabled;
+            if !cfg.operation.novelty.scope.is_empty() {
+                strategy.novelty_scope = cfg.operation.novelty.scope.clone();
+            }
+            strategy.randomize_entry_foothold = cfg.operation.randomize_entry_foothold;
+            strategy.emit_path_records = cfg.operation.emit_path_records;
+        }
+        if let Ok(v) = std::env::var("ARES_NOVELTY_ENABLED") {
+            strategy.novelty_enabled = v == "1" || v.to_lowercase() == "true";
+        }
+        if let Ok(v) = std::env::var("ARES_EMIT_PATH_RECORDS") {
+            strategy.emit_path_records = v == "1" || v.to_lowercase() == "true";
+        }
+
         info!(
             preset = ?strategy.preset,
             continue_after_da = strategy.continue_after_da,
             llm_temperature = ?strategy.llm_temperature,
+            selection_temperature = strategy.selection_temperature,
+            novelty_enabled = strategy.novelty_enabled,
+            randomize_entry_foothold = strategy.randomize_entry_foothold,
+            emit_path_records = strategy.emit_path_records,
             exclude_count = strategy.exclude_techniques.len(),
             include_count = strategy.include_techniques.len(),
             weight_overrides = strategy.weights.len(),
@@ -705,6 +754,49 @@ mod tests {
         assert_eq!(s.effective_priority("kerberoast"), 7);
         // technique_weights takes precedence
         assert_eq!(s.effective_priority("secretsdump"), 8);
+    }
+
+    #[test]
+    fn diversity_defaults_are_deterministic() {
+        // A config with no diversity keys must reproduce today's behaviour.
+        let cfg = yaml_config("fast", false, vec![], vec![], vec![]);
+        let s = Strategy::resolve(None, Some(&cfg));
+        assert_eq!(s.selection_temperature, 0.0);
+        assert!(!s.novelty_enabled);
+        assert_eq!(s.novelty_scope, "per-campaign");
+        assert!(!s.randomize_entry_foothold);
+        assert!(!s.emit_path_records);
+    }
+
+    #[test]
+    fn diversity_knobs_flow_from_yaml() {
+        let yaml_str = serde_yaml::to_string(&serde_json::json!({
+            "operation": {
+                "name": "test",
+                "namespace": "ns",
+                "selection_temperature": 0.7,
+                "novelty": {"enabled": true, "scope": "per-lab"},
+                "randomize_entry_foothold": true,
+                "emit_path_records": true,
+            },
+            "agents": {},
+            "timeouts": {},
+            "recovery": {},
+            "phase_detection": {},
+            "context_management": {},
+            "vulnerability_priorities": {},
+            "logging": {},
+            "resources": {},
+            "security": {},
+        }))
+        .unwrap();
+        let cfg: ares_core::config::AresConfig = serde_yaml::from_str(&yaml_str).unwrap();
+        let s = Strategy::resolve(None, Some(&cfg));
+        assert_eq!(s.selection_temperature, 0.7);
+        assert!(s.novelty_enabled);
+        assert_eq!(s.novelty_scope, "per-lab");
+        assert!(s.randomize_entry_foothold);
+        assert!(s.emit_path_records);
     }
 
     #[test]

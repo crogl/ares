@@ -66,6 +66,9 @@ pub fn default_cred_cache_ttl() -> u64 {
 pub fn default_max_rpm() -> u32 {
     60
 }
+pub fn default_novelty_scope() -> String {
+    "per-campaign".to_string()
+}
 
 #[cfg(test)]
 mod tests {
@@ -181,5 +184,10 @@ mod tests {
     #[test]
     fn returns_default_max_rpm() {
         assert_eq!(default_max_rpm(), 60);
+    }
+
+    #[test]
+    fn returns_default_novelty_scope() {
+        assert_eq!(default_novelty_scope(), "per-campaign");
     }
 }

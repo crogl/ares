@@ -330,6 +330,30 @@ pub(crate) fn build_s4u_payload(item: &S4uWork) -> Value {
         }
     }
 
+    // Surface protocol-transition so the worker picks the right S4U flow.
+    // Kerberos-only constrained delegation (protocol_transition=false) cannot
+    // perform S4U2Self — impacket-getST -impersonate fails at the S4U2Self step.
+    // It must instead use an existing TGT for the delegating account (e.g. the
+    // machine-account TGT obtained via -k -no-pass after extracting it) and do
+    // S4U2Proxy only. Default true preserves the standard getST flow for
+    // protocol-transition and plain-"Constrained" rows.
+    let protocol_transition = item
+        .vuln
+        .details
+        .get("protocol_transition")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    payload["protocol_transition"] = json!(protocol_transition);
+    if !protocol_transition {
+        payload["note_kerberos_only"] = json!(
+            "Kerberos-only constrained delegation: S4U2Self is NOT permitted for \
+             this account. Do NOT run a plain getST -impersonate (it fails at \
+             S4U2Self). Obtain a TGT for the delegating account first (machine \
+             account: extract its hash/AES via secretsdump, then getTGT, or use \
+             -k -no-pass with an existing ccache) and perform S4U2Proxy only."
+        );
+    }
+
     payload["vuln_id"] = json!(item.vuln.vuln_id);
     payload
 }

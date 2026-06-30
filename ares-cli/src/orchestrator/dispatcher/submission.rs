@@ -629,6 +629,10 @@ pub(crate) fn task_params_from_payload(
         "hash_value",
         "just_dc_user",
         "credential",
+        // Persisted so the attack-path diversity recorder can reconstruct the
+        // canonical (foothold, technique, target) step on exploit success.
+        "vuln_type",
+        "target",
     ] {
         if let Some(val) = payload.get(*key) {
             task_params.insert(key.to_string(), val.clone());

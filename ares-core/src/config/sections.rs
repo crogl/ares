@@ -48,6 +48,48 @@ pub struct OperationConfig {
     /// LLM temperature override (0.0-2.0). None = provider default.
     #[serde(default)]
     pub llm_temperature: Option<f32>,
+
+    // --- Attack-path diversity (see docs/attack-path-diversity.md) ---
+    // All default to today's deterministic behaviour; nothing changes until set.
+    /// Queue selection temperature for softmax sampling in `pop_best` /
+    /// `pop_next_vuln`. 0.0 = deterministic argmin (current behaviour); higher
+    /// values spread selection across near-equal-priority work for path diversity.
+    /// Distinct from `llm_temperature`, which only configures the LLM provider.
+    #[serde(default)]
+    pub selection_temperature: f32,
+
+    /// Cross-run novelty memory: bias each run away from path prefixes already
+    /// walked by prior runs. Disabled by default.
+    #[serde(default)]
+    pub novelty: NoveltyConfig,
+
+    /// Randomize the entry foothold per run so run N is pushed off run N-1's
+    /// opening move. Cheapest diversity source; off by default.
+    #[serde(default)]
+    pub randomize_entry_foothold: bool,
+
+    /// Emit a structured per-run path record (canonical foothold/technique/target
+    /// sequence) for coverage measurement. Phase 0 instrumentation; off by default.
+    #[serde(default)]
+    pub emit_path_records: bool,
+}
+
+/// Cross-run novelty memory configuration (attack-path diversity).
+///
+/// When enabled, the orchestrator persists walked path prefixes and biases
+/// selection away from them so the fleet covers more of the ~133 available
+/// permutations rather than re-walking the popular path.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct NoveltyConfig {
+    /// Enable cross-run prefix avoidance.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Scope key controlling which runs share (and reset) novelty memory, so
+    /// unrelated operations don't poison each other's diversity bias.
+    /// Defaults to "per-campaign".
+    #[serde(default = "default_novelty_scope")]
+    pub scope: String,
 }
 
 /// Per-agent configuration: model selection, step limits, and tool allowlist.

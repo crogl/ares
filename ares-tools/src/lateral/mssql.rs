@@ -72,8 +72,31 @@ pub async fn mssql_enable_xp_cmdshell(args: &Value) -> Result<ToolOutput> {
 ///
 /// Required args: `target`, `username`
 /// Optional args: `password`, `domain`, `windows_auth`
+///
+/// Resolves principal IDs to names and the impersonation TARGET login (the
+/// `major_id` principal) — `SELECT *` on `sys.server_permissions` only returns
+/// numeric IDs, which is useless for deciding who to `EXECUTE AS`. Covers
+/// server scope plus the `master` and `msdb` databases (database-level
+/// `EXECUTE AS USER` grants live in `sys.database_permissions`, not the
+/// server view, so server-only enumeration misses them entirely). The literal
+/// `scope` column lets the parser key rows robustly.
 pub async fn mssql_enum_impersonation(args: &Value) -> Result<ToolOutput> {
-    let query = "SELECT * FROM sys.server_permissions WHERE type = 'IM';";
+    let query = "\
+SELECT 'server' AS scope, gr.name AS grantee, tgt.name AS impersonate_target \
+FROM sys.server_permissions p \
+JOIN sys.server_principals gr ON p.grantee_principal_id = gr.principal_id \
+JOIN sys.server_principals tgt ON p.major_id = tgt.principal_id \
+WHERE p.permission_name = 'IMPERSONATE'; \
+SELECT 'master' AS scope, gr.name AS grantee, tgt.name AS impersonate_target \
+FROM master.sys.database_permissions p \
+JOIN master.sys.database_principals gr ON p.grantee_principal_id = gr.principal_id \
+JOIN master.sys.database_principals tgt ON p.major_id = tgt.principal_id \
+WHERE p.permission_name = 'IMPERSONATE'; \
+SELECT 'msdb' AS scope, gr.name AS grantee, tgt.name AS impersonate_target \
+FROM msdb.sys.database_permissions p \
+JOIN msdb.sys.database_principals gr ON p.grantee_principal_id = gr.principal_id \
+JOIN msdb.sys.database_principals tgt ON p.major_id = tgt.principal_id \
+WHERE p.permission_name = 'IMPERSONATE';";
 
     mssql_query(mssql_from_args(args)?, query).await
 }

@@ -49,17 +49,49 @@ operation:
 
   # Per-technique priority overrides (lower = higher priority, 1-10).
   # Merged on top of the preset defaults. Overrides vulnerability_priorities below.
+  #
+  # Rebalanced for attack-path diversity (see docs/attack-path-diversity.md):
+  # acl_abuse was 1 (top priority), so the high-volume ACL graph drained first
+  # every run and crowded out the MSSQL families, which fell back to their
+  # vulnerability_priorities defaults of 10/11 and were effectively starved.
+  # ACL is de-dominated to 3 and the MSSQL impersonation/linked-server families
+  # are lifted to 3 so all three families compete on a level footing.
   technique_weights:
     esc1: 1
     esc4: 1
-    acl_abuse: 1
     constrained_delegation: 2
     unconstrained_delegation: 2
+    rbcd: 2
+    acl_abuse: 3
     mssql_access: 3
+    mssql_impersonation: 3
+    mssql_linked: 3
 
   # LLM temperature override (0.0-2.0). Higher values = more creative technique
   # selection. None/omit = provider default.
   # llm_temperature: 1.0
+
+  # --- Attack-path diversity (see docs/attack-path-diversity.md) ---
+  # All knobs below default to today's deterministic behaviour. Omit them to
+  # reproduce current runs exactly; set them to spread the fleet across more of
+  # the available attack paths.
+  #
+  # Queue selection temperature for softmax sampling in the exploitation queue.
+  # 0.0 = deterministic argmin (current behaviour). Higher = more spread across
+  # near-equal-priority work. Distinct from llm_temperature above.
+  # selection_temperature: 0.0
+  #
+  # Cross-run novelty memory: bias each run away from path prefixes prior runs
+  # already walked, so the fleet covers more unique paths.
+  # novelty:
+  #   enabled: false
+  #   scope: per-campaign   # which runs share/reset novelty memory
+  #
+  # Randomize the entry foothold per run (cheapest diversity source).
+  # randomize_entry_foothold: false
+  #
+  # Emit structured per-run path records for coverage measurement (Phase 0).
+  # emit_path_records: false
 
 # Agent configurations
 agents:

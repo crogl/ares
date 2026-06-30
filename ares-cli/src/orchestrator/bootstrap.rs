@@ -282,10 +282,20 @@ pub(crate) async fn dispatch_initial_recon(
     let mut count = 0;
     let domain = &config.target_domain;
 
+    // Order the entry targets. When randomize_entry_foothold is set, shuffle so
+    // each run opens against a different target — the cheapest attack-path
+    // diversity source, pushing run N off run N-1's opening move
+    // (see docs/attack-path-diversity.md).
+    let mut entry_ips: Vec<&String> = config.target_ips.iter().collect();
+    if dispatcher.config.strategy.randomize_entry_foothold {
+        use rand::seq::SliceRandom;
+        entry_ips.shuffle(&mut rand::thread_rng());
+    }
+
     // Network scan + SMB sweep + SMB signing check per target IP.
     // smb_sweep (NetExec) is critical: it discovers hostnames, OS, and DCs
     // from SMB banners — data that nmap alone may miss.
-    for ip in &config.target_ips {
+    for ip in entry_ips {
         match dispatcher
             .request_recon(
                 ip,

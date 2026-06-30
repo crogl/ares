@@ -24,6 +24,7 @@ use tracing::{debug, info, warn};
 
 use crate::orchestrator::config::OrchestratorConfig;
 use crate::orchestrator::dispatcher::Dispatcher;
+use crate::orchestrator::diversity;
 use crate::orchestrator::task_queue::TaskQueue;
 use crate::orchestrator::throttling::{ThrottleDecision, Throttler};
 
@@ -172,10 +173,13 @@ impl DeferredQueue {
         }
     }
 
-    /// Pop the highest-priority (lowest-score) task from any type ZSET.
+    /// Pop a task from any type ZSET.
     ///
-    /// Scans all known task-type keys for this operation and picks the
-    /// globally lowest score.
+    /// Default behaviour: pick the globally lowest score (highest priority)
+    /// across all per-type ZSETs. When `selection_temperature > 0`, softmax-
+    /// sample among the per-type lowest candidates by priority instead, so the
+    /// deferred drain order varies across runs (attack-path diversity). At
+    /// temperature 0 the selection is exact argmin, identical to before.
     pub async fn pop_best(&self) -> Result<Option<DeferredTask>> {
         let pattern = format!("{}:{}:*", DEFERRED_QUEUE_PREFIX, self.config.operation_id);
         let total_key = self.total_key();
@@ -188,14 +192,13 @@ impl DeferredQueue {
             return Ok(None);
         }
 
-        // Find the globally best candidate across all type ZSETs
-        let mut best: Option<(String, String, f64)> = None; // (key, member, score)
-
+        // Peek the lowest-score member of each per-type ZSET — these are the
+        // selection candidates.
+        let mut candidates: Vec<(String, String, DeferredTask)> = Vec::new(); // (key, member, task)
         for key in &keys {
             if key == &total_key {
                 continue;
             }
-            // Peek at the lowest-score member
             let members: Vec<(String, f64)> = redis::cmd("ZRANGEBYSCORE")
                 .arg(key)
                 .arg("-inf")
@@ -208,34 +211,55 @@ impl DeferredQueue {
                 .await
                 .unwrap_or_default();
 
-            if let Some((member, score)) = members.into_iter().next() {
-                let dominated = best.as_ref().map(|(_, _, s)| score < *s).unwrap_or(true);
-                if dominated {
-                    best = Some((key.clone(), member, score));
+            if let Some((member, _score)) = members.into_iter().next() {
+                if let Ok(task) = serde_json::from_str::<DeferredTask>(&member) {
+                    candidates.push((key.clone(), member, task));
                 }
             }
         }
 
-        match best {
-            Some((key, member, _score)) => {
-                let total_key = self.total_key();
-                let removed: i64 = REMOVE_SCRIPT
-                    .key(&key)
-                    .key(&total_key)
-                    .arg(&member)
-                    .invoke_async(&mut conn)
-                    .await
-                    .unwrap_or(0);
-                if removed == 0 {
-                    // Someone else grabbed it (unlikely in single-orchestrator mode)
-                    return Ok(None);
-                }
-                let task: DeferredTask =
-                    serde_json::from_str(&member).context("Bad DeferredTask JSON")?;
-                Ok(Some(task))
-            }
-            None => Ok(None),
+        if candidates.is_empty() {
+            return Ok(None);
         }
+
+        let temperature = self.config.strategy.selection_temperature;
+        let idx = if temperature > 0.0 {
+            let priorities: Vec<f32> = candidates
+                .iter()
+                .map(|(_, _, t)| t.priority as f32)
+                .collect();
+            let mut rng = rand::thread_rng();
+            diversity::softmax_select_index(&priorities, temperature, &mut rng).unwrap_or(0)
+        } else {
+            // Exact argmin by score (previous behaviour; first minimum wins).
+            candidates
+                .iter()
+                .enumerate()
+                .min_by(|(_, a), (_, b)| {
+                    a.2.score()
+                        .partial_cmp(&b.2.score())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap_or(0)
+        };
+
+        let (key, member, task) = candidates
+            .into_iter()
+            .nth(idx)
+            .expect("selection index within bounds");
+        let removed: i64 = REMOVE_SCRIPT
+            .key(&key)
+            .key(&total_key)
+            .arg(&member)
+            .invoke_async(&mut conn)
+            .await
+            .unwrap_or(0);
+        if removed == 0 {
+            // Someone else grabbed it (unlikely in single-orchestrator mode)
+            return Ok(None);
+        }
+        Ok(Some(task))
     }
 
     /// Evict tasks older than `max_age` from all deferred ZSETs.

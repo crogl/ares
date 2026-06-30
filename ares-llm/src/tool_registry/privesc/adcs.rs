@@ -201,6 +201,46 @@ pub fn definitions() -> Vec<ToolDefinition> {
             }),
         },
         ToolDefinition {
+            name: "certipy_account_update".into(),
+            description: "Modify a target account's userPrincipalName via certipy (account \
+                update). The primitive for ESC9 (set a GenericAll-controlled user's UPN to \
+                administrator@<domain>, request a cert with the spoofed UPN, then restore the \
+                original UPN) and ESC10 (UPN manipulation for weak implicit cert mapping). \
+                Runs on the privesc worker alongside certipy_request/certipy_auth so the whole \
+                chain completes on one host."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "domain": {
+                        "type": "string",
+                        "description": "Domain of the authenticating account (e.g. essos.local)"
+                    },
+                    "username": {
+                        "type": "string",
+                        "description": "Authenticating user — must have GenericAll/Write over the target account"
+                    },
+                    "password": {
+                        "type": "string",
+                        "description": "Password for the authenticating user"
+                    },
+                    "user": {
+                        "type": "string",
+                        "description": "Target account whose userPrincipalName is being changed"
+                    },
+                    "upn": {
+                        "type": "string",
+                        "description": "New userPrincipalName (e.g. administrator@<domain>); pass the original value to restore it afterward"
+                    },
+                    "dc_ip": {
+                        "type": "string",
+                        "description": "Domain controller IP address"
+                    }
+                },
+                "required": ["domain", "username", "password", "user", "upn", "dc_ip"]
+            }),
+        },
+        ToolDefinition {
             name: "certipy_esc4_full_chain".into(),
             description: "Execute the full ESC4 exploit chain: modify a vulnerable certificate \
                 template, request a certificate for a privileged user, and authenticate with \

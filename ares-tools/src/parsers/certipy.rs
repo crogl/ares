@@ -70,6 +70,19 @@ pub fn parse_certipy_find(output: &str, params: &Value) -> Vec<Value> {
             if !domain.is_empty() {
                 details["domain"] = json!(domain);
             }
+            // Write-holder ESCs (GenericAll/Write on the template, ManageCA,
+            // GenericAll-on-user) require a SPECIFIC principal's credential, not
+            // just any domain user. Capture the holder certipy names on the ESC
+            // line so credential selection targets it (e.g. ESC4 → khal.drogo).
+            // find_adcs_credential falls back to any same-domain cred if the
+            // holder's credential isn't available yet, so this never regresses
+            // the any-user ESCs (esc1/2/3/6/13/15), which we leave unset.
+            if matches!(*esc_type, "esc4" | "esc7" | "esc9" | "esc10") {
+                if let Some(holder) = extract_esc_principal(output, esc_type) {
+                    details["write_holder"] = json!(holder);
+                    details["account_name"] = json!(holder);
+                }
+            }
             if let Some(ref ca) = ca_name {
                 details["ca_name"] = json!(ca);
             }
@@ -122,6 +135,43 @@ fn esc_word_boundary_match(text: &str, esc_type: &str) -> bool {
         start = abs_pos + 1;
     }
     false
+}
+
+/// Extract the principal certipy names on an ESC line as holding the dangerous
+/// right, e.g. `ESC4 : 'ESSOS.LOCAL\khal.drogo' has dangerous permissions ...`.
+/// Returns the bare sAMAccountName (portion after the domain backslash),
+/// lowercased. Returns `None` if no single-quoted principal is found.
+fn extract_esc_principal(output: &str, esc_type: &str) -> Option<String> {
+    let esc_upper = esc_type.to_uppercase();
+    for line in output.lines() {
+        let trimmed = line.trim();
+        let Some(rest) = trimmed.strip_prefix(&esc_upper) else {
+            continue;
+        };
+        // Ensure it's the ESC header line ("ESC4 :" / "ESC4:"), not e.g. "ESC40".
+        if !(rest.starts_with(' ') || rest.starts_with(':')) {
+            continue;
+        }
+        if let Some(p) = extract_quoted_principal(trimmed) {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// Pull the first single-quoted `DOMAIN\principal` (or `principal`) from a line
+/// and return the name after the last backslash, lowercased.
+fn extract_quoted_principal(line: &str) -> Option<String> {
+    let start = line.find('\'')?;
+    let rest = &line[start + 1..];
+    let end = rest.find('\'')?;
+    let principal = &rest[..end];
+    let name = principal.rsplit('\\').next().unwrap_or(principal).trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_lowercase())
+    }
 }
 
 /// Extract CA name from certipy output.
@@ -273,6 +323,28 @@ mod tests {
         assert_eq!(vulns[0]["vuln_type"], "adcs_esc1");
         assert_eq!(vulns[0]["target"], "192.168.58.10");
         assert_eq!(vulns[0]["details"]["domain"], "contoso.local");
+    }
+
+    #[test]
+    fn parse_certipy_esc4_captures_write_holder() {
+        let output = "[!] Vulnerabilities\n    ESC4 : 'ESSOS.LOCAL\\khal.drogo' has dangerous permissions over the template";
+        let params = json!({"target": "192.168.58.23", "domain": "essos.local"});
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        assert_eq!(vulns[0]["vuln_type"], "adcs_esc4");
+        // The GenericAll holder is captured so credential selection targets it.
+        assert_eq!(vulns[0]["details"]["write_holder"], "khal.drogo");
+        assert_eq!(vulns[0]["details"]["account_name"], "khal.drogo");
+    }
+
+    #[test]
+    fn parse_certipy_esc1_no_write_holder() {
+        // Any-user ESCs must NOT pin account_name (any domain cred works).
+        let output = "[!] Vulnerabilities\nESC1 : 'ESSOS.LOCAL\\Domain Users' can enroll";
+        let params = json!({"target": "192.168.58.23", "domain": "essos.local"});
+        let vulns = parse_certipy_find(output, &params);
+        assert_eq!(vulns.len(), 1);
+        assert!(vulns[0]["details"].get("account_name").is_none());
     }
 
     #[test]
